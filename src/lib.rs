@@ -185,9 +185,12 @@ impl Router {
             connection_mode: config::ConnectionMode::Http,
             max_payload_size: self.max_payload_size,
             chat_routing_key_mode: match self.chat_routing_key_mode.as_str() {
-                "full_history" => ChatRoutingKeyMode::FullHistory,
                 "session_id" => ChatRoutingKeyMode::SessionId,
-                _ => ChatRoutingKeyMode::StablePrefix,
+                "session_id_full_history_fallback" => {
+                    ChatRoutingKeyMode::SessionIdFullHistoryFallback
+                }
+                // Default / unknown values map to full_history.
+                _ => ChatRoutingKeyMode::FullHistory,
             },
             request_timeout_secs: self.request_timeout_secs,
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
@@ -263,7 +266,7 @@ impl Router {
         balance_rel_threshold = 1.5,
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
-        chat_routing_key_mode = "stable_prefix".to_string(),
+        chat_routing_key_mode = "full_history".to_string(),
         max_payload_size = 512 * 1024 * 1024,  // 512MB default for large batches
         intra_node_data_parallel_size = 1,
         api_key = None,

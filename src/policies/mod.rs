@@ -61,6 +61,21 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         headers: Option<&RequestHeaders>,
     ) -> Option<usize>;
 
+    /// Select a single worker with an optional fallback routing key.
+    ///
+    /// Most policies only understand one routing key, so the default implementation
+    /// ignores the fallback and preserves existing behavior.
+    fn select_worker_with_fallback_headers(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        fallback_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        let _ = fallback_text;
+        self.select_worker_with_headers(workers, request_text, headers)
+    }
+
     /// Select a pair of workers (prefill and decode) for PD routing
     ///
     /// Returns indices of (prefill_worker, decode_worker) from their respective arrays.

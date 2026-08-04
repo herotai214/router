@@ -114,6 +114,7 @@ mod test_pd_routing {
                 log_dir: None,
                 log_level: None,
                 request_id_headers: None,
+                chat_routing_key_mode: vllm_router_rs::config::ChatRoutingKeyMode::default(),
                 max_concurrent_requests: 64,
                 queue_size: 0,
                 queue_timeout_secs: 60,

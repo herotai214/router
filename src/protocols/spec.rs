@@ -555,70 +555,10 @@ pub struct ChatCompletionRequest {
 }
 
 impl ChatCompletionRequest {
-    /// Build a stable routing prefix for cache-aware chat routing.
+    /// Build a routing key from text-like chat history and tool schemas.
     ///
-    /// Agent traffic often changes the latest user/assistant/tool-result turns
-    /// while keeping the system/developer instructions and tool schemas stable.
-    /// Using only those stable components gives cache-aware routing a better
-    /// chance to preserve vLLM prefix-cache locality without tying unrelated
-    /// sessions to a volatile full conversation string.
-    pub fn extract_stable_routing_prefix(&self) -> String {
-        let mut parts = Vec::new();
-
-        for message in &self.messages {
-            match message {
-                ChatMessage::System { content, .. } if !content.trim().is_empty() => {
-                    parts.push(format!("system:{}", content.trim()));
-                }
-                ChatMessage::Developer { content, .. } if !content.trim().is_empty() => {
-                    parts.push(format!("developer:{}", content.trim()));
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(tools) = &self.tools {
-            let mut tools_by_name: Vec<&Tool> = tools.iter().collect();
-            tools_by_name.sort_by(|a, b| a.function.name.cmp(&b.function.name));
-
-            for tool in tools_by_name {
-                let parameters = serde_json::to_string(&tool.function.parameters)
-                    .unwrap_or_else(|_| "{}".to_string());
-                let description = tool.function.description.as_deref().unwrap_or("").trim();
-
-                parts.push(format!(
-                    "tool:{}:{}:{}",
-                    tool.function.name.trim(),
-                    description,
-                    parameters
-                ));
-            }
-        }
-
-        if let Some(functions) = &self.functions {
-            let mut functions_by_name: Vec<&Function> = functions.iter().collect();
-            functions_by_name.sort_by(|a, b| a.name.cmp(&b.name));
-
-            for function in functions_by_name {
-                let parameters = serde_json::to_string(&function.parameters)
-                    .unwrap_or_else(|_| "{}".to_string());
-                let description = function.description.as_deref().unwrap_or("").trim();
-                parts.push(format!(
-                    "function:{}:{}:{}",
-                    function.name.trim(),
-                    description,
-                    parameters
-                ));
-            }
-        }
-
-        parts.join("\n")
-    }
-
-    /// Build a broader routing key from text-like chat history and tool schemas.
-    ///
-    /// This is useful for experiments that want cache-aware routing to consider
-    /// the full conversational prefix rather than only stable agent instructions.
+    /// This lets cache-aware routing consider the full conversational prefix
+    /// rather than only a session identifier.
     pub fn extract_full_history_routing_text(&self) -> String {
         let mut parts = Vec::new();
 
@@ -763,18 +703,16 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        let stable_prefix = self.extract_stable_routing_prefix();
-        if !stable_prefix.is_empty() {
-            return stable_prefix;
+        let full_history = self.extract_full_history_routing_text();
+        if !full_history.is_empty() {
+            return full_history;
         }
 
-        // Fall back to session_id for session-based routing when no stable
-        // agent prefix is available.
+        // Fall back to session_id when the chat body has no usable history text.
         if let Some(session_id) = self.extract_session_id_for_routing() {
             return session_id;
         }
 
-        // Return empty string if no session_id - let routing policy handle this case
         String::new()
     }
 }

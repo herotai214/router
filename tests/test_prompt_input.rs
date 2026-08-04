@@ -25,7 +25,7 @@ fn test_prompt_input_single_string() {
 }
 
 #[test]
-fn test_chat_routing_uses_stable_system_and_tools() {
+fn test_chat_routing_uses_full_history_by_default() {
     let request_a: ChatCompletionRequest = serde_json::from_str(
         r#"{
             "model": "test-model",
@@ -73,16 +73,16 @@ fn test_chat_routing_uses_stable_system_and_tools() {
     let routing_a = request_a.extract_text_for_routing();
     let routing_b = request_b.extract_text_for_routing();
 
-    assert_eq!(routing_a, routing_b);
+    assert_ne!(routing_a, routing_b);
     assert!(routing_a.contains("system:You are a coding agent."));
     assert!(routing_a.contains("developer:Always inspect before editing."));
-    assert!(routing_a.contains("tool:read_file:Read a file:"));
-    assert!(!routing_a.contains("Fix bug A"));
-    assert!(!routing_a.contains("Fix bug B"));
+    assert!(routing_a.contains("user:Fix bug A"));
+    assert!(routing_a.contains("tool_schema:read_file:Read a file:"));
+    assert!(routing_b.contains("user:Fix bug B with a different suffix"));
 }
 
 #[test]
-fn test_chat_routing_sorts_tools_for_stable_prefix() {
+fn test_chat_routing_sorts_tools_for_full_history() {
     let request_a: ChatCompletionRequest = serde_json::from_str(
         r#"{
             "model": "test-model",
@@ -114,11 +114,11 @@ fn test_chat_routing_sorts_tools_for_stable_prefix() {
 }
 
 #[test]
-fn test_chat_routing_falls_back_to_session_id_without_stable_prefix() {
+fn test_chat_routing_falls_back_to_session_id_without_history_text() {
     let request: ChatCompletionRequest = serde_json::from_str(
         r#"{
             "model": "test-model",
-            "messages": [{"role": "user", "content": "No stable prefix here"}],
+            "messages": [],
             "session_params": {"session_id": "session-123"}
         }"#,
     )
@@ -163,12 +163,10 @@ fn test_chat_full_history_routing_includes_volatile_turns() {
     )
     .unwrap();
 
-    let stable_a = request_a.extract_text_for_routing();
-    let stable_b = request_b.extract_text_for_routing();
-    assert_eq!(stable_a, stable_b);
-
     let full_a = request_a.extract_full_history_routing_text();
     let full_b = request_b.extract_full_history_routing_text();
+    assert_eq!(request_a.extract_text_for_routing(), full_a);
+    assert_eq!(request_b.extract_text_for_routing(), full_b);
     assert_ne!(full_a, full_b);
     assert!(full_a.contains("user:Fix bug A"));
     assert!(full_a.contains("assistant:I will inspect it."));

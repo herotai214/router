@@ -46,17 +46,19 @@ fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliChatRoutingKeyMode {
-    StablePrefix,
     FullHistory,
     SessionId,
+    SessionIdFullHistoryFallback,
 }
 
 impl From<CliChatRoutingKeyMode> for ChatRoutingKeyMode {
     fn from(mode: CliChatRoutingKeyMode) -> Self {
         match mode {
-            CliChatRoutingKeyMode::StablePrefix => ChatRoutingKeyMode::StablePrefix,
             CliChatRoutingKeyMode::FullHistory => ChatRoutingKeyMode::FullHistory,
             CliChatRoutingKeyMode::SessionId => ChatRoutingKeyMode::SessionId,
+            CliChatRoutingKeyMode::SessionIdFullHistoryFallback => {
+                ChatRoutingKeyMode::SessionIdFullHistoryFallback
+            }
         }
     }
 }
@@ -177,7 +179,7 @@ struct CliArgs {
     max_tree_size: usize,
 
     /// Chat routing text used by text-aware policies such as cache_aware
-    #[arg(long, value_enum, default_value_t = CliChatRoutingKeyMode::StablePrefix)]
+    #[arg(long, value_enum, default_value_t = CliChatRoutingKeyMode::FullHistory)]
     chat_routing_key_mode: CliChatRoutingKeyMode,
 
     /// Maximum payload size in bytes

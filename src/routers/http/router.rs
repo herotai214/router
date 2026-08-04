@@ -511,6 +511,18 @@ impl Router {
         text: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
+        self.select_worker_for_model_with_fallback(model_id, text, None, headers)
+    }
+
+    /// Select worker for a specific model, optionally allowing policies to use
+    /// a fallback routing key when the primary key has weak affinity.
+    fn select_worker_for_model_with_fallback(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+        fallback_text: Option<&str>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -535,7 +547,12 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
+        let idx = policy.select_worker_with_fallback_headers(
+            &available,
+            text,
+            fallback_text,
+            request_headers.as_ref(),
+        )?;
         Some(available[idx].clone())
     }
 
@@ -562,6 +579,23 @@ impl Router {
         model_id: Option<&str>,
         text: String,
     ) -> Response {
+        self.route_typed_request_with_routing_text_fallback(
+            headers, typed_req, route, model_id, text, None,
+        )
+        .await
+    }
+
+    pub async fn route_typed_request_with_routing_text_fallback<
+        T: GenerationRequest + serde::Serialize + Clone,
+    >(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &str,
+        model_id: Option<&str>,
+        text: String,
+        fallback_text: Option<String>,
+    ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
 
@@ -569,7 +603,18 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
+                let selected_worker = if fallback_text.is_some() {
+                    self.select_worker_for_model_with_fallback(
+                        model_id,
+                        Some(&text),
+                        fallback_text.as_deref(),
+                        headers,
+                    )
+                } else {
+                    self.select_worker_for_model(model_id, Some(&text), headers)
+                };
+
+                let worker = match selected_worker {
                     Some(w) => w,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -1481,27 +1526,35 @@ impl RouterTrait for Router {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let text = match self.chat_routing_key_mode {
-            ChatRoutingKeyMode::StablePrefix => body.extract_text_for_routing(),
+        let (text, fallback_text) = match self.chat_routing_key_mode {
             ChatRoutingKeyMode::FullHistory => {
                 let full_history = body.extract_full_history_routing_text();
                 if full_history.is_empty() {
-                    body.extract_session_id_for_routing().unwrap_or_default()
+                    (
+                        body.extract_session_id_for_routing().unwrap_or_default(),
+                        None,
+                    )
                 } else {
-                    full_history
+                    (full_history, None)
                 }
             }
-            ChatRoutingKeyMode::SessionId => {
-                body.extract_session_id_for_routing().unwrap_or_default()
-            }
+            ChatRoutingKeyMode::SessionId => (
+                body.extract_session_id_for_routing().unwrap_or_default(),
+                None,
+            ),
+            ChatRoutingKeyMode::SessionIdFullHistoryFallback => (
+                body.extract_session_id_for_routing().unwrap_or_default(),
+                Some(body.extract_full_history_routing_text()),
+            ),
         };
 
-        self.route_typed_request_with_routing_text(
+        self.route_typed_request_with_routing_text_fallback(
             headers,
             body,
             "/v1/chat/completions",
             model_id,
             text,
+            fallback_text,
         )
         .await
     }

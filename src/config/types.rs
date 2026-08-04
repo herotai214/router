@@ -7,17 +7,17 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatRoutingKeyMode {
-    /// Stable system/developer/tool schema prefix, with session_id fallback.
-    StablePrefix,
     /// Text-like content from the full chat history and tool schemas.
     FullHistory,
     /// Explicit session_id only, with no prompt-prefix key.
     SessionId,
+    /// Try session_id affinity first, then fall back to full chat history.
+    SessionIdFullHistoryFallback,
 }
 
 impl Default for ChatRoutingKeyMode {
     fn default() -> Self {
-        Self::StablePrefix
+        Self::FullHistory
     }
 }
 
@@ -1059,6 +1059,7 @@ mod tests {
             log_dir: Some("/var/log/vllm".to_string()),
             log_level: Some("info".to_string()),
             request_id_headers: None,
+            chat_routing_key_mode: ChatRoutingKeyMode::default(),
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
@@ -1125,6 +1126,7 @@ mod tests {
             log_dir: None,
             log_level: Some("debug".to_string()),
             request_id_headers: None,
+            chat_routing_key_mode: ChatRoutingKeyMode::default(),
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
@@ -1187,6 +1189,7 @@ mod tests {
             log_dir: Some("/opt/logs/vllm".to_string()),
             log_level: Some("trace".to_string()),
             request_id_headers: None,
+            chat_routing_key_mode: ChatRoutingKeyMode::default(),
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
