@@ -1,9 +1,9 @@
 use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig, RetryConfig,
-    RouterConfig, RoutingMode, TraceConfig,
+    ChatRoutingKeyMode, CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode,
+    DiscoveryConfig, HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
+    RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -42,6 +42,23 @@ fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
     }
 
     prefill_entries
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliChatRoutingKeyMode {
+    StablePrefix,
+    FullHistory,
+    SessionId,
+}
+
+impl From<CliChatRoutingKeyMode> for ChatRoutingKeyMode {
+    fn from(mode: CliChatRoutingKeyMode) -> Self {
+        match mode {
+            CliChatRoutingKeyMode::StablePrefix => ChatRoutingKeyMode::StablePrefix,
+            CliChatRoutingKeyMode::FullHistory => ChatRoutingKeyMode::FullHistory,
+            CliChatRoutingKeyMode::SessionId => ChatRoutingKeyMode::SessionId,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -158,6 +175,10 @@ struct CliArgs {
     /// Maximum size of the approximation tree for cache-aware routing
     #[arg(long, default_value_t = 67108864)] // 2^26
     max_tree_size: usize,
+
+    /// Chat routing text used by text-aware policies such as cache_aware
+    #[arg(long, value_enum, default_value_t = CliChatRoutingKeyMode::StablePrefix)]
+    chat_routing_key_mode: CliChatRoutingKeyMode,
 
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
@@ -522,6 +543,7 @@ impl CliArgs {
             } else {
                 Some(self.request_id_headers.clone())
             },
+            chat_routing_key_mode: self.chat_routing_key_mode.into(),
             max_concurrent_requests: self.max_concurrent_requests,
             queue_size: 100,        // Default queue size
             queue_timeout_secs: 60, // Default timeout

@@ -59,6 +59,7 @@
     during the next eviction cycle.
 */
 
+use super::hash_key::extract_hash_key_from_headers;
 use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
@@ -191,6 +192,7 @@ impl CacheAwarePolicy {
         }
 
         RouterMetrics::record_load_balancing_event();
+        RouterMetrics::record_cache_aware_decision("load_balance");
         RouterMetrics::set_load_range(max_load, min_load);
 
         // Use shortest queue when imbalanced
@@ -230,7 +232,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         &self,
         workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
-        _headers: Option<&RequestHeaders>,
+        headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -269,8 +271,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             );
         }
 
-        // Use cache-aware routing when balanced
-        let text = request_text.unwrap_or("");
+        // Use cache-aware routing when balanced. Keep an explicit stable request
+        // prefix first; fall back to session headers for clients that carry
+        // affinity only in HTTP metadata.
+        let header_key = headers.and_then(extract_hash_key_from_headers);
+        let text = request_text
+            .filter(|text| !text.trim().is_empty())
+            .or(header_key.as_deref())
+            .unwrap_or("");
 
         // Get the tree reference without locking the entire HashMap
         // DashMap only locks the specific shard containing this key
@@ -285,6 +293,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 "Warning: No tree found for model '{}', using random worker selection",
                 model_id
             );
+            RouterMetrics::record_cache_aware_decision("no_tree_random");
             // Return a random healthy worker
             let mut rng = rand::rng();
             let random_idx = rng.random_range(0..healthy_indices.len());
@@ -327,6 +336,12 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         };
 
         if let Some(idx) = selected_idx {
+            if match_rate > self.config.cache_threshold {
+                RouterMetrics::record_cache_aware_decision("cache_affinity");
+            } else {
+                RouterMetrics::record_cache_aware_decision("low_match_min_load");
+            }
+
             // Update the tree with this request (use worker URL directly, no allocation)
             tree.insert(text, workers[idx].url());
 
@@ -342,7 +357,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         if match_rate > self.config.cache_threshold {
             let tenant_url: &str = &result.tenant;
             tree.remove_tenant(tenant_url);
+            RouterMetrics::record_cache_aware_decision("stale_tenant_fallback");
             debug!("Removed stale worker {} from cache tree", tenant_url);
+        } else {
+            RouterMetrics::record_cache_aware_decision("first_healthy_fallback");
         }
 
         // Fallback to first healthy worker
@@ -511,6 +529,73 @@ mod tests {
         // Similar request should also go to same worker
         let idx3 = policy.select_worker(&workers, Some("hello")).unwrap();
         assert_eq!(idx1, idx3);
+    }
+
+    #[test]
+    fn test_cache_aware_falls_back_to_session_header_when_text_empty() {
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+
+        let mut headers = RequestHeaders::new();
+        headers.insert("x-session-id".to_string(), "agent-session-1".to_string());
+
+        let idx1 = policy
+            .select_worker_with_headers(&workers, Some(""), Some(&headers))
+            .unwrap();
+        let idx2 = policy
+            .select_worker_with_headers(&workers, None, Some(&headers))
+            .unwrap();
+
+        assert_eq!(idx1, idx2);
+    }
+
+    #[test]
+    fn test_cache_aware_stable_text_precedes_session_header() {
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+
+        let mut headers_a = RequestHeaders::new();
+        headers_a.insert("x-session-id".to_string(), "session-a".to_string());
+        let mut headers_b = RequestHeaders::new();
+        headers_b.insert("x-session-id".to_string(), "session-b".to_string());
+
+        let stable_agent_prefix = "system:You are a coding agent\ntool:read_file";
+        let idx1 = policy
+            .select_worker_with_headers(&workers, Some(stable_agent_prefix), Some(&headers_a))
+            .unwrap();
+        let idx2 = policy
+            .select_worker_with_headers(&workers, Some(stable_agent_prefix), Some(&headers_b))
+            .unwrap();
+
+        assert_eq!(idx1, idx2);
     }
 
     #[test]

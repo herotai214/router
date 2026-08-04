@@ -3,6 +3,24 @@ use crate::config::validation::ConfigValidator;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Which text key the router should pass to text-aware policies for chat requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatRoutingKeyMode {
+    /// Stable system/developer/tool schema prefix, with session_id fallback.
+    StablePrefix,
+    /// Text-like content from the full chat history and tool schemas.
+    FullHistory,
+    /// Explicit session_id only, with no prompt-prefix key.
+    SessionId,
+}
+
+impl Default for ChatRoutingKeyMode {
+    fn default() -> Self {
+        Self::StablePrefix
+    }
+}
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -43,6 +61,9 @@ pub struct RouterConfig {
     pub log_level: Option<String>,
     /// Custom request ID headers to check (defaults to common headers)
     pub request_id_headers: Option<Vec<String>>,
+    /// Chat routing key mode for text-aware policies such as cache_aware.
+    #[serde(default)]
+    pub chat_routing_key_mode: ChatRoutingKeyMode,
     /// Maximum concurrent requests allowed (for rate limiting)
     pub max_concurrent_requests: usize,
     /// Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately)
@@ -463,6 +484,7 @@ impl Default for RouterConfig {
             log_dir: None,
             log_level: None,
             request_id_headers: None,
+            chat_routing_key_mode: ChatRoutingKeyMode::default(),
             max_concurrent_requests: 32768,
             queue_size: 100,
             queue_timeout_secs: 60,

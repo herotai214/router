@@ -68,6 +68,12 @@ pub enum ChatMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    Developer {
+        role: String,
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     User {
         role: String, // "user"
         content: UserMessageContent,
@@ -156,6 +162,21 @@ impl<'de> Deserialize<'de> for ChatMessage {
                     .map(String::from),
             }),
             "system" => Ok(ChatMessage::System {
+                role: role.to_string(),
+                content: value
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                name: value.get("name").and_then(|n| {
+                    if n.is_null() {
+                        None
+                    } else {
+                        n.as_str().map(String::from)
+                    }
+                }),
+            }),
+            "developer" => Ok(ChatMessage::Developer {
                 role: role.to_string(),
                 content: value
                     .get("content")
@@ -533,6 +554,205 @@ pub struct ChatCompletionRequest {
     pub other: serde_json::Map<String, serde_json::Value>,
 }
 
+impl ChatCompletionRequest {
+    /// Build a stable routing prefix for cache-aware chat routing.
+    ///
+    /// Agent traffic often changes the latest user/assistant/tool-result turns
+    /// while keeping the system/developer instructions and tool schemas stable.
+    /// Using only those stable components gives cache-aware routing a better
+    /// chance to preserve vLLM prefix-cache locality without tying unrelated
+    /// sessions to a volatile full conversation string.
+    pub fn extract_stable_routing_prefix(&self) -> String {
+        let mut parts = Vec::new();
+
+        for message in &self.messages {
+            match message {
+                ChatMessage::System { content, .. } if !content.trim().is_empty() => {
+                    parts.push(format!("system:{}", content.trim()));
+                }
+                ChatMessage::Developer { content, .. } if !content.trim().is_empty() => {
+                    parts.push(format!("developer:{}", content.trim()));
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(tools) = &self.tools {
+            let mut tools_by_name: Vec<&Tool> = tools.iter().collect();
+            tools_by_name.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+
+            for tool in tools_by_name {
+                let parameters = serde_json::to_string(&tool.function.parameters)
+                    .unwrap_or_else(|_| "{}".to_string());
+                let description = tool.function.description.as_deref().unwrap_or("").trim();
+
+                parts.push(format!(
+                    "tool:{}:{}:{}",
+                    tool.function.name.trim(),
+                    description,
+                    parameters
+                ));
+            }
+        }
+
+        if let Some(functions) = &self.functions {
+            let mut functions_by_name: Vec<&Function> = functions.iter().collect();
+            functions_by_name.sort_by(|a, b| a.name.cmp(&b.name));
+
+            for function in functions_by_name {
+                let parameters = serde_json::to_string(&function.parameters)
+                    .unwrap_or_else(|_| "{}".to_string());
+                let description = function.description.as_deref().unwrap_or("").trim();
+                parts.push(format!(
+                    "function:{}:{}:{}",
+                    function.name.trim(),
+                    description,
+                    parameters
+                ));
+            }
+        }
+
+        parts.join("\n")
+    }
+
+    /// Build a broader routing key from text-like chat history and tool schemas.
+    ///
+    /// This is useful for experiments that want cache-aware routing to consider
+    /// the full conversational prefix rather than only stable agent instructions.
+    pub fn extract_full_history_routing_text(&self) -> String {
+        let mut parts = Vec::new();
+
+        for message in &self.messages {
+            match message {
+                ChatMessage::System { content, .. } if !content.trim().is_empty() => {
+                    parts.push(format!("system:{}", content.trim()));
+                }
+                ChatMessage::Developer { content, .. } if !content.trim().is_empty() => {
+                    parts.push(format!("developer:{}", content.trim()));
+                }
+                ChatMessage::User { content, .. } => match content {
+                    UserMessageContent::Text(text) if !text.trim().is_empty() => {
+                        parts.push(format!("user:{}", text.trim()));
+                    }
+                    UserMessageContent::Parts(content_parts) => {
+                        for part in content_parts {
+                            if let ContentPart::Text { text } = part {
+                                if !text.trim().is_empty() {
+                                    parts.push(format!("user:{}", text.trim()));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                ChatMessage::Assistant {
+                    content,
+                    tool_calls,
+                    function_call,
+                    ..
+                } => {
+                    if let Some(content) = content {
+                        if !content.trim().is_empty() {
+                            parts.push(format!("assistant:{}", content.trim()));
+                        }
+                    }
+
+                    if let Some(calls) = tool_calls {
+                        for call in calls {
+                            if let Some(arguments) = &call.function.arguments {
+                                if !arguments.trim().is_empty() {
+                                    parts.push(format!(
+                                        "assistant_tool_call:{}:{}",
+                                        call.function.name.trim(),
+                                        arguments.trim()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(call) = function_call {
+                        if let Some(arguments) = &call.arguments {
+                            if !arguments.trim().is_empty() {
+                                parts.push(format!(
+                                    "assistant_function_call:{}:{}",
+                                    call.name.trim(),
+                                    arguments.trim()
+                                ));
+                            }
+                        }
+                    }
+                }
+                ChatMessage::Tool { content, .. } => {
+                    if let Some(text) = content.as_str() {
+                        if !text.trim().is_empty() {
+                            parts.push(format!("tool:{}", text.trim()));
+                        }
+                    } else if let Some(arr) = content.as_array() {
+                        for item in arr {
+                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                if !text.trim().is_empty() {
+                                    parts.push(format!("tool:{}", text.trim()));
+                                }
+                            }
+                        }
+                    }
+                }
+                ChatMessage::Function { content, name, .. } if !content.trim().is_empty() => {
+                    parts.push(format!("function:{}:{}", name.trim(), content.trim()));
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(tools) = &self.tools {
+            let mut tools_by_name: Vec<&Tool> = tools.iter().collect();
+            tools_by_name.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+
+            for tool in tools_by_name {
+                let parameters = serde_json::to_string(&tool.function.parameters)
+                    .unwrap_or_else(|_| "{}".to_string());
+                let description = tool.function.description.as_deref().unwrap_or("").trim();
+                parts.push(format!(
+                    "tool_schema:{}:{}:{}",
+                    tool.function.name.trim(),
+                    description,
+                    parameters
+                ));
+            }
+        }
+
+        if let Some(functions) = &self.functions {
+            let mut functions_by_name: Vec<&Function> = functions.iter().collect();
+            functions_by_name.sort_by(|a, b| a.name.cmp(&b.name));
+
+            for function in functions_by_name {
+                let parameters = serde_json::to_string(&function.parameters)
+                    .unwrap_or_else(|_| "{}".to_string());
+                let description = function.description.as_deref().unwrap_or("").trim();
+                parts.push(format!(
+                    "function_schema:{}:{}:{}",
+                    function.name.trim(),
+                    description,
+                    parameters
+                ));
+            }
+        }
+
+        parts.join("\n")
+    }
+
+    pub fn extract_session_id_for_routing(&self) -> Option<String> {
+        let session_params = self.session_params.as_ref()?;
+        let session_id = session_params.get("session_id")?.as_str()?.trim();
+        if session_id.is_empty() {
+            None
+        } else {
+            Some(session_id.to_string())
+        }
+    }
+}
+
 impl GenerationRequest for ChatCompletionRequest {
     fn is_stream(&self) -> bool {
         self.stream
@@ -543,15 +763,15 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        // Use session_id from session_params for session-based routing
-        if let Some(ref session_params) = self.session_params {
-            if let Some(session_id) = session_params.get("session_id") {
-                if let Some(session_id_str) = session_id.as_str() {
-                    if !session_id_str.trim().is_empty() {
-                        return session_id_str.to_string();
-                    }
-                }
-            }
+        let stable_prefix = self.extract_stable_routing_prefix();
+        if !stable_prefix.is_empty() {
+            return stable_prefix;
+        }
+
+        // Fall back to session_id for session-based routing when no stable
+        // agent prefix is available.
+        if let Some(session_id) = self.extract_session_id_for_routing() {
+            return session_id;
         }
 
         // Return empty string if no session_id - let routing policy handle this case

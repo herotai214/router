@@ -1,4 +1,4 @@
-use crate::config::types::RetryConfig;
+use crate::config::types::{ChatRoutingKeyMode, RetryConfig};
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
     RetryExecutor, Worker, WorkerRegistry, WorkerType,
@@ -43,6 +43,7 @@ pub struct Router {
     api_key: Option<String>,
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
+    chat_routing_key_mode: ChatRoutingKeyMode,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
@@ -179,6 +180,7 @@ impl Router {
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
+            chat_routing_key_mode: ctx.router_config.chat_routing_key_mode,
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
         })
@@ -544,9 +546,24 @@ impl Router {
         route: &str,
         model_id: Option<&str>,
     ) -> Response {
+        let text = typed_req.extract_text_for_routing();
+
+        self.route_typed_request_with_routing_text(headers, typed_req, route, model_id, text)
+            .await
+    }
+
+    pub async fn route_typed_request_with_routing_text<
+        T: GenerationRequest + serde::Serialize + Clone,
+    >(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &str,
+        model_id: Option<&str>,
+        text: String,
+    ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        let text = typed_req.extract_text_for_routing();
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1464,8 +1481,29 @@ impl RouterTrait for Router {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
-            .await
+        let text = match self.chat_routing_key_mode {
+            ChatRoutingKeyMode::StablePrefix => body.extract_text_for_routing(),
+            ChatRoutingKeyMode::FullHistory => {
+                let full_history = body.extract_full_history_routing_text();
+                if full_history.is_empty() {
+                    body.extract_session_id_for_routing().unwrap_or_default()
+                } else {
+                    full_history
+                }
+            }
+            ChatRoutingKeyMode::SessionId => {
+                body.extract_session_id_for_routing().unwrap_or_default()
+            }
+        };
+
+        self.route_typed_request_with_routing_text(
+            headers,
+            body,
+            "/v1/chat/completions",
+            model_id,
+            text,
+        )
+        .await
     }
 
     async fn route_completion(
@@ -1802,6 +1840,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            chat_routing_key_mode: ChatRoutingKeyMode::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
         }
@@ -1874,6 +1913,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            chat_routing_key_mode: ChatRoutingKeyMode::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
         }

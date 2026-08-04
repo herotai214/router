@@ -42,6 +42,7 @@ struct Router {
     balance_rel_threshold: f32,
     eviction_interval_secs: u64,
     max_tree_size: usize,
+    chat_routing_key_mode: String,
     max_payload_size: usize,
     intra_node_data_parallel_size: usize,
     api_key: Option<String>,
@@ -103,7 +104,8 @@ impl Router {
     /// Convert PyO3 Router to RouterConfig
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
-            DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
+            ChatRoutingKeyMode, DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig,
+            RoutingMode,
         };
 
         // Convert policy helper function
@@ -182,6 +184,11 @@ impl Router {
             port: self.port,
             connection_mode: config::ConnectionMode::Http,
             max_payload_size: self.max_payload_size,
+            chat_routing_key_mode: match self.chat_routing_key_mode.as_str() {
+                "full_history" => ChatRoutingKeyMode::FullHistory,
+                "session_id" => ChatRoutingKeyMode::SessionId,
+                _ => ChatRoutingKeyMode::StablePrefix,
+            },
             request_timeout_secs: self.request_timeout_secs,
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: self.worker_startup_check_interval,
@@ -256,6 +263,7 @@ impl Router {
         balance_rel_threshold = 1.5,
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
+        chat_routing_key_mode = "stable_prefix".to_string(),
         max_payload_size = 512 * 1024 * 1024,  // 512MB default for large batches
         intra_node_data_parallel_size = 1,
         api_key = None,
@@ -324,6 +332,7 @@ impl Router {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        chat_routing_key_mode: String,
         max_payload_size: usize,
         intra_node_data_parallel_size: usize,
         api_key: Option<String>,
@@ -385,6 +394,7 @@ impl Router {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            chat_routing_key_mode,
             max_payload_size,
             intra_node_data_parallel_size,
             api_key,
