@@ -1531,7 +1531,8 @@ impl RouterTrait for Router {
                 let full_history = body.extract_full_history_routing_text();
                 if full_history.is_empty() {
                     (
-                        body.extract_session_id_for_routing().unwrap_or_default(),
+                        body.extract_session_id_key_for_routing()
+                            .unwrap_or_default(),
                         None,
                     )
                 } else {
@@ -1539,11 +1540,13 @@ impl RouterTrait for Router {
                 }
             }
             ChatRoutingKeyMode::SessionId => (
-                body.extract_session_id_for_routing().unwrap_or_default(),
+                body.extract_session_id_key_for_routing()
+                    .unwrap_or_default(),
                 None,
             ),
             ChatRoutingKeyMode::SessionIdFullHistoryFallback => (
-                body.extract_session_id_for_routing().unwrap_or_default(),
+                body.extract_session_id_key_for_routing()
+                    .unwrap_or_default(),
                 Some(body.extract_full_history_routing_text()),
             ),
         };

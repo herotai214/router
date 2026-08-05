@@ -4,21 +4,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Which text key the router should pass to text-aware policies for chat requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatRoutingKeyMode {
     /// Text-like content from the full chat history and tool schemas.
+    #[default]
     FullHistory,
     /// Explicit session_id only, with no prompt-prefix key.
     SessionId,
     /// Try session_id affinity first, then fall back to full chat history.
     SessionIdFullHistoryFallback,
-}
-
-impl Default for ChatRoutingKeyMode {
-    fn default() -> Self {
-        Self::FullHistory
-    }
 }
 
 /// Main router configuration

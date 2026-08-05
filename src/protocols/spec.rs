@@ -555,6 +555,8 @@ pub struct ChatCompletionRequest {
 }
 
 impl ChatCompletionRequest {
+    const SESSION_ID_ROUTING_TERMINATOR: &'static str = "\x1f";
+
     /// Build a routing key from text-like chat history and tool schemas.
     ///
     /// This lets cache-aware routing consider the full conversational prefix
@@ -691,6 +693,13 @@ impl ChatCompletionRequest {
             Some(session_id.to_string())
         }
     }
+
+    pub fn extract_session_id_key_for_routing(&self) -> Option<String> {
+        self.extract_session_id_for_routing().map(|mut session_id| {
+            session_id.push_str(Self::SESSION_ID_ROUTING_TERMINATOR);
+            session_id
+        })
+    }
 }
 
 impl GenerationRequest for ChatCompletionRequest {
@@ -709,7 +718,7 @@ impl GenerationRequest for ChatCompletionRequest {
         }
 
         // Fall back to session_id when the chat body has no usable history text.
-        if let Some(session_id) = self.extract_session_id_for_routing() {
+        if let Some(session_id) = self.extract_session_id_key_for_routing() {
             return session_id;
         }
 
@@ -3402,6 +3411,25 @@ mod tests {
         let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(request.model.as_deref(), Some("gpt-4"));
         assert_eq!(request.get_model(), Some("gpt-4"));
+    }
+
+    #[test]
+    fn test_chat_session_id_routing_key_has_terminator() {
+        let json = r#"{
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "session_params": {"session_id": "session-1"}
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            request.extract_session_id_for_routing().as_deref(),
+            Some("session-1")
+        );
+        assert_eq!(
+            request.extract_session_id_key_for_routing().as_deref(),
+            Some("session-1\x1f")
+        );
     }
 
     #[test]

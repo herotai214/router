@@ -73,6 +73,8 @@ use std::thread;
 use std::time::Duration;
 use tracing::{debug, info};
 
+const FALLBACK_SESSION_CACHE_THRESHOLD: f32 = 0.999;
+
 /// Cache-aware routing policy
 ///
 /// Routes requests based on cache affinity when load is balanced,
@@ -310,14 +312,14 @@ impl CacheAwarePolicy {
         };
         debug!("Using cache-aware routing for model '{}'", model_id);
 
-        let probe = |text: &str| {
+        let probe = |text: &str, cache_threshold: f32| {
             let result = tree.prefix_match_with_counts(text);
             let match_rate = if result.input_char_count == 0 {
                 0.0
             } else {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
-            let selected_idx = if match_rate > self.config.cache_threshold {
+            let selected_idx = if match_rate > cache_threshold {
                 let tenant_url: &str = &result.tenant;
                 workers
                     .iter()
@@ -336,9 +338,10 @@ impl CacheAwarePolicy {
         let (selected_idx, selected_text, decision, stale_tenant, used_fallback) =
             if use_fallback_probe {
                 let fallback_text = fallback_text.unwrap_or("");
-                let (primary_idx, primary_match_rate, primary_tenant) = probe(primary_text);
+                let (primary_idx, primary_match_rate, primary_tenant) =
+                    probe(primary_text, FALLBACK_SESSION_CACHE_THRESHOLD);
 
-                if primary_match_rate > self.config.cache_threshold {
+                if primary_match_rate > FALLBACK_SESSION_CACHE_THRESHOLD {
                     if let Some(idx) = primary_idx {
                         (Some(idx), primary_text, "session_id_match", None, false)
                     } else {
@@ -346,7 +349,7 @@ impl CacheAwarePolicy {
                         debug!("Removed stale worker {} from cache tree", primary_tenant);
                         RouterMetrics::record_cache_aware_decision("session_id_fallback");
                         let (fallback_idx, fallback_match_rate, fallback_tenant) =
-                            probe(fallback_text);
+                            probe(fallback_text, self.config.cache_threshold);
                         if fallback_match_rate > self.config.cache_threshold {
                             if let Some(idx) = fallback_idx {
                                 (Some(idx), fallback_text, "full_history_match", None, true)
@@ -371,7 +374,8 @@ impl CacheAwarePolicy {
                     }
                 } else {
                     RouterMetrics::record_cache_aware_decision("session_id_fallback");
-                    let (fallback_idx, fallback_match_rate, fallback_tenant) = probe(fallback_text);
+                    let (fallback_idx, fallback_match_rate, fallback_tenant) =
+                        probe(fallback_text, self.config.cache_threshold);
                     if fallback_match_rate > self.config.cache_threshold {
                         if let Some(idx) = fallback_idx {
                             (Some(idx), fallback_text, "full_history_match", None, true)
@@ -395,7 +399,7 @@ impl CacheAwarePolicy {
                     }
                 }
             } else {
-                let (idx, match_rate, tenant) = probe(primary_text);
+                let (idx, match_rate, tenant) = probe(primary_text, self.config.cache_threshold);
                 let decision = if match_rate > self.config.cache_threshold {
                     "cache_affinity"
                 } else {
@@ -741,6 +745,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx1, idx3);
+    }
+
+    #[test]
+    fn test_cache_aware_fallback_uses_strict_session_threshold() {
+        let config = CacheAwareConfig {
+            cache_threshold: 0.3,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+
+        let idx1 = policy
+            .select_worker_with_fallback_headers(
+                &workers,
+                Some("session-1\x1f"),
+                Some("system:first unrelated prefix"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(idx1, 0);
+
+        workers[0].increment_load();
+
+        let idx2 = policy
+            .select_worker_with_fallback_headers(
+                &workers,
+                Some("session-12\x1f"),
+                Some("system:second unrelated prefix"),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(idx2, 1);
     }
 
     #[test]
