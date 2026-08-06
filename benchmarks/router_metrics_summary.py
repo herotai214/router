@@ -256,6 +256,25 @@ def main() -> int:
     )
     parser.add_argument("--pre", help="Experimental: pre-benchmark router .prom file")
     parser.add_argument("--post", help="Experimental: post-benchmark router .prom file")
+    parser.add_argument(
+        "--out",
+        help="Optional path to write the JSON summary (stdout still gets JSON unless --brief-only).",
+    )
+    parser.add_argument(
+        "--brief",
+        action="store_true",
+        help="Also print a one-line human summary to stderr.",
+    )
+    parser.add_argument(
+        "--brief-only",
+        action="store_true",
+        help="Print only the one-line human summary to stdout (implies --brief).",
+    )
+    parser.add_argument(
+        "--label",
+        default="",
+        help="Optional label included in --brief output.",
+    )
     args = parser.parse_args()
 
     if args.pre or args.post:
@@ -285,8 +304,40 @@ def main() -> int:
             worker_scrape_errors=worker_errors,
         )
 
-    json.dump(summary, sys.stdout, indent=2, sort_keys=True)
-    sys.stdout.write("\n")
+    if args.out:
+        Path(args.out).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+
+    def brief_line() -> str:
+        decisions = summary.get("cache_aware_decisions") or {}
+        prefix = summary.get("prefix_cache") or {}
+        workers = (summary.get("workers_balance") or {}).get("by_worker") or {}
+        label = args.label or "case"
+        parts = [
+            f"METRICS_SUMMARY label={label}",
+            f"prefix_hit_rate={float(prefix.get('hit_rate_pct') or 0.0):.2f}%",
+            f"prefix_hits={prefix.get('hits', 0)}",
+            f"prefix_queries={prefix.get('queries', 0)}",
+            f"decisions_total={decisions.get('total', 0)}",
+        ]
+        for key in DECISION_KEYS:
+            val = decisions.get(key, 0)
+            if val:
+                parts.append(f"{key}={val}")
+        if workers:
+            balance = ",".join(f"{k.split(':')[-1]}={v}" for k, v in sorted(workers.items()))
+            parts.append(f"workers={balance}")
+        return " ".join(parts)
+
+    if args.brief or args.brief_only:
+        line = brief_line()
+        if args.brief_only:
+            print(line)
+        else:
+            print(line, file=sys.stderr)
+
+    if not args.brief_only:
+        json.dump(summary, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
     return 0
 
 

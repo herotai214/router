@@ -1,151 +1,196 @@
-# Router Metrics Summary
+# Cache-Aware Chat Benchmarks
 
-This directory contains a small helper for summarizing router Prometheus metrics
-after chat-completions benchmark runs.
+Small, dependency-free helpers for `/v1/chat/completions` prefix-cache experiments
+with vLLM Router.
 
-This is a rough benchmark utility for the current `/v1/chat/completions`
-prefix-cache experiments. It assumes the router and workers are cold-started for
-one benchmark case, then queried right after the case finishes.
+| File | Role |
+|------|------|
+| `CACHE_AWARE_OPERATOR_GUIDE.md` | End-to-end install → workers+router → bench → DP baseline → metrics |
+| `chat_prefix_repetition.py` | Synthetic chat prefix-repetition client (TTFT / E2E / RPS) |
+| `router_metrics_summary.sh` | **User entrypoint** for a clean post-run metrics summary |
+| `router_metrics_summary.py` | Implementation behind the `.sh` (also callable from other tools) |
 
-## One-command Usage
+**Recommended demo model:** Qwen3.5-4B (small weights, long context). See the operator guide.
 
-After a benchmark finishes, while the router and workers are still alive, run:
+Cold-start each case (fresh workers + router) so absolute Prometheus counters are
+the case counters.
+
+## Mental model
+
+```text
+Client  →  vllm-router (cache_aware)  →  independent vLLM workers
+                │                              │
+                │  picks worker likely to      │  each owns its own
+                │  already hold this prefix    │  KV / prefix cache
+```
+
+For these demos, start **N independent** `vllm serve` processes (TP=1, no DP)
+and pass each URL to the router.
+
+## Bring up 2 workers + cache-aware router
 
 ```bash
-bash router/benchmarks/router_metrics_summary.sh 127.0.0.1:29400
+# Recommend Qwen3.5-4B for a small long-context demo
+export MODEL_PATH=/path/to/Qwen3.5-4B
+export SERVED=qwen35-4b
+
+CUDA_VISIBLE_DEVICES=0 vllm serve "$MODEL_PATH" \
+  --host 0.0.0.0 --port 18100 \
+  --served-model-name "$SERVED" \
+  --tensor-parallel-size 1 \
+  --enable-prefix-caching \
+  --trust-remote-code \
+  > vllm_w0.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=1 vllm serve "$MODEL_PATH" \
+  --host 0.0.0.0 --port 18101 \
+  --served-model-name "$SERVED" \
+  --tensor-parallel-size 1 \
+  --enable-prefix-caching \
+  --trust-remote-code \
+  > vllm_w1.log 2>&1 &
+
+curl -fsS http://127.0.0.1:18100/health
+curl -fsS http://127.0.0.1:18101/health
+
+# Preferred: native Rust binary (from repo root after cargo build --release)
+# Chat key modes: full-history | session-id | session-id-full-history-fallback
+./target/release/vllm-router \
+  --host 0.0.0.0 \
+  --port 18180 \
+  --worker-urls http://127.0.0.1:18100 http://127.0.0.1:18101 \
+  --policy cache_aware \
+  --prometheus-port 29400 \
+  --cache-threshold 0.3 \
+  --balance-abs-threshold 2 \
+  --balance-rel-threshold 1.5 \
+  --chat-routing-key-mode full-history \
+  > router.log 2>&1 &
+
+curl -fsS http://127.0.0.1:18180/health
 ```
 
-The target may be either `host:port`, a full URL, or a saved `.prom` file:
+Build the binary with `cargo build --release` (from the router repo root).  
+`cargo run --release -- …` is equivalent. A `vllm-router` console script from a
+Python wheel exists and wraps the same engine, but this guide uses the Rust
+binary only.
+
+### Threshold knobs
+
+| Flag | Role |
+|------|------|
+| `--cache-threshold` | Min prefix-tree match rate for cache affinity (use `~0.3` for text keys; `~0.999` for pure `session-id` to avoid false matches) |
+| `--balance-abs-threshold` / `--balance-rel-threshold` | Load-balance gates; if imbalance exceeds them, router may skip affinity (`load_balance`) |
+
+Common presets: `lb_mid` = `0.3 / 2 / 1.5`, `lb_aggr` = `0.3 / 0 / 1.0`, `sid999` = `0.999 / 2 / 1.5`.
+
+## Run the synthetic chat benchmark
+
+From the router repo root:
 
 ```bash
-bash router/benchmarks/router_metrics_summary.sh http://127.0.0.1:29400/metrics
-bash router/benchmarks/router_metrics_summary.sh logs/my_run/metrics_router_case_post.prom
+python3 benchmarks/chat_prefix_repetition.py \
+  --base-url http://127.0.0.1:18180 \
+  --model qwen35-4b \
+  --num-prompts 100 \
+  --prefix-len 256 \
+  --suffix-len 16 \
+  --session-groups 16 \
+  --unique-prefixes 12 \
+  --output-len 16 \
+  --max-concurrency 4 \
+  --label full_history_lb_mid
 ```
 
-The helper curls router `/metrics`, discovers worker URLs from the router's
-worker-balance metrics, curls each worker `/metrics` once, and computes prefix
-hit rate from worker counters. Nothing runs in the router background.
+Env vars `BASE_URL` / `MODEL` / `NUM_PROMPTS` / … still work as fallbacks.
 
-The output JSON uses the benchmark-facing names:
+The client sends `session_params.session_id` on every request so `session-id` and
+fallback key modes have a real sticky key.
 
-- `cache_aware_decisions`: cache-aware routing decision counts.
-- `workers_balance`: policy decision split by worker.
-- `prefix_cache`: aggregate and per-worker prefix-cache hits, queries, and hit
-  rate.
+## Get metrics (prefer the `.sh`)
 
-Example shape:
+**Why both `.sh` and `.py`?**  
+`router_metrics_summary.sh` is the one-liner you should run; it only forwards
+args to `router_metrics_summary.py`. The `.py` is the real implementation (also
+imported/invoked by automation). Prefer the `.sh` in docs and shells.
 
-```json
-{
-  "window": "absolute_cold_start",
-  "scope": "chat_completions_benchmark_rough",
-  "cache_aware_decisions": {
-    "session_id_match": 73,
-    "session_id_fallback": 27,
-    "full_history_match": 1,
-    "full_history_low_match": 26,
-    "cache_affinity": 0,
-    "load_balance": 0,
-    "low_match_min_load": 0,
-    "total": 127
-  },
-  "workers_balance": {
-    "by_worker": {
-      "http://127.0.0.1:28100": 52,
-      "http://127.0.0.1:28101": 48
-    },
-    "total": 100
-  },
-  "prefix_cache": {
-    "hits": 4405104,
-    "queries": 6491110,
-    "hit_rate": 0.6786,
-    "hit_rate_pct": 67.86,
-    "per_worker": {}
-  }
-}
+While router and workers are **still alive**:
+
+```bash
+# Clean JSON + optional one-liner
+bash benchmarks/router_metrics_summary.sh 127.0.0.1:29400 --brief
+
+# Save JSON to a file, print only the brief line
+bash benchmarks/router_metrics_summary.sh 127.0.0.1:29400 \
+  --out summary.json --brief-only --label full_history_lb_mid
 ```
 
-## Router `/metrics` Requirements
+Target may be `host:port`, a URL, or a saved `.prom` file:
 
-The helper expects router `/metrics` to contain the existing router metrics:
+```bash
+curl -fsS http://127.0.0.1:29400/metrics > metrics_router.prom
+curl -fsS http://127.0.0.1:18100/metrics > metrics_w0.prom
+curl -fsS http://127.0.0.1:18101/metrics > metrics_w1.prom
+
+bash benchmarks/router_metrics_summary.sh metrics_router.prom \
+  --workers metrics_w0.prom,metrics_w1.prom \
+  --out summary.json --brief-only
+```
+
+Raw `/metrics` dumps are huge and messy; use the summary helper for decisions +
+prefix hit rate. Do not rely on scraping after teardown — worker hit rate needs
+a live (or saved) worker scrape.
+
+### JSON fields
+
+- `cache_aware_decisions` — routing decision counts
+- `workers_balance` — policy decisions by worker URL
+- `prefix_cache` — aggregate / per-worker hits, queries, hit rate
+
+### Decision labels
+
+**Fallback mode** (`session_id_full_history_fallback`):
+
+- `session_id_match` — session key strong → sticky worker
+- `session_id_fallback` — session weak/stale → try full history (path counter)
+- `full_history_match` — after fallback, history strong → affinity
+- `full_history_low_match` — after fallback still weak → min-load
+
+**Single-key modes** (`full_history`, `session_id`):
+
+- `cache_affinity` — match ≥ `cache_threshold`
+- `load_balance` — imbalance past abs/rel gates
+- `low_match_min_load` — match below threshold → min-load
+
+### Required Prometheus series
+
+Router:
 
 ```text
 vllm_router_cache_aware_decisions_total{decision="..."}
 vllm_router_policy_decisions_total{policy="cache_aware",worker="..."}
 ```
 
-The helper expects worker `/metrics` to contain the existing vLLM prefix-cache
-counters:
+Workers:
 
 ```text
 vllm:prefix_cache_hits_total
 vllm:prefix_cache_queries_total
 ```
 
-If worker discovery from router metrics is not enough, pass explicit workers:
+### Experimental delta mode
 
 ```bash
-bash router/benchmarks/router_metrics_summary.sh 127.0.0.1:29400 \
-  --workers http://127.0.0.1:28100,http://127.0.0.1:28101
+bash benchmarks/router_metrics_summary.sh \
+  --pre logs/case_pre.prom \
+  --post logs/case_post.prom
 ```
 
-## Cold-start Semantics
+Marked `delta_experimental_untested` in JSON. Prefer cold-start absolute snapshots.
 
-For the main path, use one fresh router and fresh workers per benchmark case.
-Then one post-benchmark command is enough:
+## DP baseline and expectations
 
-```bash
-bash router/benchmarks/router_metrics_summary.sh 127.0.0.1:29400
-```
-
-The JSON field `window` is `absolute_cold_start` in this mode. Since the router
-and workers start from zero for each case, absolute counters are the case
-counters. Run the helper before the benchmark cleanup kills the workers, because
-hit rate comes from one on-demand worker `/metrics` scrape.
-
-The helper also has an experimental pre/post delta mode:
-
-```bash
-bash router/benchmarks/router_metrics_summary.sh \
-  --pre logs/my_run/metrics_router_case_pre.prom \
-  --post logs/my_run/metrics_router_case_post.prom
-```
-
-This is marked `delta_experimental_untested` in JSON. Keep it as a convenience
-for old logs; the cold-start snapshot path is the supported benchmark path.
-
-## Decision Labels
-
-### Fallback Mode
-
-`session_id_full_history_fallback` probes the session key first, then falls back
-to full chat history only when the session key is weak or stale.
-
-- `session_id_match`: the `session_id` key had a strong match and the router
-  chose the matched healthy worker.
-- `session_id_fallback`: the `session_id` key was weak or stale, so the router
-  tried the full-history key next. This is a path counter and can be counted in
-  addition to the final fallback result.
-- `full_history_match`: after session fallback, full history had a strong match
-  and the router chose that matched worker.
-- `full_history_low_match`: after session fallback, full history was still below
-  threshold, so the router chose the minimum-load healthy worker.
-
-In Codex-style multi-turn runs, `full_history_match` can be rare because later
-turns usually hit `session_id_match`; full-history fallback is mostly evaluated
-on cold session starts.
-
-### Single-key Modes
-
-Pure `full_history` and pure `session_id` modes emit the generic labels:
-
-- `cache_affinity`: the selected routing key matched above `cache_threshold`, so
-  the router used cache affinity.
-- `load_balance`: load imbalance exceeded the configured gates, so the router
-  chose a lower-load worker instead of following cache affinity.
-- `low_match_min_load`: the selected routing key did not match above threshold,
-  so the router chose the minimum-load healthy worker.
-
-`load_balance` and `low_match_min_load` both route away from cache affinity, but
-for different reasons: one is load pressure, the other is weak prefix match.
+See `CACHE_AWARE_OPERATOR_GUIDE.md` §4.2 for a same-GPU-count
+`--data-parallel-size 2` control (no router). On this synthetic repeated-prefix
+chat shape, **cache-aware + `lb_mid` should generally beat DP** on TTFT and
+prefix hit rate.
