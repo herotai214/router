@@ -51,7 +51,25 @@ MAX_CONCURRENCY="${MAX_CONCURRENCY:-4}"
 MAX_TOKENS="${MAX_TOKENS:-256}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
+# Per-request server queue/prefill/ITL in chat response `metrics` (vLLM >= ~0.26).
+# Set ENABLE_PER_REQUEST_METRICS=0 on older stacks (e.g. Ascend v0.23) that reject the flag.
+ENABLE_PER_REQUEST_METRICS="${ENABLE_PER_REQUEST_METRICS:-1}"
+# Per-request reused prefix tokens in response `usage.prompt_tokens_details.cached_tokens`.
+# Set ENABLE_PROMPT_TOKENS_DETAILS=0 if an older backend rejects the flag.
+ENABLE_PROMPT_TOKENS_DETAILS="${ENABLE_PROMPT_TOKENS_DETAILS:-1}"
 VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:---max-num-seqs 4}"
+if [ "${ENABLE_PER_REQUEST_METRICS}" = "1" ]; then
+  case " ${VLLM_EXTRA_ARGS} " in
+    *" --enable-per-request-metrics "*) ;;
+    *) VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS} --enable-per-request-metrics" ;;
+  esac
+fi
+if [ "${ENABLE_PROMPT_TOKENS_DETAILS}" = "1" ]; then
+  case " ${VLLM_EXTRA_ARGS} " in
+    *" --enable-prompt-tokens-details "*) ;;
+    *) VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS} --enable-prompt-tokens-details" ;;
+  esac
+fi
 
 VLLM_BIN="${VLLM_BIN:-vllm}"
 ROUTER_BIN="${ROUTER_BIN:-${ROOT_DIR}/target/release/vllm-router}"
@@ -205,6 +223,7 @@ run_bench() {
   if [ -n "${MAX_TOKENS}" ]; then
     max_tokens_args+=(--max-tokens "${MAX_TOKENS}")
   fi
+  local per_req_jsonl="${LOG_DIR}/per_request_${label}.jsonl"
   log "BENCH_START label=${label} MAX_TOKENS=${MAX_TOKENS:-from_jsonl} base=${base_url}"
   "${PYTHON_BIN}" "${BENCH_DIR}/chat_jsonl_bench.py" \
     --input "${DATASET}" \
@@ -213,19 +232,23 @@ run_bench() {
     --max-concurrency "${MAX_CONCURRENCY}" \
     --limit "${NUM_PROMPTS}" \
     --label "${label}" \
+    --fire-mode "${CHAT_JSONL_FIRE_MODE:-session_serial}" \
+    --per-request-jsonl "${per_req_jsonl}" \
     "${max_tokens_args[@]}" \
     2>&1 | tee "${bench_log}"
-  log "BENCH_DONE label=${label}"
+  log "BENCH_DONE label=${label} per_request_jsonl=${per_req_jsonl}"
 }
 
 summarize_dp_only() {
   local label="$1"
   local backend_prom="$2"
+  local per_req_jsonl="${LOG_DIR}/per_request_${label}.jsonl"
   local out_json="${LOG_DIR}/summary_${label}.json"
   # No router decisions; still get APC / Prompt / latency via --workers and empty router scrape.
   # Pass backend as both target (ignored decisions) and workers.
   bash "${BENCH_DIR}/router_metrics_summary.sh" "${backend_prom}" \
     --workers "${backend_prom}" \
+    --per-request-jsonl "${per_req_jsonl}" \
     --out "${out_json}" \
     --brief-only \
     --label "${label}" \
@@ -237,9 +260,11 @@ summarize_router_case() {
   local label="$1"
   local router_prom="$2"
   local backend_prom="$3"
+  local per_req_jsonl="${LOG_DIR}/per_request_${label}.jsonl"
   local out_json="${LOG_DIR}/summary_${label}.json"
   bash "${BENCH_DIR}/router_metrics_summary.sh" "${router_prom}" \
     --workers "${backend_prom}" \
+    --per-request-jsonl "${per_req_jsonl}" \
     --out "${out_json}" \
     --brief-only \
     --label "${label}" \
@@ -318,6 +343,7 @@ main() {
   log "DATASET=${DATASET}"
   log "DEVICE_ENV_NAME=${DEVICE_ENV_NAME} DEVICES=${DEVICES} DP_SIZE=${DP_SIZE}"
   log "NUM_PROMPTS=${NUM_PROMPTS} MAX_CONCURRENCY=${MAX_CONCURRENCY} MAX_TOKENS=${MAX_TOKENS:-from_jsonl}"
+  log "ENABLE_PER_REQUEST_METRICS=${ENABLE_PER_REQUEST_METRICS} ENABLE_PROMPT_TOKENS_DETAILS=${ENABLE_PROMPT_TOKENS_DETAILS} VLLM_EXTRA_ARGS=${VLLM_EXTRA_ARGS}"
   log "PORTS baseline=${DP_BASELINE_PORT} backend=${BACKEND_PORT} router=${ROUTER_PORT} prom=${ROUTER_PROM_PORT}"
   log "RUN_DP_BASELINE=${RUN_DP_BASELINE} RUN_CACHE_AWARE=${RUN_CACHE_AWARE}"
   log "CONFIGS=${CONFIGS}"
@@ -338,7 +364,7 @@ main() {
   fi
 
   log "ALL_DONE ${LOG_DIR}"
-  log "Artifacts: vllm_*.log router_*.log bench_*.log metrics/*.prom summary_*.json driver.log"
+  log "Artifacts: vllm_*.log router_*.log bench_*.log per_request_*.jsonl metrics/*.prom summary_*.json driver.log"
 }
 
 main "$@"

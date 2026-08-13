@@ -60,7 +60,10 @@
 */
 
 use super::hash_key::extract_hash_key_from_headers;
-use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, RequestHeaders};
+use super::{
+    get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, RequestHeaders,
+    RoutingSelection,
+};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use crate::policies::normalize_model_key;
@@ -182,7 +185,7 @@ impl CacheAwarePolicy {
         model_id: &str,
         max_load: usize,
         min_load: usize,
-    ) -> Option<usize> {
+    ) -> Option<RoutingSelection> {
         // Log load balancing trigger (only compute worker loads if debug enabled)
         if tracing::enabled!(tracing::Level::DEBUG) {
             let worker_loads: Vec<(&str, usize)> =
@@ -225,16 +228,19 @@ impl CacheAwarePolicy {
         RouterMetrics::record_processed_request(workers[min_load_idx].url());
         RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
 
-        Some(min_load_idx)
+        Some(RoutingSelection {
+            index: min_load_idx,
+            decision: Some("load_balance"),
+        })
     }
 
-    fn select_worker_cache_aware(
+    fn select_worker_cache_aware_with_decision(
         &self,
         workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
         fallback_text: Option<&str>,
         headers: Option<&RequestHeaders>,
-    ) -> Option<usize> {
+    ) -> Option<RoutingSelection> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
@@ -308,7 +314,10 @@ impl CacheAwarePolicy {
             RouterMetrics::record_processed_request(workers[selected_idx].url());
             RouterMetrics::record_policy_decision(self.name(), workers[selected_idx].url());
 
-            return Some(selected_idx);
+            return Some(RoutingSelection {
+                index: selected_idx,
+                decision: Some("no_tree_random"),
+            });
         };
         debug!("Using cache-aware routing for model '{}'", model_id);
 
@@ -433,7 +442,10 @@ impl CacheAwarePolicy {
             RouterMetrics::record_processed_request(workers[idx].url());
             RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
 
-            return Some(idx);
+            return Some(RoutingSelection {
+                index: idx,
+                decision: Some(decision),
+            });
         }
 
         if decision == "stale_tenant_fallback" {
@@ -446,10 +458,28 @@ impl CacheAwarePolicy {
             RouterMetrics::record_processed_request(workers[idx].url());
             RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
 
-            Some(idx)
+            Some(RoutingSelection {
+                index: idx,
+                decision: Some(if decision == "stale_tenant_fallback" {
+                    "stale_tenant_fallback"
+                } else {
+                    "first_healthy_fallback"
+                }),
+            })
         } else {
             None
         }
+    }
+
+    fn select_worker_cache_aware(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        fallback_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        self.select_worker_cache_aware_with_decision(workers, request_text, fallback_text, headers)
+            .map(|selection| selection.index)
     }
 }
 
@@ -471,6 +501,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
         self.select_worker_cache_aware(workers, request_text, fallback_text, headers)
+    }
+
+    fn select_worker_with_fallback_headers_with_decision(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        fallback_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<RoutingSelection> {
+        self.select_worker_cache_aware_with_decision(workers, request_text, fallback_text, headers)
     }
 
     fn name(&self) -> &'static str {

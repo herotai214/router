@@ -17,6 +17,12 @@ Hit-rate naming (both reported):
 
 Latency means from worker histograms (sum/count, all engines):
   queue / prefill / decode / ttft / e2e / inference
+
+Optional per-request JSONL from ``chat_jsonl_bench.py``:
+  --per-request-jsonl /path/to/per_request_case.jsonl
+
+This adds grep-friendly server_* means from vLLM's per-request response
+metrics (requires ``vllm serve --enable-per-request-metrics``).
 """
 
 from __future__ import annotations
@@ -216,6 +222,67 @@ def prompt_cache_stats(cached: float, total: float) -> dict[str, Any]:
         "prompt_tokens_total": json_number(total),
         "hit_rate": rate,
         "hit_rate_pct": rate * 100.0,
+    }
+
+
+def value_summary(values: list[float]) -> dict[str, Any] | None:
+    if not values:
+        return None
+    values = sorted(values)
+    return {
+        "count": len(values),
+        "mean": sum(values) / len(values),
+        "p50": values[min(len(values) - 1, max(0, round(0.50 * (len(values) - 1))))],
+        "p90": values[min(len(values) - 1, max(0, round(0.90 * (len(values) - 1))))],
+    }
+
+
+def summarize_per_request_jsonl(path: str | None) -> dict[str, Any] | None:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        return {"path": str(p), "error": "file_not_found"}
+
+    rows = []
+    for raw in p.read_text(errors="ignore").splitlines():
+        if not raw.strip():
+            continue
+        try:
+            rows.append(json.loads(raw))
+        except json.JSONDecodeError:
+            continue
+
+    def collect(field: str) -> list[float]:
+        vals: list[float] = []
+        for row in rows:
+            value = row.get(field)
+            if value is None:
+                continue
+            try:
+                vals.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        return vals
+
+    fields = {
+        "server_queue_ms": "server_queue_ms",
+        "server_prefill_ms": "server_prefill_ms",
+        "server_mean_itl_ms": "server_mean_itl_ms",
+        "server_generation_ms": "server_generation_ms",
+        "client_ttft_ms": "client_ttft_ms",
+        "client_tpot_ms": "client_tpot_ms",
+        "client_e2e_ms": "client_e2e_ms",
+    }
+    stats = {
+        key: value_summary(collect(field))
+        for key, field in fields.items()
+    }
+    return {
+        "path": str(p),
+        "requests": len(rows),
+        "ok": sum(1 for row in rows if row.get("ok")),
+        "metrics": {key: val for key, val in stats.items() if val is not None},
     }
 
 
@@ -456,6 +523,11 @@ def main() -> int:
         default="",
         help="Optional label included in --brief output.",
     )
+    parser.add_argument(
+        "--per-request-jsonl",
+        default="",
+        help="Optional per_request_*.jsonl from chat_jsonl_bench.py.",
+    )
     args = parser.parse_args()
 
     discovered: list[str] = []
@@ -488,6 +560,10 @@ def main() -> int:
             discovered_worker_urls=discovered,
         )
 
+    per_request = summarize_per_request_jsonl(args.per_request_jsonl)
+    if per_request is not None:
+        summary["per_request"] = per_request
+
     if args.out:
         Path(args.out).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 
@@ -496,6 +572,7 @@ def main() -> int:
         apc = summary.get("apc_prefix_cache") or {}
         prompt = summary.get("prompt_token_cache") or {}
         latency = summary.get("latency_seconds") or {}
+        per_req = ((summary.get("per_request") or {}).get("metrics") or {})
         workers = (summary.get("workers_balance") or {}).get("by_worker") or {}
         label = args.label or "case"
         parts = [
@@ -520,6 +597,18 @@ def main() -> int:
             if item and item.get("mean") is not None:
                 short = lat_key.replace("_seconds", "")
                 parts.append(f"{short}_mean_s={float(item['mean']):.3f}")
+        for key in (
+            "server_queue_ms",
+            "server_prefill_ms",
+            "server_mean_itl_ms",
+            "server_generation_ms",
+            "client_ttft_ms",
+            "client_tpot_ms",
+            "client_e2e_ms",
+        ):
+            item = per_req.get(key)
+            if item and item.get("mean") is not None:
+                parts.append(f"per_req_{key}_mean={float(item['mean']):.2f}")
         for key in DECISION_KEYS:
             val = decisions.get(key, 0)
             if val:

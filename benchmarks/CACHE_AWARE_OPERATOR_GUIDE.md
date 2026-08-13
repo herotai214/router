@@ -11,7 +11,7 @@ benchmarks/chat_jsonl_bench.py            ← Codex / OpenAI chat JSONL client
 benchmarks/router_metrics_summary.sh      ← prefer this
 benchmarks/router_metrics_summary.py
 benchmarks/run_dp_cache_aware_demo.sh     ← synthetic DP+router demo
-benchmarks/run_codex_dp_cache_aware.sh    ← Codex JSONL DP+router (NPU/CUDA)
+benchmarks/run_codex_dp_cache_aware.sh            ← Codex JSONL DP+router (NPU/CUDA)
 benchmarks/CACHE_AWARE_OPERATOR_GUIDE.md
 ```
 

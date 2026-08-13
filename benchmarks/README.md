@@ -120,14 +120,10 @@ MAX_TOKENS=256 \
 bash benchmarks/run_codex_dp_cache_aware.sh
 ```
 
-Four router knobs (sequential cold starts):
+Run configs **one at a time** on a single DP pair (set `DEVICES` / `CONFIGS` per case):
 
 ```bash
-RUN_DP_BASELINE=0 RUN_CACHE_AWARE=1 \
-CONFIGS="lb_rel15:0.3:2:1.5 lb_rel20:0.3:2:2.0 lb_rel25:0.3:2:2.5 lb_c02_rel20:0.2:2:2.0" \
-MODEL_PATH=... DATASET=... DEVICES=0,1 \
-ROUTER_BIN=./target/release/vllm-router \
-bash benchmarks/run_codex_dp_cache_aware.sh
+DEVICES=0,1 CONFIGS="lb_mid:0.3:2:1.5" bash benchmarks/run_codex_dp_cache_aware.sh
 ```
 
 CUDA:

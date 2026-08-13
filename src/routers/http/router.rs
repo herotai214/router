@@ -504,7 +504,9 @@ impl Router {
         })
     }
 
-    /// Select worker for a specific model considering circuit breaker state
+    /// Select worker for a specific model considering circuit breaker state.
+    /// Test helper; production routing uses `_with_fallback_trace`.
+    #[cfg(test)]
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
@@ -516,6 +518,8 @@ impl Router {
 
     /// Select worker for a specific model, optionally allowing policies to use
     /// a fallback routing key when the primary key has weak affinity.
+    /// Test helper; production routing uses `_with_fallback_trace`.
+    #[cfg(test)]
     fn select_worker_for_model_with_fallback(
         &self,
         model_id: Option<&str>,
@@ -523,6 +527,19 @@ impl Router {
         fallback_text: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
+        self.select_worker_for_model_with_fallback_trace(model_id, text, fallback_text, headers)
+            .map(|(worker, _decision)| worker)
+    }
+
+    /// Select worker and return a policy-specific routing decision label when
+    /// available. Used only for per-request tracing headers.
+    fn select_worker_for_model_with_fallback_trace(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+        fallback_text: Option<&str>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<(Arc<dyn Worker>, Option<&'static str>)> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -547,13 +564,13 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_fallback_headers(
+        let selection = policy.select_worker_with_fallback_headers_with_decision(
             &available,
             text,
             fallback_text,
             request_headers.as_ref(),
         )?;
-        Some(available[idx].clone())
+        Some((available[selection.index].clone(), selection.decision))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -604,17 +621,22 @@ impl Router {
             // operation per attempt
             |_: u32| async {
                 let selected_worker = if fallback_text.is_some() {
-                    self.select_worker_for_model_with_fallback(
+                    self.select_worker_for_model_with_fallback_trace(
                         model_id,
                         Some(&text),
                         fallback_text.as_deref(),
                         headers,
                     )
                 } else {
-                    self.select_worker_for_model(model_id, Some(&text), headers)
+                    self.select_worker_for_model_with_fallback_trace(
+                        model_id,
+                        Some(&text),
+                        None,
+                        headers,
+                    )
                 };
 
-                let worker = match selected_worker {
+                let (worker, routing_decision) = match selected_worker {
                     Some(w) => w,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -656,6 +678,7 @@ impl Router {
                         worker.url(),
                         is_stream,
                         load_incremented,
+                        routing_decision,
                     )
                     .await;
 
@@ -709,6 +732,34 @@ impl Router {
             }
         }
         worker_url.to_string()
+    }
+
+    fn add_routing_trace_headers(
+        headers: &mut HeaderMap,
+        worker_url: &str,
+        dp_rank: Option<usize>,
+        decision: Option<&str>,
+    ) {
+        if let Ok(value) = HeaderValue::from_str(worker_url) {
+            headers.insert("x-vllm-router-worker", value);
+        }
+        let base_worker = match dp_utils::extract_dp_rank(worker_url) {
+            Ok((base, _)) => base,
+            Err(_) => worker_url,
+        };
+        if let Ok(value) = HeaderValue::from_str(base_worker) {
+            headers.insert("x-vllm-router-base-worker", value);
+        }
+        if let Some(rank) = dp_rank {
+            if let Ok(value) = HeaderValue::from_str(&rank.to_string()) {
+                headers.insert("x-vllm-router-dp-rank", value);
+            }
+        }
+        if let Some(decision) = decision {
+            if let Ok(value) = HeaderValue::from_str(decision) {
+                headers.insert("x-vllm-router-decision", value);
+            }
+        }
     }
 
     // Generic simple routing for GET/POST without JSON body
@@ -826,6 +877,7 @@ impl Router {
     }
 
     // Send typed request directly without conversion
+    #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -834,6 +886,7 @@ impl Router {
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
+        routing_decision: Option<&str>,
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -939,7 +992,13 @@ impl Router {
 
         if !is_stream {
             // For non-streaming requests, preserve headers
-            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            Self::add_routing_trace_headers(
+                &mut response_headers,
+                worker_url,
+                extracted_dp_rank,
+                routing_decision,
+            );
 
             let response = match res.bytes().await {
                 Ok(body) => {
@@ -980,6 +1039,12 @@ impl Router {
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            Self::add_routing_trace_headers(
+                &mut response_headers,
+                &worker_url,
+                extracted_dp_rank,
+                routing_decision,
+            );
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1034,6 +1099,12 @@ impl Router {
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            Self::add_routing_trace_headers(
+                &mut response_headers,
+                worker_url,
+                extracted_dp_rank,
+                routing_decision,
+            );
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
