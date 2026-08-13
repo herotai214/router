@@ -60,10 +60,13 @@
 
     6. load_balance_metric: request | token (default request)
     request: existing in-flight request counts for abs/rel + min-load.
-    token: predicted_load(w) = token_load[w] + uncached_tokens(w, req).
-    Pick the min predicted load, keeping a strong-cache worker only if it
-    stays within token_abs_req_equiv incoming-request equivalents AND
-    token_balance_rel of the cheapest worker.
+    token: min-load uses in-flight token_load only (occupancy already charged
+    to each worker). Do NOT add this request's uncached tokens into "best" —
+    that folds the cache-miss tax into load and makes sticky always look cheaper.
+    Uncached is still charged to token_load after the pick.
+    Keep a strong-cache worker only if its token_load stays within
+    token_abs_req_equiv request-equivalents of occupancy (token_load / inflight)
+    AND token_balance_rel of the cheapest worker.
 */
 
 use super::hash_key::extract_hash_key_from_headers;
@@ -193,6 +196,18 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// Tokens already charged per in-flight request. Used so token_abs_req_equiv
+    /// is a request-equivalent in occupancy units, not this prompt's full size.
+    fn token_occupancy_unit(worker: &dyn Worker) -> f32 {
+        let n = worker.load();
+        let tokens = worker.token_load() as f32;
+        if n == 0 {
+            1.0
+        } else {
+            (tokens / n as f32).max(1.0)
+        }
+    }
+
     fn uncached_tokens_for_worker(
         tree: Option<&Arc<Tree>>,
         worker_url: &str,
@@ -269,7 +284,6 @@ impl CacheAwarePolicy {
 
         let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
         let input_tokens = Self::estimate_prompt_tokens(score_text);
-        let incoming_unit = input_tokens.max(1) as f32;
 
         let mut uncached_by_idx = vec![0usize; workers.len()];
         let mut match_by_idx = vec![0.0f32; workers.len()];
@@ -287,7 +301,9 @@ impl CacheAwarePolicy {
             );
             uncached_by_idx[idx] = uncached;
             match_by_idx[idx] = match_rate;
-            let predicted = workers[idx].token_load().saturating_add(uncached);
+            // Occupancy already on the worker. Incoming uncached is a placement
+            // cost, not current load — adding it makes cache-miss ranks look busy.
+            let predicted = workers[idx].token_load();
             if predicted < best_predicted
                 || (predicted == best_predicted
                     && match_rate
@@ -309,16 +325,14 @@ impl CacheAwarePolicy {
             if aff_idx == best_idx {
                 aff_idx
             } else {
-                let pred_aff = workers[aff_idx]
-                    .token_load()
-                    .saturating_add(uncached_by_idx[aff_idx]);
-                let pred_best = workers[best_idx]
-                    .token_load()
-                    .saturating_add(uncached_by_idx[best_idx]);
+                let pred_aff = workers[aff_idx].token_load();
+                let pred_best = workers[best_idx].token_load();
+                let incoming_unit = Self::token_occupancy_unit(&*workers[aff_idx])
+                    .max(Self::token_occupancy_unit(&*workers[best_idx]));
                 let excess = pred_aff.saturating_sub(pred_best) as f32;
                 let abs_ok = excess <= self.config.token_abs_req_equiv * incoming_unit;
                 let rel_ok = (pred_aff as f32)
-                    <= (pred_best.max(input_tokens.max(1)) as f32) * self.config.token_balance_rel;
+                    <= pred_best.max(incoming_unit as usize) as f32 * self.config.token_balance_rel;
                 if abs_ok && rel_ok {
                     aff_idx
                 } else {
@@ -1128,8 +1142,12 @@ mod tests {
 
         let worker1 = BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular);
         let worker2 = BasicWorker::new("http://w2:8000".to_string(), WorkerType::Regular);
-        // 100k vs 20k token backlog, incoming ~80k chars/4.
+        // 100k / 5 req vs 20k / 1 req → occupancy unit 20k, excess 80k > abs=1.
+        for _ in 0..5 {
+            worker1.increment_load();
+        }
         worker1.add_token_load(100_000);
+        worker2.increment_load();
         worker2.add_token_load(20_000);
 
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1), Arc::new(worker2)];
@@ -1142,8 +1160,8 @@ mod tests {
 
     #[test]
     fn test_token_aware_prefers_lower_predicted_over_higher_cache_hit() {
-        // N1: 50% cache, 20k load. N2: 70% cache, 100k load.
-        // Incoming 100 tokens → predicted 20_050 vs 100_030, so pick N1.
+        // N1: 50% cache, 20k / 1 req. N2: 70% cache, 100k / 5 req.
+        // Occupancy 20k vs 100k; abs=1 request-equiv of 20k → pick N1.
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             eviction_interval_secs: 0,
             cache_threshold: 0.3,
@@ -1155,7 +1173,11 @@ mod tests {
 
         let worker1 = BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular);
         let worker2 = BasicWorker::new("http://w2:8000".to_string(), WorkerType::Regular);
+        worker1.increment_load();
         worker1.add_token_load(20_000);
+        for _ in 0..5 {
+            worker2.increment_load();
+        }
         worker2.add_token_load(100_000);
 
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1), Arc::new(worker2)];
@@ -1170,6 +1192,40 @@ mod tests {
         assert_eq!(
             idx, 0,
             "70% cache on the 100k worker should lose to 50% cache on the 20k worker"
+        );
+    }
+
+    #[test]
+    fn test_token_aware_min_load_ignores_incoming_uncached() {
+        // Warm rank: 2 in-flight, 8k occupancy, 90% prefix hit.
+        // Idle rank: 0 occupancy, would take ~20k uncached if we added it to "best".
+        // Old formula stays warm (8k+uncached < 0+20k). Occupancy-only + abs=1 breaks.
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            cache_threshold: 0.3,
+            load_balance_metric: CacheAwareLoadMetric::Token,
+            token_abs_req_equiv: 1.0,
+            token_balance_rel: 1.5,
+            ..Default::default()
+        });
+
+        let worker1 = BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular);
+        let worker2 = BasicWorker::new("http://w2:8000".to_string(), WorkerType::Regular);
+        worker1.increment_load();
+        worker1.increment_load();
+        worker1.add_token_load(8_000);
+
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1), Arc::new(worker2)];
+        policy.init_workers(&workers);
+
+        let prompt = "p".repeat(80_000);
+        let tree = policy.trees.get("default").expect("default tree").clone();
+        tree.insert(&prompt[..72_000], workers[0].url());
+
+        let idx = policy.select_worker(&workers, Some(&prompt)).unwrap();
+        assert_eq!(
+            idx, 1,
+            "incoming uncached on the idle worker must not hide occupancy on the warm worker"
         );
     }
 }

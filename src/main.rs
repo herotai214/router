@@ -198,7 +198,7 @@ struct CliArgs {
     #[arg(long, value_enum, default_value_t = CliCacheAwareLoadMetric::Request)]
     cache_aware_load_metric: CliCacheAwareLoadMetric,
 
-    /// Token-mode abs threshold in incoming-request equivalents (used when load metric is token)
+    /// Token-mode abs slack in occupancy request-equivalents (token_load / inflight; not this prompt's size)
     #[arg(long, default_value_t = 1.0)]
     token_abs_req_equiv: f32,
 
