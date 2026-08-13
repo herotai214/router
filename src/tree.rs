@@ -626,7 +626,6 @@ impl Tree {
         (matched_text, result.tenant.to_string())
     }
 
-    #[allow(dead_code)]
     pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
         // Use slice-based traversal - no Vec<char> allocation
 

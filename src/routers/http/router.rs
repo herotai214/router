@@ -528,7 +528,7 @@ impl Router {
         headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
         self.select_worker_for_model_with_fallback_trace(model_id, text, fallback_text, headers)
-            .map(|(worker, _decision)| worker)
+            .map(|(worker, _decision, _token_cost)| worker)
     }
 
     /// Select worker and return a policy-specific routing decision label when
@@ -539,7 +539,7 @@ impl Router {
         text: Option<&str>,
         fallback_text: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Option<(Arc<dyn Worker>, Option<&'static str>)> {
+    ) -> Option<(Arc<dyn Worker>, Option<&'static str>, usize)> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -570,7 +570,11 @@ impl Router {
             fallback_text,
             request_headers.as_ref(),
         )?;
-        Some((available[selection.index].clone(), selection.decision))
+        Some((
+            available[selection.index].clone(),
+            selection.decision,
+            selection.token_cost,
+        ))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -636,7 +640,7 @@ impl Router {
                     )
                 };
 
-                let (worker, routing_decision) = match selected_worker {
+                let (worker, routing_decision, token_cost) = match selected_worker {
                     Some(w) => w,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -657,6 +661,9 @@ impl Router {
 
                 let load_incremented = if policy.name() == "cache_aware" {
                     worker.increment_load();
+                    if token_cost > 0 {
+                        worker.add_token_load(token_cost);
+                    }
                     RouterMetrics::set_running_requests(worker.url(), worker.load());
                     true
                 } else {
@@ -679,6 +686,7 @@ impl Router {
                         is_stream,
                         load_incremented,
                         routing_decision,
+                        token_cost,
                     )
                     .await;
 
@@ -692,6 +700,9 @@ impl Router {
                 if is_retryable_status(response.status()) && load_incremented {
                     if let Some(cleanup_worker) = worker_for_cleanup {
                         cleanup_worker.decrement_load();
+                        if token_cost > 0 {
+                            cleanup_worker.sub_token_load(token_cost);
+                        }
                         RouterMetrics::set_running_requests(
                             cleanup_worker.url(),
                             cleanup_worker.load(),
@@ -887,6 +898,7 @@ impl Router {
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
         routing_decision: Option<&str>,
+        token_cost: usize,
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -975,6 +987,9 @@ impl Router {
                 if load_incremented {
                     if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
                         worker.decrement_load();
+                        if token_cost > 0 {
+                            worker.sub_token_load(token_cost);
+                        }
                         RouterMetrics::set_running_requests(worker_url, worker.load());
                     }
                 }
@@ -1012,6 +1027,9 @@ impl Router {
                     if load_incremented {
                         if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
                             worker.decrement_load();
+                            if token_cost > 0 {
+                                worker.sub_token_load(token_cost);
+                            }
                             RouterMetrics::set_running_requests(worker_url, worker.load());
                         }
                     }
@@ -1025,6 +1043,9 @@ impl Router {
             if load_incremented {
                 if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
                     worker.decrement_load();
+                    if token_cost > 0 {
+                        worker.sub_token_load(token_cost);
+                    }
                     RouterMetrics::set_running_requests(worker_url, worker.load());
                 }
             }
@@ -1034,6 +1055,7 @@ impl Router {
             // For streaming with load tracking, we need to manually decrement when done
             let registry = Arc::clone(&self.worker_registry);
             let worker_url = worker_url.to_string();
+            let stream_token_cost = token_cost;
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -1064,6 +1086,9 @@ impl Router {
                             {
                                 if let Some(worker) = registry.get_by_url(&worker_url) {
                                     worker.decrement_load();
+                                    if stream_token_cost > 0 {
+                                        worker.sub_token_load(stream_token_cost);
+                                    }
                                     RouterMetrics::set_running_requests(&worker_url, worker.load());
                                     decremented = true;
                                 }
@@ -1081,6 +1106,9 @@ impl Router {
                 if !decremented {
                     if let Some(worker) = registry.get_by_url(&worker_url) {
                         worker.decrement_load();
+                        if stream_token_cost > 0 {
+                            worker.sub_token_load(stream_token_cost);
+                        }
                         RouterMetrics::set_running_requests(&worker_url, worker.load());
                     }
                 }

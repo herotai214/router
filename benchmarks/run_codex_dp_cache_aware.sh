@@ -85,6 +85,11 @@ RUN_CACHE_AWARE="${RUN_CACHE_AWARE:-1}"
 # label:cache_threshold:balance_abs:balance_rel
 CONFIGS="${CONFIGS:-lb_mid:0.3:2:1.5}"
 CHAT_ROUTING_KEY_MODE="${CHAT_ROUTING_KEY_MODE:-session-id-full-history-fallback}"
+# request (default) or token. Token mode ignores request-count abs/rel and uses
+# predicted_load = in-flight tokens + uncached tokens of this request.
+CACHE_AWARE_LOAD_METRIC="${CACHE_AWARE_LOAD_METRIC:-request}"
+TOKEN_ABS_REQ_EQUIV="${TOKEN_ABS_REQ_EQUIV:-1.0}"
+TOKEN_BALANCE_REL="${TOKEN_BALANCE_REL:-1.5}"
 
 TS="$(date +%Y%m%d_%H%M%S)"
 MT_TAG="${MAX_TOKENS:-jsonl}"
@@ -197,7 +202,7 @@ start_router_dp_aware() {
     echo "Build with: (cd ${ROOT_DIR} && cargo build --release)" >&2
     exit 1
   fi
-  log "START_ROUTER label=${label} mode=${CHAT_ROUTING_KEY_MODE} cache=${cache} abs=${abs} rel=${rel} intra_dp=${DP_SIZE}"
+  log "START_ROUTER label=${label} mode=${CHAT_ROUTING_KEY_MODE} cache=${cache} abs=${abs} rel=${rel} load_metric=${CACHE_AWARE_LOAD_METRIC} token_abs=${TOKEN_ABS_REQ_EQUIV} token_rel=${TOKEN_BALANCE_REL} intra_dp=${DP_SIZE}"
   "${ROUTER_BIN}" \
     --host 0.0.0.0 \
     --port "${ROUTER_PORT}" \
@@ -207,6 +212,9 @@ start_router_dp_aware() {
     --cache-threshold "${cache}" \
     --balance-abs-threshold "${abs}" \
     --balance-rel-threshold "${rel}" \
+    --cache-aware-load-metric "${CACHE_AWARE_LOAD_METRIC}" \
+    --token-abs-req-equiv "${TOKEN_ABS_REQ_EQUIV}" \
+    --token-balance-rel "${TOKEN_BALANCE_REL}" \
     --chat-routing-key-mode "${CHAT_ROUTING_KEY_MODE}" \
     --intra-node-data-parallel-size "${DP_SIZE}" \
     >"${log_file}" 2>&1 &

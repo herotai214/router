@@ -1,9 +1,9 @@
 use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
-    ChatRoutingKeyMode, CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode,
-    DiscoveryConfig, HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
-    RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    CacheAwareLoadMetric, ChatRoutingKeyMode, CircuitBreakerConfig, ConfigError, ConfigResult,
+    ConnectionMode, DiscoveryConfig, HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig,
+    PolicyConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -59,6 +59,22 @@ impl From<CliChatRoutingKeyMode> for ChatRoutingKeyMode {
             CliChatRoutingKeyMode::SessionIdFullHistoryFallback => {
                 ChatRoutingKeyMode::SessionIdFullHistoryFallback
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum CliCacheAwareLoadMetric {
+    #[default]
+    Request,
+    Token,
+}
+
+impl From<CliCacheAwareLoadMetric> for CacheAwareLoadMetric {
+    fn from(metric: CliCacheAwareLoadMetric) -> Self {
+        match metric {
+            CliCacheAwareLoadMetric::Request => CacheAwareLoadMetric::Request,
+            CliCacheAwareLoadMetric::Token => CacheAwareLoadMetric::Token,
         }
     }
 }
@@ -177,6 +193,18 @@ struct CliArgs {
     /// Maximum size of the approximation tree for cache-aware routing
     #[arg(long, default_value_t = 67108864)] // 2^26
     max_tree_size: usize,
+
+    /// Cache-aware load signal: request counts (default) or estimated prefill tokens
+    #[arg(long, value_enum, default_value_t = CliCacheAwareLoadMetric::Request)]
+    cache_aware_load_metric: CliCacheAwareLoadMetric,
+
+    /// Token-mode abs threshold in incoming-request equivalents (used when load metric is token)
+    #[arg(long, default_value_t = 1.0)]
+    token_abs_req_equiv: f32,
+
+    /// Token-mode relative load threshold (used when load metric is token)
+    #[arg(long, default_value_t = 1.5)]
+    token_balance_rel: f32,
 
     /// Chat routing text used by text-aware policies such as cache_aware
     #[arg(long, value_enum, default_value_t = CliChatRoutingKeyMode::FullHistory)]
@@ -388,6 +416,9 @@ impl CliArgs {
                 balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
+                load_balance_metric: self.cache_aware_load_metric.into(),
+                token_abs_req_equiv: self.token_abs_req_equiv,
+                token_balance_rel: self.token_balance_rel,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5, // Default value

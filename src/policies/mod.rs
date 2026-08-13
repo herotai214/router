@@ -18,6 +18,7 @@ mod registry;
 mod rendezvous_hash;
 mod round_robin;
 
+pub use crate::config::CacheAwareLoadMetric;
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
@@ -38,6 +39,8 @@ pub type RequestHeaders = HashMap<String, String>;
 pub struct RoutingSelection {
     pub index: usize,
     pub decision: Option<&'static str>,
+    /// Estimated uncached prefill tokens charged to the selected worker.
+    pub token_cost: usize,
 }
 
 /// Core trait for load balancing policies
@@ -97,6 +100,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
             .map(|index| RoutingSelection {
                 index,
                 decision: None,
+                token_cost: 0,
             })
     }
 
@@ -188,6 +192,9 @@ pub struct CacheAwareConfig {
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
+    pub load_balance_metric: CacheAwareLoadMetric,
+    pub token_abs_req_equiv: f32,
+    pub token_balance_rel: f32,
 }
 
 impl Default for CacheAwareConfig {
@@ -198,6 +205,9 @@ impl Default for CacheAwareConfig {
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
+            load_balance_metric: CacheAwareLoadMetric::Request,
+            token_abs_req_equiv: 1.0,
+            token_balance_rel: 1.5,
         }
     }
 }

@@ -55,6 +55,9 @@ CACHE_THRESHOLD="${CACHE_THRESHOLD:-0.3}"
 BALANCE_ABS_THRESHOLD="${BALANCE_ABS_THRESHOLD:-2}"
 BALANCE_REL_THRESHOLD="${BALANCE_REL_THRESHOLD:-1.5}"
 CHAT_ROUTING_KEY_MODE="${CHAT_ROUTING_KEY_MODE:-session-id-full-history-fallback}"
+CACHE_AWARE_LOAD_METRIC="${CACHE_AWARE_LOAD_METRIC:-request}"
+TOKEN_ABS_REQ_EQUIV="${TOKEN_ABS_REQ_EQUIV:-1.0}"
+TOKEN_BALANCE_REL="${TOKEN_BALANCE_REL:-1.5}"
 
 TS="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="${LOG_DIR:-${PWD}/logs_dp${DP_SIZE}_cache_aware_demo_rp${ROUTER_PORT}_${TS}}"
@@ -145,7 +148,7 @@ start_backend_dp() {
 
 start_router_dp_aware() {
   local log_file="${LOG_DIR}/router_cache_aware_dp${DP_SIZE}.log"
-  log "START_ROUTER cache_aware mode=${CHAT_ROUTING_KEY_MODE} cache=${CACHE_THRESHOLD} abs=${BALANCE_ABS_THRESHOLD} rel=${BALANCE_REL_THRESHOLD} intra_dp=${DP_SIZE}"
+  log "START_ROUTER cache_aware mode=${CHAT_ROUTING_KEY_MODE} cache=${CACHE_THRESHOLD} abs=${BALANCE_ABS_THRESHOLD} rel=${BALANCE_REL_THRESHOLD} load_metric=${CACHE_AWARE_LOAD_METRIC} token_abs=${TOKEN_ABS_REQ_EQUIV} token_rel=${TOKEN_BALANCE_REL} intra_dp=${DP_SIZE}"
   if [ ! -x "${ROUTER_BIN}" ] && ! command -v "${ROUTER_BIN}" >/dev/null 2>&1; then
     echo "ERROR: ROUTER_BIN not found/executable: ${ROUTER_BIN}" >&2
     echo "Build with: (cd ${ROOT_DIR} && cargo build --release)" >&2
@@ -160,6 +163,9 @@ start_router_dp_aware() {
     --cache-threshold "${CACHE_THRESHOLD}" \
     --balance-abs-threshold "${BALANCE_ABS_THRESHOLD}" \
     --balance-rel-threshold "${BALANCE_REL_THRESHOLD}" \
+    --cache-aware-load-metric "${CACHE_AWARE_LOAD_METRIC}" \
+    --token-abs-req-equiv "${TOKEN_ABS_REQ_EQUIV}" \
+    --token-balance-rel "${TOKEN_BALANCE_REL}" \
     --chat-routing-key-mode "${CHAT_ROUTING_KEY_MODE}" \
     --intra-node-data-parallel-size "${DP_SIZE}" \
     >"${log_file}" 2>&1 &
@@ -201,7 +207,7 @@ main() {
   log "SERVED_MODEL=${SERVED_MODEL}"
   log "DEVICE_ENV_NAME=${DEVICE_ENV_NAME} DEVICES=${DEVICES} DP_SIZE=${DP_SIZE}"
   log "BACKEND_PORT=${BACKEND_PORT} ROUTER_PORT=${ROUTER_PORT} ROUTER_PROM_PORT=${ROUTER_PROM_PORT}"
-  log "CACHE_THRESHOLD=${CACHE_THRESHOLD} ABS=${BALANCE_ABS_THRESHOLD} REL=${BALANCE_REL_THRESHOLD}"
+  log "CACHE_THRESHOLD=${CACHE_THRESHOLD} ABS=${BALANCE_ABS_THRESHOLD} REL=${BALANCE_REL_THRESHOLD} LOAD_METRIC=${CACHE_AWARE_LOAD_METRIC} TOKEN_ABS=${TOKEN_ABS_REQ_EQUIV} TOKEN_REL=${TOKEN_BALANCE_REL}"
   log "CHAT_ROUTING_KEY_MODE=${CHAT_ROUTING_KEY_MODE}"
   log "NOTE: cache-aware also works with N independent workers (no DP); this script demos DP+router only."
 

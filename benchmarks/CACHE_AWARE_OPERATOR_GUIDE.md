@@ -186,8 +186,11 @@ CLI key-mode spelling uses hyphens: `full-history`, `session-id`,
 | Flag | Meaning |
 |------|---------|
 | `--cache-threshold` | Min prefix-tree match rate to treat as a strong hit and prefer that worker |
-| `--balance-abs-threshold` | Absolute load gap that allows breaking affinity |
-| `--balance-rel-threshold` | Relative load gap that allows breaking affinity |
+| `--balance-abs-threshold` | Absolute load gap that allows breaking affinity (request-count mode) |
+| `--balance-rel-threshold` | Relative load gap that allows breaking affinity (request-count mode) |
+| `--cache-aware-load-metric` | `request` (default) or `token`. Token mode is entirely token-level: predicted load = in-flight token estimate + uncached tokens of this request |
+| `--token-abs-req-equiv` | Token-mode abs slack, in incoming-request equivalents (default `1.0`) |
+| `--token-balance-rel` | Token-mode relative slack vs cheapest worker (default `1.5`) |
 | `--chat-routing-key-mode` | Which string keys the cache-aware tree for chat |
 | `--intra-node-data-parallel-size` | Expand one backend URL into DP-rank virtual workers (topology B only) |
 
@@ -198,6 +201,24 @@ lb_mid   = cache=0.3,   abs=2, rel=1.5   # usual winner vs plain DP
 lb_aggr  = cache=0.3,   abs=0, rel=1.0   # more even workers, lower hit rate
 sid999   = cache=0.999, abs=2, rel=1.5   # pure session_id (near-exact)
 ```
+
+**Token-level load (opt-in).** Default remains request-count. With
+`--cache-aware-load-metric token`, cache-aware is entirely token-level:
+`predicted_load(w) = token_load[w] + uncached(w, req)`, where uncached ≈
+`chars/4 × (1 − prefix match)`. Keep a strong-cache worker only if it stays within
+`--token-abs-req-equiv` incoming-request equivalents **and** `--token-balance-rel`
+of the cheapest worker.
+
+```bash
+./target/release/vllm-router \
+  --policy cache_aware \
+  --cache-aware-load-metric token \
+  --token-abs-req-equiv 1.0 \
+  --token-balance-rel 1.5 \
+  ...
+```
+
+The Codex helper accepts the same knobs as env vars (`CACHE_AWARE_LOAD_METRIC=token`).
 
 ---
 

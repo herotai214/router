@@ -92,6 +92,9 @@ mod test_pd_routing {
                     balance_rel_threshold: 1.2,
                     eviction_interval_secs: 60,
                     max_tree_size: 1000000,
+                    load_balance_metric: Default::default(),
+                    token_abs_req_equiv: 1.0,
+                    token_balance_rel: 1.5,
                 },
             ),
         ];

@@ -58,6 +58,21 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Decrement the load counter
     fn decrement_load(&self);
 
+    /// Estimated in-flight effective prefill tokens (0 unless token-aware routing).
+    fn token_load(&self) -> usize {
+        0
+    }
+
+    /// Add estimated prefill tokens to the in-flight token load.
+    fn add_token_load(&self, tokens: usize) {
+        let _ = tokens;
+    }
+
+    /// Subtract estimated prefill tokens from the in-flight token load.
+    fn sub_token_load(&self, tokens: usize) {
+        let _ = tokens;
+    }
+
     /// Reset the load counter to 0 (for sync/recovery)
     fn reset_load(&self) {
         // Default implementation - does nothing
@@ -285,6 +300,7 @@ pub struct WorkerMetadata {
 pub struct BasicWorker {
     metadata: WorkerMetadata,
     load_counter: Arc<AtomicUsize>,
+    token_load_counter: Arc<AtomicUsize>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
     consecutive_failures: Arc<AtomicUsize>,
@@ -323,6 +339,7 @@ impl BasicWorker {
         Self {
             metadata,
             load_counter: Arc::new(AtomicUsize::new(0)),
+            token_load_counter: Arc::new(AtomicUsize::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
@@ -458,8 +475,30 @@ impl Worker for BasicWorker {
             .ok();
     }
 
+    fn token_load(&self) -> usize {
+        self.token_load_counter.load(Ordering::Relaxed)
+    }
+
+    fn add_token_load(&self, tokens: usize) {
+        if tokens > 0 {
+            self.token_load_counter.fetch_add(tokens, Ordering::Relaxed);
+        }
+    }
+
+    fn sub_token_load(&self, tokens: usize) {
+        if tokens == 0 {
+            return;
+        }
+        self.token_load_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(tokens))
+            })
+            .ok();
+    }
+
     fn reset_load(&self) {
         self.load_counter.store(0, Ordering::Relaxed);
+        self.token_load_counter.store(0, Ordering::Relaxed);
     }
 
     fn processed_requests(&self) -> usize {
@@ -557,6 +596,18 @@ impl Worker for DPAwareWorker {
 
     fn decrement_load(&self) {
         self.base_worker.decrement_load();
+    }
+
+    fn token_load(&self) -> usize {
+        self.base_worker.token_load()
+    }
+
+    fn add_token_load(&self, tokens: usize) {
+        self.base_worker.add_token_load(tokens);
+    }
+
+    fn sub_token_load(&self, tokens: usize) {
+        self.base_worker.sub_token_load(tokens);
     }
 
     fn reset_load(&self) {

@@ -131,10 +131,12 @@ impl ConfigValidator {
             }
             PolicyConfig::CacheAware {
                 cache_threshold,
-                balance_abs_threshold: _,
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                token_abs_req_equiv,
+                token_balance_rel,
+                ..
             } => {
                 if !(0.0..=1.0).contains(cache_threshold) {
                     return Err(ConfigError::InvalidValue {
@@ -165,6 +167,22 @@ impl ConfigValidator {
                         field: "max_tree_size".to_string(),
                         value: max_tree_size.to_string(),
                         reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *token_abs_req_equiv < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "token_abs_req_equiv".to_string(),
+                        value: token_abs_req_equiv.to_string(),
+                        reason: "Must be >= 0.0".to_string(),
+                    });
+                }
+
+                if *token_balance_rel < 1.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "token_balance_rel".to_string(),
+                        value: token_balance_rel.to_string(),
+                        reason: "Must be >= 1.0".to_string(),
                     });
                 }
             }
@@ -589,6 +607,9 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                load_balance_metric: Default::default(),
+                token_abs_req_equiv: 1.0,
+                token_balance_rel: 1.5,
             },
         );
 
@@ -608,6 +629,9 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                load_balance_metric: Default::default(),
+                token_abs_req_equiv: 1.0,
+                token_balance_rel: 1.5,
             },
         );
 
@@ -665,6 +689,9 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                load_balance_metric: Default::default(),
+                token_abs_req_equiv: 1.0,
+                token_balance_rel: 1.5,
             },
         );
 
@@ -710,6 +737,9 @@ mod tests {
                     balance_rel_threshold: 1.1,
                     eviction_interval_secs: 60,
                     max_tree_size: 1000,
+                    load_balance_metric: Default::default(),
+                    token_abs_req_equiv: 1.0,
+                    token_balance_rel: 1.5,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,

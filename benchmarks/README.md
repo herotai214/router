@@ -164,7 +164,9 @@ CUDA_VISIBLE_DEVICES=0,1 vllm serve "$MODEL_PATH" \
 | Flag | Role |
 |------|------|
 | `--cache-threshold` | Min prefix-tree match for affinity (`~0.3` text; `~0.999` pure session-id) |
-| `--balance-abs-threshold` / `--balance-rel-threshold` | Load-balance gates |
+| `--balance-abs-threshold` / `--balance-rel-threshold` | Load-balance gates (request-count mode) |
+| `--cache-aware-load-metric` | `request` (default) or `token` predicted-load routing |
+| `--token-abs-req-equiv` / `--token-balance-rel` | Token-mode abs (incoming-request equivalents) and relative slack |
 | `--intra-node-data-parallel-size` | Topology B only — expand one URL into DP-rank workers |
 
 Presets: `lb_mid` = `0.3 / 2 / 1.5`, `lb_aggr` = `0.3 / 0 / 1.0`, `sid999` = `0.999 / 2 / 1.5`.

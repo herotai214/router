@@ -224,6 +224,25 @@ impl RoutingMode {
     }
 }
 
+/// Load signal used by cache-aware imbalance / fallback routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheAwareLoadMetric {
+    /// In-flight request counts (existing default).
+    #[default]
+    Request,
+    /// Estimated in-flight effective prefill tokens.
+    Token,
+}
+
+pub fn default_token_abs_req_equiv() -> f32 {
+    1.0
+}
+
+pub fn default_token_balance_rel() -> f32 {
+    1.5
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -246,6 +265,15 @@ pub enum PolicyConfig {
         eviction_interval_secs: u64,
         /// Maximum cache tree size per tenant
         max_tree_size: usize,
+        /// Request-count vs token-estimated load for cache-aware LB.
+        #[serde(default)]
+        load_balance_metric: CacheAwareLoadMetric,
+        /// Token-mode abs: extra load allowed, in incoming-request equivalents.
+        #[serde(default = "default_token_abs_req_equiv")]
+        token_abs_req_equiv: f32,
+        /// Token-mode relative threshold (same role as balance_rel_threshold).
+        #[serde(default = "default_token_balance_rel")]
+        token_balance_rel: f32,
     },
 
     #[serde(rename = "power_of_two")]
@@ -724,6 +752,9 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            load_balance_metric: Default::default(),
+            token_abs_req_equiv: 1.0,
+            token_balance_rel: 1.5,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -747,6 +778,9 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            load_balance_metric: Default::default(),
+            token_abs_req_equiv: 1.0,
+            token_balance_rel: 1.5,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -770,6 +804,9 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 600,
             max_tree_size: 5000,
+            load_balance_metric: Default::default(),
+            token_abs_req_equiv: 1.0,
+            token_balance_rel: 1.5,
         };
 
         match cache_aware {
@@ -779,6 +816,7 @@ mod tests {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                ..
             } => {
                 assert!((cache_threshold - 0.75).abs() < 0.0001);
                 assert_eq!(balance_abs_threshold, 20);
@@ -1099,6 +1137,9 @@ mod tests {
                 balance_rel_threshold: 1.2,
                 eviction_interval_secs: 600,
                 max_tree_size: 10000,
+                load_balance_metric: Default::default(),
+                token_abs_req_equiv: 1.0,
+                token_balance_rel: 1.5,
             },
             host: "0.0.0.0".to_string(),
             port: 3001,
@@ -1233,6 +1274,9 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                load_balance_metric: Default::default(),
+                token_abs_req_equiv: 1.0,
+                token_balance_rel: 1.5,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1266,6 +1310,9 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                load_balance_metric: Default::default(),
+                token_abs_req_equiv: 1.0,
+                token_balance_rel: 1.5,
             }),
             decode_policy: None,
             discovery_address: None,
@@ -1331,6 +1378,9 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 2000,
+            load_balance_metric: Default::default(),
+            token_abs_req_equiv: 1.0,
+            token_balance_rel: 1.5,
         };
 
         // Both should fall back to main policy

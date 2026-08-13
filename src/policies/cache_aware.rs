@@ -57,12 +57,19 @@
     5. max_tree_size: (integer)
     Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
     during the next eviction cycle.
+
+    6. load_balance_metric: request | token (default request)
+    request: existing in-flight request counts for abs/rel + min-load.
+    token: predicted_load(w) = token_load[w] + uncached_tokens(w, req).
+    Pick the min predicted load, keeping a strong-cache worker only if it
+    stays within token_abs_req_equiv incoming-request equivalents AND
+    token_balance_rel of the cheapest worker.
 */
 
 use super::hash_key::extract_hash_key_from_headers;
 use super::{
-    get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, RequestHeaders,
-    RoutingSelection,
+    get_healthy_worker_indices, CacheAwareConfig, CacheAwareLoadMetric, LoadBalancingPolicy,
+    RequestHeaders, RoutingSelection,
 };
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
@@ -177,6 +184,178 @@ impl CacheAwarePolicy {
         }
     }
 
+    fn estimate_prompt_tokens(text: &str) -> usize {
+        let chars = text.chars().count();
+        if chars == 0 {
+            0
+        } else {
+            chars.div_ceil(4)
+        }
+    }
+
+    fn uncached_tokens_for_worker(
+        tree: Option<&Arc<Tree>>,
+        worker_url: &str,
+        text: &str,
+        input_tokens: usize,
+    ) -> (f32, usize) {
+        if text.is_empty() || input_tokens == 0 {
+            return (0.0, 0);
+        }
+        let Some(tree) = tree else {
+            return (0.0, input_tokens);
+        };
+        let matched = tree.prefix_match_tenant(text, worker_url);
+        let total_chars = text.chars().count();
+        let match_rate = if total_chars == 0 {
+            0.0
+        } else {
+            matched.chars().count() as f32 / total_chars as f32
+        };
+        let cached = ((input_tokens as f32) * match_rate).round() as usize;
+        (match_rate, input_tokens.saturating_sub(cached.min(input_tokens)))
+    }
+
+    fn insert_routing_text(
+        &self,
+        tree: Option<&Arc<Tree>>,
+        model_id: &str,
+        worker_url: &str,
+        selected_text: &str,
+        primary_text: &str,
+        used_fallback: bool,
+    ) {
+        let Some(tree) = tree else {
+            debug!(
+                "Warning: No tree found for model '{}', skipping cache update",
+                model_id
+            );
+            return;
+        };
+        if !selected_text.is_empty() {
+            tree.insert(selected_text, worker_url);
+        }
+        if used_fallback && !primary_text.is_empty() && primary_text != selected_text {
+            tree.insert(primary_text, worker_url);
+        }
+    }
+
+    fn select_worker_token_aware(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        fallback_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+        healthy_indices: &[usize],
+        model_id: &str,
+    ) -> Option<RoutingSelection> {
+        let header_key = headers.and_then(extract_hash_key_from_headers);
+        let primary_text = request_text
+            .filter(|text| !text.trim().is_empty())
+            .or(header_key.as_deref())
+            .unwrap_or("");
+        let fallback_text = fallback_text.filter(|text| !text.trim().is_empty());
+        let used_fallback = fallback_text.is_some() && !primary_text.is_empty();
+        let score_text = fallback_text.unwrap_or(if primary_text.is_empty() {
+            ""
+        } else {
+            primary_text
+        });
+        let primary_text = if primary_text.is_empty() {
+            score_text
+        } else {
+            primary_text
+        };
+
+        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+        let input_tokens = Self::estimate_prompt_tokens(score_text);
+        let incoming_unit = input_tokens.max(1) as f32;
+
+        let mut uncached_by_idx = vec![0usize; workers.len()];
+        let mut match_by_idx = vec![0.0f32; workers.len()];
+        let mut best_idx = None;
+        let mut best_predicted = usize::MAX;
+        let mut affinity_idx = None;
+        let mut affinity_match = 0.0f32;
+
+        for &idx in healthy_indices {
+            let (match_rate, uncached) = Self::uncached_tokens_for_worker(
+                tree.as_ref(),
+                workers[idx].url(),
+                score_text,
+                input_tokens,
+            );
+            uncached_by_idx[idx] = uncached;
+            match_by_idx[idx] = match_rate;
+            let predicted = workers[idx].token_load().saturating_add(uncached);
+            if predicted < best_predicted
+                || (predicted == best_predicted
+                    && match_rate
+                        > best_idx.map(|i| match_by_idx[i]).unwrap_or(f32::NEG_INFINITY))
+            {
+                best_predicted = predicted;
+                best_idx = Some(idx);
+            }
+            if match_rate > self.config.cache_threshold
+                && (affinity_idx.is_none() || match_rate > affinity_match)
+            {
+                affinity_idx = Some(idx);
+                affinity_match = match_rate;
+            }
+        }
+
+        let best_idx = best_idx?;
+        let pick_idx = if let Some(aff_idx) = affinity_idx {
+            if aff_idx == best_idx {
+                aff_idx
+            } else {
+                let pred_aff = workers[aff_idx]
+                    .token_load()
+                    .saturating_add(uncached_by_idx[aff_idx]);
+                let pred_best = workers[best_idx]
+                    .token_load()
+                    .saturating_add(uncached_by_idx[best_idx]);
+                let excess = pred_aff.saturating_sub(pred_best) as f32;
+                let abs_ok = excess <= self.config.token_abs_req_equiv * incoming_unit;
+                let rel_ok = (pred_aff as f32)
+                    <= (pred_best.max(input_tokens.max(1)) as f32) * self.config.token_balance_rel;
+                if abs_ok && rel_ok {
+                    aff_idx
+                } else {
+                    best_idx
+                }
+            }
+        } else {
+            best_idx
+        };
+
+        let token_cost = uncached_by_idx[pick_idx];
+        let decision = if Some(pick_idx) == affinity_idx {
+            "token_affinity"
+        } else {
+            "token_min_load"
+        };
+
+        RouterMetrics::record_cache_aware_decision(decision);
+        self.insert_routing_text(
+            tree.as_ref(),
+            model_id,
+            workers[pick_idx].url(),
+            score_text,
+            primary_text,
+            used_fallback,
+        );
+        workers[pick_idx].increment_processed();
+        RouterMetrics::record_processed_request(workers[pick_idx].url());
+        RouterMetrics::record_policy_decision(self.name(), workers[pick_idx].url());
+
+        Some(RoutingSelection {
+            index: pick_idx,
+            decision: Some(decision),
+            token_cost,
+        })
+    }
+
     fn select_worker_min_load(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -231,6 +410,7 @@ impl CacheAwarePolicy {
         Some(RoutingSelection {
             index: min_load_idx,
             decision: Some("load_balance"),
+            token_cost: 0,
         })
     }
 
@@ -250,6 +430,17 @@ impl CacheAwarePolicy {
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model.
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
+
+        if self.config.load_balance_metric == CacheAwareLoadMetric::Token {
+            return self.select_worker_token_aware(
+                workers,
+                request_text,
+                fallback_text,
+                headers,
+                &healthy_indices,
+                model_id,
+            );
+        }
 
         // Get current load statistics - compute min/max in single pass without allocation.
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
@@ -317,6 +508,7 @@ impl CacheAwarePolicy {
             return Some(RoutingSelection {
                 index: selected_idx,
                 decision: Some("no_tree_random"),
+                token_cost: 0,
             });
         };
         debug!("Using cache-aware routing for model '{}'", model_id);
@@ -445,6 +637,7 @@ impl CacheAwarePolicy {
             return Some(RoutingSelection {
                 index: idx,
                 decision: Some(decision),
+                token_cost: 0,
             });
         }
 
@@ -465,6 +658,7 @@ impl CacheAwarePolicy {
                 } else {
                     "first_healthy_fallback"
                 }),
+                token_cost: 0,
             })
         } else {
             None
@@ -839,6 +1033,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0, // Disable eviction thread
             max_tree_size: 10000,
+            ..Default::default()
         });
 
         let worker1 = BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular);
@@ -891,5 +1086,90 @@ mod tests {
         // All requests should now go to worker2
         let idx = policy.select_worker(&workers, Some("test1")).unwrap();
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn test_token_aware_uses_token_load_not_request_count() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            load_balance_metric: CacheAwareLoadMetric::Token,
+            ..Default::default()
+        });
+
+        let worker1 = BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular);
+        let worker2 = BasicWorker::new("http://w2:8000".to_string(), WorkerType::Regular);
+        for _ in 0..20 {
+            worker1.increment_load();
+        }
+        worker2.add_token_load(50_000);
+
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1), Arc::new(worker2)];
+        policy.init_workers(&workers);
+
+        let idx = policy
+            .select_worker(&workers, Some("a reasonably long prompt for tokens"))
+            .unwrap();
+        assert_eq!(
+            idx, 0,
+            "token mode should ignore request-count imbalance and pick lower token_load"
+        );
+    }
+
+    #[test]
+    fn test_token_aware_breaks_affinity_when_excess_is_one_request() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            cache_threshold: 0.3,
+            load_balance_metric: CacheAwareLoadMetric::Token,
+            token_abs_req_equiv: 1.0,
+            token_balance_rel: 1.5,
+            ..Default::default()
+        });
+
+        let worker1 = BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular);
+        let worker2 = BasicWorker::new("http://w2:8000".to_string(), WorkerType::Regular);
+        // 100k vs 20k token backlog, incoming ~80k chars/4.
+        worker1.add_token_load(100_000);
+        worker2.add_token_load(20_000);
+
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1), Arc::new(worker2)];
+        policy.init_workers(&workers);
+
+        let prompt = "x".repeat(320); // ~80 tokens
+        let idx = policy.select_worker(&workers, Some(&prompt)).unwrap();
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn test_token_aware_prefers_lower_predicted_over_higher_cache_hit() {
+        // N1: 50% cache, 20k load. N2: 70% cache, 100k load.
+        // Incoming 100 tokens → predicted 20_050 vs 100_030, so pick N1.
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            cache_threshold: 0.3,
+            load_balance_metric: CacheAwareLoadMetric::Token,
+            token_abs_req_equiv: 1.0,
+            token_balance_rel: 1.5,
+            ..Default::default()
+        });
+
+        let worker1 = BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular);
+        let worker2 = BasicWorker::new("http://w2:8000".to_string(), WorkerType::Regular);
+        worker1.add_token_load(20_000);
+        worker2.add_token_load(100_000);
+
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1), Arc::new(worker2)];
+        policy.init_workers(&workers);
+
+        let prompt = "p".repeat(400); // 100 tokens at chars/4
+        let tree = policy.trees.get("default").expect("default tree").clone();
+        tree.insert(&prompt[..200], workers[0].url());
+        tree.insert(&prompt[..280], workers[1].url());
+
+        let idx = policy.select_worker(&workers, Some(&prompt)).unwrap();
+        assert_eq!(
+            idx, 0,
+            "70% cache on the 100k worker should lose to 50% cache on the 20k worker"
+        );
     }
 }
