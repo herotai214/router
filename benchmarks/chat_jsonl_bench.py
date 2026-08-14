@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Replay OpenAI chat JSONL against /v1/chat/completions.
 
+This is the **quoted** cache-aware performance client (Codex SWE-bench Pro
+JSONL). Official ``vllm bench serve`` cannot do this: it fires independent
+ShareGPT/random/completions requests with no ``session_params.session_id``,
+no growing per-session history, and no session-serial fire mode. See
+``CACHE_AWARE_BENCHMARKS.md``.
+
 Prints duration, RPS, TTFT, TPOT, and E2E. Uses streaming by default so TTFT works.
 
 Default fire mode is ``session_serial``: global concurrency is honored, but at

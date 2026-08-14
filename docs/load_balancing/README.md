@@ -223,7 +223,11 @@ full history). Same default on the Rust binary and the Python launcher.
 | `max_tree_size` | 2^26 | Maximum nodes per radix tree |
 
 Demo preset `lb_mid` uses `cache=0.3, abs=2, rel=1.5` (stickier abs than the
-binary default). See `benchmarks/CACHE_AWARE_OPERATOR_GUIDE.md`.
+binary default; from Codex mt32/mt256 with `run_codex_dp_cache_aware.sh`).
+Install and topologies: [`CACHE_AWARE_OPERATOR_GUIDE.md`](CACHE_AWARE_OPERATOR_GUIDE.md).
+Smoke / Codex: `benchmarks/CACHE_AWARE_BENCHMARKS.md`.
+Metrics: `benchmarks/ROUTER_METRICS.md`.
+Dataset build: `benchmarks/dataset/CODEX_SWEBENCHPRO.md`.
 
 ### Behavior
 

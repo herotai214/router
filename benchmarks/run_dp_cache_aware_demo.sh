@@ -15,6 +15,7 @@
 # This script only automates the DP+router topology that many deployments use.
 #
 # Usage (from router repo root, after cargo build --release).
+# Full how-to: benchmarks/CACHE_AWARE_BENCHMARKS.md
 # Python launcher: pip install -e . from this tree (needs rustc/cargo; not a wheel).
 # Chat key default: session-id-full-history-fallback.
 #   MODEL_PATH=/path/to/Qwen3.5-4B \

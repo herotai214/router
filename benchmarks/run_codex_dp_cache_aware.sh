@@ -11,6 +11,7 @@
 # Source CANN/ATB in the shell first so `import torch_npu` works.
 #
 # Examples (from router repo root after cargo build --release).
+# Dataset build: benchmarks/dataset/CODEX_SWEBENCHPRO.md
 # Python `vllm-router` also works if you `pip install -e .` from this tree
 # (still needs rustc/cargo; not PyPI / not a wheel).
 #
@@ -339,7 +340,7 @@ main() {
   fi
   if [ -z "${DATASET}" ] || [ ! -f "${DATASET}" ]; then
     echo "ERROR: set DATASET=/path/to/01_codex_swebenchpro_128k_filter_25s4t_chat.jsonl" >&2
-    echo "Tip: copy from npu_codex_100req_runner or your prefix_cache_datasets tree." >&2
+    echo "Tip: build it with benchmarks/dataset/prepare_codex_swebenchpro_jsonl.py (see benchmarks/dataset/CODEX_SWEBENCHPRO.md)." >&2
     exit 1
   fi
 
