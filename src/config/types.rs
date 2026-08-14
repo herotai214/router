@@ -8,11 +8,11 @@ use std::collections::HashMap;
 #[serde(rename_all = "snake_case")]
 pub enum ChatRoutingKeyMode {
     /// Text-like content from the full chat history and tool schemas.
-    #[default]
     FullHistory,
     /// Explicit session_id only, with no prompt-prefix key.
     SessionId,
     /// Try session_id affinity first, then fall back to full chat history.
+    #[default]
     SessionIdFullHistoryFallback,
 }
 

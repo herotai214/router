@@ -5,6 +5,33 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# Values accepted by the Rust PyO3 constructor (src/lib.rs). Hyphens are
+# normalized to underscores so the Python CLI matches `vllm-router` (Rust).
+CHAT_ROUTING_KEY_MODES = (
+    "full_history",
+    "session_id",
+    "session_id_full_history_fallback",
+)
+
+
+def normalize_chat_routing_key_mode(value: str) -> str:
+    """Map CLI spellings to the Rust/PyO3 snake_case names."""
+    normalized = value.strip().replace("-", "_")
+    if normalized not in CHAT_ROUTING_KEY_MODES:
+        raise ValueError(
+            f"invalid chat routing key mode {value!r}. "
+            f"Choose from: {', '.join(CHAT_ROUTING_KEY_MODES)} "
+            "(hyphens also accepted, e.g. session-id-full-history-fallback)"
+        )
+    return normalized
+
+
+def parse_chat_routing_key_mode(value: str) -> str:
+    try:
+        return normalize_chat_routing_key_mode(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
 
 @dataclasses.dataclass
 class RouterArgs:
@@ -30,6 +57,9 @@ class RouterArgs:
     cache_threshold: float = 0.3
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5
+    chat_routing_key_mode: str = (
+        "session_id_full_history_fallback"  # session then full history
+    )
     eviction_interval_secs: int = 120
     max_tree_size: int = 2**26
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
@@ -225,6 +255,17 @@ class RouterArgs:
             type=float,
             default=RouterArgs.balance_rel_threshold,
             help="Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware",
+        )
+        parser.add_argument(
+            f"--{prefix}chat-routing-key-mode",
+            type=parse_chat_routing_key_mode,
+            default=RouterArgs.chat_routing_key_mode,
+            help=(
+                "Chat text key for cache_aware. Default: "
+                "session_id_full_history_fallback (session_id first, then "
+                "full history). Also: full_history, session_id. "
+                "Hyphens accepted (session-id-full-history-fallback)."
+            ),
         )
         parser.add_argument(
             f"--{prefix}eviction-interval-secs",
@@ -515,9 +556,17 @@ class RouterArgs:
         # Mooncake-specific annotation
         args_dict["bootstrap_port_annotation"] = "vllm.ai/bootstrap-port"
 
+        if "chat_routing_key_mode" in args_dict and args_dict["chat_routing_key_mode"]:
+            args_dict["chat_routing_key_mode"] = normalize_chat_routing_key_mode(
+                args_dict["chat_routing_key_mode"]
+            )
+
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        self.chat_routing_key_mode = normalize_chat_routing_key_mode(
+            self.chat_routing_key_mode
+        )
         # Validate configuration based on mode
         if self.vllm_pd_disaggregation:
             # Validate PD configuration - skip URL requirements if using service discovery

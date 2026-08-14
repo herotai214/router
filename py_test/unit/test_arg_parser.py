@@ -23,6 +23,7 @@ class TestRouterArgs:
         assert args.host == "127.0.0.1"
         assert args.port == 30000
         assert args.policy == "cache_aware"
+        assert args.chat_routing_key_mode == "session_id_full_history_fallback"
         assert args.worker_urls == []
         assert args.vllm_pd_disaggregation is False
         assert args.prefill_urls == []
@@ -439,8 +440,31 @@ class TestParseRouterArgs:
         assert router_args.port == 30001
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert router_args.policy == "round_robin"
+        assert router_args.chat_routing_key_mode == "session_id_full_history_fallback"
 
-    def test_parse_pd_args(self):
+    def test_parse_chat_routing_key_mode(self):
+        """Hyphen and underscore spellings both map to the Rust/PyO3 names."""
+        hyphen = parse_router_args(
+            ["--chat-routing-key-mode", "session-id-full-history-fallback"]
+        )
+        assert hyphen.chat_routing_key_mode == "session_id_full_history_fallback"
+
+        underscore = parse_router_args(
+            ["--chat-routing-key-mode", "session_id_full_history_fallback"]
+        )
+        assert underscore.chat_routing_key_mode == "session_id_full_history_fallback"
+
+        session_only = parse_router_args(["--chat-routing-key-mode", "session-id"])
+        assert session_only.chat_routing_key_mode == "session_id"
+
+        full_history = parse_router_args(["--chat-routing-key-mode", "full_history"])
+        assert full_history.chat_routing_key_mode == "full_history"
+
+    def test_parse_chat_routing_key_mode_invalid(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--chat-routing-key-mode", "not-a-mode"])
+
+    def test_parse_pd_disaggregation_args(self):
         """Test parsing PD disaggregated mode arguments."""
         args = [
             "--vllm-pd-disaggregation",

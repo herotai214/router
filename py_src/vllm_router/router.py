@@ -1,6 +1,6 @@
 from typing import Optional
 
-from vllm_router.router_args import RouterArgs
+from vllm_router.router_args import RouterArgs, normalize_chat_routing_key_mode
 from vllm_router_rs import PolicyType
 from vllm_router_rs import Router as _Router
 
@@ -37,11 +37,14 @@ class Router:
         worker_startup_check_interval: Interval in seconds between checks for worker initialization. Default: 10
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to cached worker
             if the match rate exceeds threshold, otherwise routes to the worker with the smallest
-            tree. Default: 0.5
+            tree. Default: 0.3
+        chat_routing_key_mode: Chat key for cache_aware. Default:
+            'session_id_full_history_fallback'. Also 'full_history' or 'session_id'.
+            Hyphens accepted.
         balance_abs_threshold: Load balancing is triggered when (max_load - min_load) > abs_threshold
-            AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 32
+            AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 64
         balance_rel_threshold: Load balancing is triggered when (max_load - min_load) > abs_threshold
-            AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 1.0001
+            AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 1.5
         eviction_interval_secs: Interval in seconds between cache eviction operations in cache-aware
             routing. Default: 60
         max_payload_size: Maximum payload size in bytes. Default: 256MB
@@ -126,6 +129,9 @@ class Router:
         )
         args_dict["prefill_policy"] = policy_from_str(args_dict["prefill_policy"])
         args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
+        args_dict["chat_routing_key_mode"] = normalize_chat_routing_key_mode(
+            args_dict.get("chat_routing_key_mode") or "session_id_full_history_fallback"
+        )
 
         # remove mini_lb parameter
         args_dict.pop("mini_lb")

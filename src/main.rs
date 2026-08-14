@@ -44,10 +44,11 @@ fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
     prefill_entries
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
 enum CliChatRoutingKeyMode {
     FullHistory,
     SessionId,
+    #[default]
     SessionIdFullHistoryFallback,
 }
 
@@ -178,8 +179,13 @@ struct CliArgs {
     #[arg(long, default_value_t = 67108864)] // 2^26
     max_tree_size: usize,
 
-    /// Chat routing text used by text-aware policies such as cache_aware
-    #[arg(long, value_enum, default_value_t = CliChatRoutingKeyMode::FullHistory)]
+    /// Chat routing text used by text-aware policies such as cache_aware.
+    /// Default: session-id first, then full chat history (agent / multi-turn).
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = CliChatRoutingKeyMode::SessionIdFullHistoryFallback
+    )]
     chat_routing_key_mode: CliChatRoutingKeyMode,
 
     /// Maximum payload size in bytes

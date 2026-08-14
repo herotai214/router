@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""Synthetic /v1/chat/completions prefix-repetition benchmark for vLLM Router.
+"""Synthetic /v1/chat/completions prefix-repetition smoke client.
 
-Chat analogue of vLLM's completions ``prefix_repetition`` dataset. Sends OpenAI
-chat requests with repeated prefix text, a changing suffix, and a stable
-``session_params.session_id`` so cache-aware chat key modes
-(``full_history``, ``session_id``, ``session_id_full_history_fallback``) can be
-exercised.
+Constructed dataset (not a real agent trace). Defaults: 100 requests, 16
+sessions, 12 unique long prefixes, short changing suffix, plus a stable
+``session_params.session_id``. After the first request of each prefix, later
+requests that share it **must** show prefix-cache hits if they land on the
+same worker. Treat this as a unit-test-like sanity check of cache-aware
+routing + ``--enable-prefix-caching``, not as the realistic eval (use
+``chat_jsonl_bench.py`` / Codex JSONL for that).
+
+Chat analogue of vLLM's completions ``prefix_repetition`` shape. Router chat
+key default is ``session_id_full_history_fallback``; this client still sends
+session id so ``session_id`` / fallback can stick.
 
 Assumptions:
   - Workers and (optionally) the router are already up and healthy.
-  - Prefer a cold start (fresh workers + router) per case so absolute Prometheus
-    counters match the case.
-  - This is a controlled synthetic smoke/matrix workload, not a replacement for
-    realistic multi-turn agent traces (e.g. Codex JSONL).
+  - Cold start (fresh workers + router) per case so Prometheus counters match.
+  - Summarize hit rate while processes are still alive:
 
-After the run, while processes are still alive, summarize router/worker metrics:
-
-  bash benchmarks/router_metrics_summary.sh 127.0.0.1:29400
+      bash benchmarks/router_metrics_summary.sh 127.0.0.1:29400
 """
 
 from __future__ import annotations

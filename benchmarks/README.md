@@ -6,14 +6,19 @@ with vLLM Router.
 | File | Role |
 |------|------|
 | `CACHE_AWARE_OPERATOR_GUIDE.md` | End-to-end install → topologies → bench → metrics |
-| `chat_prefix_repetition.py` | Synthetic chat prefix-repetition client (TTFT / E2E / RPS) |
-| `chat_jsonl_bench.py` | Replay OpenAI chat JSONL (Codex-style) with TTFT / E2E |
+| `chat_prefix_repetition.py` | **Smoke** constructed prefix-repetition client (must show cache hit) |
+| `chat_jsonl_bench.py` | Replay OpenAI chat JSONL (Codex-style; realistic eval) |
 | `router_metrics_summary.sh` | **User entrypoint** for post-run metrics summary |
 | `router_metrics_summary.py` | Implementation behind the `.sh` |
-| `run_dp_cache_aware_demo.sh` | Synthetic **DP + cache-aware router** demo |
-| `run_codex_dp_cache_aware.sh` | Codex JSONL **DP + cache-aware** runner (NPU/CUDA) |
+| `run_dp_cache_aware_demo.sh` | Smoke: DP + cache-aware + `chat_prefix_repetition.py` |
+| `run_codex_dp_cache_aware.sh` | Codex JSONL DP + cache-aware (NPU/CUDA) |
 
-**Recommended demo model:** Qwen3.5-4B. See the operator guide.
+**Recommended demo model:** Qwen3.5-4B. See the operator guide for install
+(Rust required; Python `vllm-router` is `pip install -e .` from this tree, not
+PyPI / not a wheel).
+
+Default `--chat-routing-key-mode` is `session-id-full-history-fallback` (Rust
+and Python). Codex JSONL default fire mode is `session_serial`.
 
 Cold-start each case (fresh backends + router) so absolute Prometheus counters
 are the case counters.
@@ -72,7 +77,7 @@ CUDA_VISIBLE_DEVICES=1 vllm serve "$MODEL_PATH" \
   --cache-threshold 0.3 \
   --balance-abs-threshold 2 \
   --balance-rel-threshold 1.5 \
-  --chat-routing-key-mode full-history \
+  --chat-routing-key-mode session-id-full-history-fallback \
   > router.log 2>&1 &
 ```
 
@@ -163,13 +168,18 @@ CUDA_VISIBLE_DEVICES=0,1 vllm serve "$MODEL_PATH" \
 
 | Flag | Role |
 |------|------|
-| `--cache-threshold` | Min prefix-tree match for affinity (`~0.3` text; `~0.999` pure session-id) |
-| `--balance-abs-threshold` / `--balance-rel-threshold` | Load-balance gates |
+| `--cache-threshold` | Min prefix-tree match for affinity (`~0.3` text; `~0.999` pure session-id). CLI default `0.3` |
+| `--balance-abs-threshold` / `--balance-rel-threshold` | Load-balance gates. CLI default `64` / `1.5`; `lb_mid` demo uses `2` / `1.5` |
+| `--chat-routing-key-mode` | Chat key. Default `session-id-full-history-fallback` |
 | `--intra-node-data-parallel-size` | Topology B only — expand one URL into DP-rank workers |
 
 Presets: `lb_mid` = `0.3 / 2 / 1.5`, `lb_aggr` = `0.3 / 0 / 1.0`, `sid999` = `0.999 / 2 / 1.5`.
 
-## Run the synthetic chat benchmark
+## Smoke: constructed prefix-repetition (must show hit rate)
+
+Not the realistic eval. 100 req / 16 sessions / 12 unique long prefixes. After
+the first request of each prefix, later shares must hit if they stay on the
+same worker. Codex JSONL is the real-ish workload.
 
 ```bash
 python3 benchmarks/chat_prefix_repetition.py \
@@ -186,7 +196,12 @@ python3 benchmarks/chat_prefix_repetition.py \
 ```
 
 The client sends `session_params.session_id` so `session-id` / fallback modes
-have a real sticky key.
+have a real sticky key. Fallback is the router default; you do not need to pass
+`--chat-routing-key-mode` unless you want `full-history` or `session-id` only.
+
+Codex JSONL (`chat_jsonl_bench.py` / `run_codex_dp_cache_aware.sh`) defaults to
+`--fire-mode session_serial` (≤1 in-flight turn per session). `jsonl` fires
+every row immediately and can overlap turns of the same session.
 
 ## Get metrics (prefer the `.sh`)
 

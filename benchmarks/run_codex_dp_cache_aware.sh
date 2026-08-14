@@ -10,7 +10,12 @@
 #   DEVICE_ENV_NAME=ASCEND_RT_VISIBLE_DEVICES
 # Source CANN/ATB in the shell first so `import torch_npu` works.
 #
-# Examples (from router repo root after cargo build --release):
+# Examples (from router repo root after cargo build --release).
+# Python `vllm-router` also works if you `pip install -e .` from this tree
+# (still needs rustc/cargo; not PyPI / not a wheel).
+#
+# Chat key default is session-id-full-history-fallback. Codex client default
+# fire mode is session_serial.
 #
 #   # NPU: DP baseline + one fallback lb_mid case
 #   source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -85,6 +90,7 @@ RUN_CACHE_AWARE="${RUN_CACHE_AWARE:-1}"
 # label:cache_threshold:balance_abs:balance_rel
 CONFIGS="${CONFIGS:-lb_mid:0.3:2:1.5}"
 CHAT_ROUTING_KEY_MODE="${CHAT_ROUTING_KEY_MODE:-session-id-full-history-fallback}"
+CHAT_JSONL_FIRE_MODE="${CHAT_JSONL_FIRE_MODE:-session_serial}"
 
 TS="$(date +%Y%m%d_%H%M%S)"
 MT_TAG="${MAX_TOKENS:-jsonl}"
@@ -232,7 +238,7 @@ run_bench() {
     --max-concurrency "${MAX_CONCURRENCY}" \
     --limit "${NUM_PROMPTS}" \
     --label "${label}" \
-    --fire-mode "${CHAT_JSONL_FIRE_MODE:-session_serial}" \
+    --fire-mode "${CHAT_JSONL_FIRE_MODE}" \
     --per-request-jsonl "${per_req_jsonl}" \
     "${max_tokens_args[@]}" \
     2>&1 | tee "${bench_log}"

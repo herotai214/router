@@ -1,17 +1,17 @@
 # Cache-Aware vLLM Router — Operator Guide
 
-One-stop path: install → bring up topology → synthetic bench → clean metrics.
+One-stop path: install → topology → smoke (must show hit rate) → optional Codex JSONL.
 
 Canonical helpers:
 
 ```text
 benchmarks/README.md
-benchmarks/chat_prefix_repetition.py      ← synthetic client
-benchmarks/chat_jsonl_bench.py            ← Codex / OpenAI chat JSONL client
+benchmarks/chat_prefix_repetition.py      ← smoke client (must show cache hit)
+benchmarks/chat_jsonl_bench.py            ← Codex / OpenAI chat JSONL (realistic)
 benchmarks/router_metrics_summary.sh      ← prefer this
 benchmarks/router_metrics_summary.py
-benchmarks/run_dp_cache_aware_demo.sh     ← synthetic DP+router demo
-benchmarks/run_codex_dp_cache_aware.sh            ← Codex JSONL DP+router (NPU/CUDA)
+benchmarks/run_dp_cache_aware_demo.sh     ← smoke: DP+router+prefix-repetition
+benchmarks/run_codex_dp_cache_aware.sh    ← Codex JSONL DP+router (NPU/CUDA)
 benchmarks/CACHE_AWARE_OPERATOR_GUIDE.md
 ```
 
@@ -26,31 +26,48 @@ prefix-cache experiments.
 Run on a GPU/NPU node (or in your CUDA/Ascend container), not a bare login node
 with a mismatched Python.
 
+**Rust is required.** The router is a Rust binary. The optional Python
+`vllm-router` launcher is only a thin argparse wrapper around the same PyO3
+extension — `pip install -e .` still invokes `cargo` / `rustc` via
+`setuptools-rust`. PyPI `vllm-router` does **not** include this branch’s
+chat-routing changes. Do not install from a local wheel (`python -m build`,
+`dist/*.whl`); this tree is not shipped that way.
+
 ```bash
 cd /path/to/workspace
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
+rustc --version && cargo --version
 
-# vLLM workers (separate from the router binary)
+# vLLM workers (separate Python env from the router)
 uv venv env_vllm && source env_vllm/bin/activate
 uv pip install "vllm==0.26.0" --torch-backend=auto   # pin as needed
 # NPU: use your vllm + vllm-ascend env instead (e.g. 0.23) and source CANN/ATB.
 
-git clone https://github.com/vllm-project/router.git
-cd router
-git checkout <branch-with-chat-routing>
+cd /path/to/router          # this tree / branch
 cargo build --release
 ./target/release/vllm-router --help
-# expect --chat-routing-key-mode and --intra-node-data-parallel-size
+# expect --chat-routing-key-mode (default: session-id-full-history-fallback)
+# and --intra-node-data-parallel-size
 ```
 
-This guide uses the **native Rust binary**:
+Preferred: the **native Rust binary**
 
 ```bash
 ./target/release/vllm-router …
 # or while developing:
 cargo run --release -- …
 ```
+
+Optional: Python launcher from **this source tree** (still needs Rust on PATH):
+
+```bash
+source env_vllm/bin/activate
+pip install -e .          # compiles vllm_router_rs; not a wheel
+vllm-router --help
+```
+
+Use one or the other. Both must be built from this branch.
 
 ---
 
@@ -110,7 +127,7 @@ curl -fsS http://127.0.0.1:18100/health && curl -fsS http://127.0.0.1:18101/heal
   --cache-threshold 0.3 \
   --balance-abs-threshold 2 \
   --balance-rel-threshold 1.5 \
-  --chat-routing-key-mode full-history \
+  --chat-routing-key-mode session-id-full-history-fallback \
   > router.log 2>&1 &
 
 curl -fsS http://127.0.0.1:18180/health
@@ -158,10 +175,12 @@ ROUTER_BIN=./target/release/vllm-router \
 bash benchmarks/run_dp_cache_aware_demo.sh
 ```
 
-For **Codex JSONL** on the same DP+router topology (NPU defaults):
+For **Codex JSONL** on the same DP+router topology. Script default device env is
+Ascend (`ASCEND_RT_VISIBLE_DEVICES`); set `DEVICE_ENV_NAME=CUDA_VISIBLE_DEVICES`
+on GPU boxes. Client default is `--fire-mode session_serial`.
 
 ```bash
-# Source Ascend env first (torch_npu must import)
+# NPU — source CANN/ATB first (torch_npu must import)
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh   # if present
 
@@ -178,8 +197,19 @@ bash benchmarks/run_codex_dp_cache_aware.sh
 `CONFIGS` can list several `label:cache:abs:rel` entries (cold-started sequentially).
 CUDA: `DEVICE_ENV_NAME=CUDA_VISIBLE_DEVICES`.
 
-CLI key-mode spelling uses hyphens: `full-history`, `session-id`,
-`session-id-full-history-fallback`.
+**Default `--chat-routing-key-mode` is `session-id-full-history-fallback`**
+(Rust binary, Python `vllm-router`, and `RouterArgs`). Session id first, then
+full chat history. Override with `full-history` or `session-id`. CLI spelling
+uses hyphens; the Python launcher also accepts underscores.
+
+`--fire-mode session_serial` is the Codex JSONL default (one in-flight turn per
+`session_id`). `--fire-mode jsonl` fires rows as-is and can overlap turns of the
+same session — not a realistic agent client.
+
+Binary / Python **software** defaults for the load gates are
+`cache_threshold=0.3`, `balance_abs_threshold=64`, `balance_rel_threshold=1.5`.
+Demo snippets below use the **`lb_mid` preset** `0.3 / 2 / 1.5` (stickier abs
+than the binary default).
 
 ### Threshold parameters
 
@@ -188,7 +218,7 @@ CLI key-mode spelling uses hyphens: `full-history`, `session-id`,
 | `--cache-threshold` | Min prefix-tree match rate to treat as a strong hit and prefer that worker |
 | `--balance-abs-threshold` | Absolute load gap that allows breaking affinity |
 | `--balance-rel-threshold` | Relative load gap that allows breaking affinity |
-| `--chat-routing-key-mode` | Which string keys the cache-aware tree for chat |
+| `--chat-routing-key-mode` | Chat key. Default: `session-id-full-history-fallback` |
 | `--intra-node-data-parallel-size` | Expand one backend URL into DP-rank virtual workers (topology B only) |
 
 Presets:
@@ -206,7 +236,14 @@ sid999   = cache=0.999, abs=2, rel=1.5   # pure session_id (near-exact)
 Cold-start each case (kill previous processes, or use fresh ports) so absolute
 Prometheus counters match that case.
 
-### 4.1 Synthetic chat (against the router)
+### 4.1 Smoke: constructed prefix-repetition (must show hit rate)
+
+Not a realistic agent trace. 100 requests, 16 sessions, 12 unique long prefixes
+plus a short suffix. After the first request of each prefix, later shares
+**must** hit prefix cache if they stay on the same worker. If Prompt/APC hit
+stays at the cold/random floor, routing or `--enable-prefix-caching` is broken.
+
+For a real-ish eval use Codex JSONL (`run_codex_dp_cache_aware.sh`).
 
 ```bash
 cd /path/to/router
@@ -335,10 +372,12 @@ Full definitions: `benchmarks/README.md`.
 
 ## 6. Minimal checklist
 
-1. Install vLLM (+ Ascend if NPU) and `cargo build --release`.
+1. Install Rust + vLLM (+ Ascend if NPU). `cargo build --release` (or
+   `pip install -e .` from this tree — still compiles Rust). Not PyPI, not a wheel.
 2. Prefer **Qwen3.5-4B** for a small long-context demo.
 3. Choose topology **A** (independent workers) or **B** (DP + `--intra-node-data-parallel-size`).
-4. Enable `--enable-prefix-caching` on every backend; use `lb_mid` for demos.
-5. Run `benchmarks/chat_prefix_repetition.py` against the router (or `run_dp_cache_aware_demo.sh` for B).
+4. Enable `--enable-prefix-caching` on every backend. Chat key default is
+   fallback; use `lb_mid` (`0.3 / 2 / 1.5`) for demos.
+5. Smoke: `chat_prefix_repetition.py` (or `run_dp_cache_aware_demo.sh`) — Prompt/APC hit must show. Realistic eval: Codex JSONL.
 6. `bash benchmarks/router_metrics_summary.sh … --brief` — check **APC + Prompt hit** and **queue/prefill/decode/TTFT/E2E**.
 7. Optional: cold DP baseline (§4.2) on the same GPU count for comparison.

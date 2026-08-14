@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Demo: one vLLM DP backend + cache-aware router (intra-node DP ranks).
+# Lightweight smoke demo: one vLLM DP backend + cache-aware router.
+#
+# Workload is chat_prefix_repetition.py — a constructed prefix-repetition
+# dataset (not Codex). If routing + prefix cache work, Prompt/APC hit rate
+# MUST show. Realistic eval: run_codex_dp_cache_aware.sh.
 #
 # Topology:
 #   client -> vllm-router (cache_aware, --intra-node-data-parallel-size=N)
@@ -10,7 +14,9 @@
 # N independent `vllm serve` workers + router without --intra-node-data-parallel-size.
 # This script only automates the DP+router topology that many deployments use.
 #
-# Usage (from router repo root, after cargo build --release):
+# Usage (from router repo root, after cargo build --release).
+# Python launcher: pip install -e . from this tree (needs rustc/cargo; not a wheel).
+# Chat key default: session-id-full-history-fallback.
 #   MODEL_PATH=/path/to/Qwen3.5-4B \
 #   DEVICE_ENV_NAME=CUDA_VISIBLE_DEVICES DEVICES=0,1 \
 #   bash benchmarks/run_dp_cache_aware_demo.sh
