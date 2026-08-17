@@ -133,6 +133,12 @@ NPU: set `DEVICE_ENV_NAME=ASCEND_RT_VISIBLE_DEVICES` and source CANN/ATB first.
 The script starts a DP backend + cache-aware router, runs
 `chat_prefix_repetition.py`, scrapes `.prom`s, and writes `summary.json`.
 
+**If this looks broken:** Prompt/APC hit must rise above a cold floor after
+these 100 requests (shared prefixes across different `session_id`s). If both
+stay at ~0 / random, stop — prefix cache is off, the router is not this
+binary, or workers are not the ones you think. Do not quote a Codex run
+until smoke hits. Flag meanings: operator guide §3–4.
+
 ### 3.2 Client only (stack already up)
 
 ```bash
@@ -169,7 +175,8 @@ Topology A (DP + router), plus an optional DP-only control. Wrapper:
 `benchmarks/run_codex_dp_cache_aware.sh`.
 
 ```bash
-# NPU — source CANN/ATB first so torch_npu imports
+# NPU — source CANN/ATB first so torch_npu imports.
+# Quoted C4 @2048: also set ENABLE_* =0 on Ascend 0.23 (flags do not exist there).
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh   # if present
 
@@ -179,11 +186,25 @@ DEVICE_ENV_NAME=ASCEND_RT_VISIBLE_DEVICES DEVICES=0,1 \
 ROUTER_BIN=./target/release/vllm-router \
 RUN_DP_BASELINE=1 RUN_CACHE_AWARE=1 \
 CONFIGS=lb_mid:0.3:2:1.5 \
-MAX_TOKENS=256 \
+MAX_TOKENS=256 MAX_CONCURRENCY=4 \
+ENABLE_PER_REQUEST_METRICS=0 ENABLE_PROMPT_TOKENS_DETAILS=0 \
+VLLM_EXTRA_ARGS='--max-num-seqs 4 --max-num-batched-tokens 2048' \
 bash benchmarks/run_codex_dp_cache_aware.sh
 ```
 
-CUDA: `DEVICE_ENV_NAME=CUDA_VISIBLE_DEVICES`.
+CUDA (vLLM 0.26; leave `ENABLE_PER_REQUEST_METRICS` at default 1):
+
+```bash
+MODEL_PATH=/path/to/Qwen3.5-4B \
+DATASET=/path/to/01_codex_swebenchpro_128k_filter_25s4t_chat.jsonl \
+DEVICE_ENV_NAME=CUDA_VISIBLE_DEVICES DEVICES=0,1 \
+ROUTER_BIN=./target/release/vllm-router \
+RUN_DP_BASELINE=1 RUN_CACHE_AWARE=1 \
+CONFIGS=lb_mid:0.3:2:1.5 \
+MAX_TOKENS=256 MAX_CONCURRENCY=4 \
+VLLM_EXTRA_ARGS='--max-num-seqs 4 --max-num-batched-tokens 2048' \
+bash benchmarks/run_codex_dp_cache_aware.sh
+```
 
 | Env | Meaning |
 |-----|---------|
@@ -198,6 +219,9 @@ CUDA: `DEVICE_ENV_NAME=CUDA_VISIBLE_DEVICES`.
 | `CHAT_JSONL_FIRE_MODE` | Default `session_serial` (**recommended**). `jsonl` is not recommended |
 | `CHAT_ROUTING_KEY_MODE` | Router chat key; default `session-id-full-history-fallback` |
 | `NUM_PROMPTS` | Client `--limit` (default 100 = full 25×4 file) |
+| `VLLM_EXTRA_ARGS` | Extra `vllm serve` flags. Quoted C4 uses `--max-num-seqs 4 --max-num-batched-tokens 2048` |
+| `ENABLE_PER_REQUEST_METRICS` | Default `1` (vLLM ≥ ~0.26). Set `0` on Ascend 0.23 |
+| `ENABLE_PROMPT_TOKENS_DETAILS` | Default `1`. Set `0` on Ascend 0.23 |
 
 `lb_mid` is `0.3 / 2 / 1.5` (stickier abs than the binary default `0.3 / 64 / 1.5`).
 Flag meanings: operator guide.

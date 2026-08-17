@@ -226,6 +226,19 @@ sid999   = cache=0.999, abs=2, rel=1.5   # near-exact session_id (see below)
 
 Enable `--enable-prefix-caching` on every backend.
 
+### Response trace headers (always on)
+
+Every routed `/v1/chat/completions` response includes:
+
+| Header | Value |
+|--------|--------|
+| `x-vllm-router-worker` | Opaque `w0`, `w1`, … (sorted unique `host:port@rank`) |
+| `x-vllm-router-base-worker` | Opaque `wN` with DP rank stripped |
+| `x-vllm-router-dp-rank` | `0` / `1` / … |
+| `x-vllm-router-decision` | `session_id_match`, `load_balance`, `full_history_low_match`, … |
+
+There is **no** flag to emit full worker URLs or to turn these headers off. Map `wN` by sorting `--worker-urls` (expanded by `--intra-node-data-parallel-size`). Prometheus `vllm_router_policy_decisions_total` still labels the real URL.
+
 ### Why `sid999` is 0.999, not 1.0
 
 The policy uses **`match_rate > cache_threshold`**, not `>=`. Match rate is in
