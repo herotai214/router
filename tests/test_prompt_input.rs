@@ -124,7 +124,7 @@ fn test_chat_routing_falls_back_to_session_id_without_history_text() {
     )
     .unwrap();
 
-    assert_eq!(request.extract_text_for_routing(), "session-123");
+    assert_eq!(request.extract_text_for_routing(), "session-123\x1f");
 }
 
 #[test]

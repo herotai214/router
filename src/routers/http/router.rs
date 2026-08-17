@@ -734,20 +734,44 @@ impl Router {
         worker_url.to_string()
     }
 
+    fn opaque_worker_id(urls: &[String], worker_url: &str, strip_dp_rank: bool) -> String {
+        let normalize = |url: &str| {
+            if strip_dp_rank {
+                dp_utils::extract_dp_rank(url)
+                    .map(|(base, _)| base.to_string())
+                    .unwrap_or_else(|_| url.to_string())
+            } else {
+                url.to_string()
+            }
+        };
+
+        let worker_key = normalize(worker_url);
+        let mut keys: Vec<String> = urls.iter().map(|url| normalize(url)).collect();
+        keys.sort();
+        keys.dedup();
+
+        keys.iter()
+            .position(|key| key == &worker_key)
+            .map(|i| format!("w{i}"))
+            .unwrap_or_else(|| "w?".to_string())
+    }
+
     fn add_routing_trace_headers(
+        &self,
         headers: &mut HeaderMap,
         worker_url: &str,
         dp_rank: Option<usize>,
         decision: Option<&str>,
     ) {
-        if let Ok(value) = HeaderValue::from_str(worker_url) {
+        let worker_urls = self.get_worker_urls();
+        if let Ok(value) =
+            HeaderValue::from_str(&Self::opaque_worker_id(&worker_urls, worker_url, false))
+        {
             headers.insert("x-vllm-router-worker", value);
         }
-        let base_worker = match dp_utils::extract_dp_rank(worker_url) {
-            Ok((base, _)) => base,
-            Err(_) => worker_url,
-        };
-        if let Ok(value) = HeaderValue::from_str(base_worker) {
+        if let Ok(value) =
+            HeaderValue::from_str(&Self::opaque_worker_id(&worker_urls, worker_url, true))
+        {
             headers.insert("x-vllm-router-base-worker", value);
         }
         if let Some(rank) = dp_rank {
@@ -993,7 +1017,7 @@ impl Router {
         if !is_stream {
             // For non-streaming requests, preserve headers
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            Self::add_routing_trace_headers(
+            self.add_routing_trace_headers(
                 &mut response_headers,
                 worker_url,
                 extracted_dp_rank,
@@ -1039,7 +1063,7 @@ impl Router {
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-            Self::add_routing_trace_headers(
+            self.add_routing_trace_headers(
                 &mut response_headers,
                 &worker_url,
                 extracted_dp_rank,
@@ -1099,7 +1123,7 @@ impl Router {
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-            Self::add_routing_trace_headers(
+            self.add_routing_trace_headers(
                 &mut response_headers,
                 worker_url,
                 extracted_dp_rank,
@@ -1971,6 +1995,80 @@ mod tests {
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
         }
+    }
+
+    #[test]
+    fn test_opaque_worker_id_hides_urls_and_groups_dp_ranks() {
+        let urls = vec![
+            "http://10.1.2.34:18100@1".to_string(),
+            "http://10.1.2.35:18100@0".to_string(),
+            "http://10.1.2.34:18100@0".to_string(),
+            "http://10.1.2.35:18100@1".to_string(),
+        ];
+
+        assert_eq!(
+            Router::opaque_worker_id(&urls, "http://10.1.2.34:18100@1", false),
+            "w1"
+        );
+        assert_eq!(
+            Router::opaque_worker_id(&urls, "http://10.1.2.35:18100@1", false),
+            "w3"
+        );
+        assert_eq!(
+            Router::opaque_worker_id(&urls, "http://10.1.2.34:18100@1", true),
+            "w0"
+        );
+        assert_eq!(
+            Router::opaque_worker_id(&urls, "http://10.1.2.35:18100@1", true),
+            "w1"
+        );
+        assert_eq!(
+            Router::opaque_worker_id(&urls, "http://missing:1", false),
+            "w?"
+        );
+    }
+
+    #[test]
+    fn test_add_routing_trace_headers_emit_opaque_worker_ids() {
+        let router = create_test_regular_router();
+        let mut headers = HeaderMap::new();
+        router.add_routing_trace_headers(
+            &mut headers,
+            "http://worker2:8080",
+            Some(1),
+            Some("session_id_match"),
+        );
+
+        let worker = headers
+            .get("x-vllm-router-worker")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let base_worker = headers
+            .get("x-vllm-router-base-worker")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(worker, "w1");
+        assert_eq!(base_worker, "w1");
+        assert!(!worker.contains("://"));
+        assert!(!base_worker.contains("://"));
+        assert_eq!(
+            headers
+                .get("x-vllm-router-dp-rank")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            headers
+                .get("x-vllm-router-decision")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "session_id_match"
+        );
     }
 
     #[test]
