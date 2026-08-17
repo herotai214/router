@@ -82,6 +82,76 @@ fn test_chat_routing_uses_full_history_by_default() {
 }
 
 #[test]
+fn test_chat_routing_preserves_multipart_system_and_developer_text() {
+    let request: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "You are a coding agent."},
+                        {"type": "text", "text": "Prefer small diffs."}
+                    ]
+                },
+                {
+                    "role": "developer",
+                    "content": [
+                        {"type": "text", "text": "Always inspect before editing."},
+                        {"type": "text", "text": "Never commit secrets."}
+                    ]
+                },
+                {"role": "user", "content": "Fix bug A"}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let routing = request.extract_text_for_routing();
+    assert!(routing.contains("system:You are a coding agent."));
+    assert!(routing.contains("system:Prefer small diffs."));
+    assert!(routing.contains("developer:Always inspect before editing."));
+    assert!(routing.contains("developer:Never commit secrets."));
+    assert!(routing.contains("user:Fix bug A"));
+
+    let forwarded = serde_json::to_value(&request).unwrap();
+    let messages = forwarded["messages"].as_array().unwrap();
+    assert!(messages[0]["content"].is_array());
+    assert_eq!(messages[0]["content"][1]["text"], "Prefer small diffs.");
+    assert!(messages[1]["content"].is_array());
+    assert_eq!(messages[1]["content"][1]["text"], "Never commit secrets.");
+}
+
+#[test]
+fn test_chat_routing_preserves_multipart_assistant_text() {
+    let request: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "Inspect src/main.rs"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "I will inspect the file."}]
+                },
+                {"role": "user", "content": "Continue"}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let routing = request.extract_text_for_routing();
+    assert!(routing.contains("assistant:I will inspect the file."));
+    assert!(routing.contains("user:Continue"));
+
+    let forwarded = serde_json::to_value(&request).unwrap();
+    assert!(forwarded["messages"][1]["content"].is_array());
+    assert_eq!(
+        forwarded["messages"][1]["content"][0]["text"],
+        "I will inspect the file."
+    );
+}
+
+#[test]
 fn test_chat_routing_sorts_tools_for_full_history() {
     let request_a: ChatCompletionRequest = serde_json::from_str(
         r#"{

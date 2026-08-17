@@ -7,7 +7,7 @@ use serde_json::{from_str, to_string, to_value};
 use vllm_router_rs::core::{BasicWorker, WorkerType};
 use vllm_router_rs::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
-    PromptInput, SamplingParams, UserMessageContent,
+    MessageContent, PromptInput, SamplingParams,
 };
 
 /// Create a default GenerateRequest for benchmarks with minimal fields set
@@ -163,7 +163,7 @@ fn test_benchmark_request_creation() {
         model: Some("test-model".to_string()),
         messages: vec![ChatMessage::User {
             role: "user".to_string(),
-            content: UserMessageContent::Text("Test message".to_string()),
+            content: MessageContent::Text("Test message".to_string()),
             name: None,
         }],
         max_tokens: Some(150),

@@ -13,8 +13,8 @@ use tower::ServiceExt;
 use vllm_router_rs::{
     config::{RouterConfig, RoutingMode},
     protocols::spec::{
-        ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, PromptInput,
-        UserMessageContent,
+        ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, MessageContent,
+        PromptInput,
     },
     routers::{openai_router::OpenAIRouter, RouterTrait},
 };
@@ -225,7 +225,7 @@ async fn test_openai_router_chat_completion_with_mock() {
     let mut chat_request = create_minimal_chat_request();
     chat_request.messages = vec![ChatMessage::User {
         role: "user".to_string(),
-        content: UserMessageContent::Text("Hello, how are you?".to_string()),
+        content: MessageContent::Text("Hello, how are you?".to_string()),
         name: None,
     }];
     chat_request.temperature = Some(0.7);

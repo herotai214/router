@@ -64,26 +64,26 @@ use std::collections::HashMap;
 pub enum ChatMessage {
     System {
         role: String,
-        content: String,
+        content: MessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
     Developer {
         role: String,
-        content: String,
+        content: MessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
     User {
         role: String, // "user"
-        content: UserMessageContent,
+        content: MessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
     Assistant {
         role: String, // "assistant"
         #[serde(skip_serializing_if = "Option::is_none")]
-        content: Option<String>,
+        content: Option<MessageContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,13 +123,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
         match role {
             "assistant" => Ok(ChatMessage::Assistant {
                 role: role.to_string(),
-                content: value.get("content").and_then(|c| {
-                    if c.is_null() {
-                        None
-                    } else {
-                        c.as_str().map(String::from)
-                    }
-                }),
+                content: MessageContent::parse_nullable(value.get("content")),
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -163,11 +157,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
             }),
             "system" => Ok(ChatMessage::System {
                 role: role.to_string(),
-                content: value
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+                content: MessageContent::parse_or_empty(value.get("content")),
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -178,11 +168,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
             }),
             "developer" => Ok(ChatMessage::Developer {
                 role: role.to_string(),
-                content: value
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+                content: MessageContent::parse_or_empty(value.get("content")),
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -192,13 +178,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 }),
             }),
             "user" => {
-                let content = value
-                    .get("content")
-                    .map(|c| {
-                        serde_json::from_value(c.clone())
-                            .unwrap_or(UserMessageContent::Text(String::new()))
-                    })
-                    .unwrap_or(UserMessageContent::Text(String::new()));
+                let content = MessageContent::parse_or_empty(value.get("content"));
                 Ok(ChatMessage::User {
                     role: role.to_string(),
                     content,
@@ -284,23 +264,70 @@ pub struct StructuredOutputsParams {
     pub whitespace_pattern: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(untagged)]
-pub enum UserMessageContent {
+pub enum MessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+impl MessageContent {
+    /// Missing / null / unusable JSON becomes `Text("")`. Empty text is valid.
+    fn parse_or_empty(value: Option<&Value>) -> Self {
+        match value {
+            Some(content) => serde_json::from_value(content.clone())
+                .unwrap_or_else(|_| MessageContent::Text(String::new())),
+            None => MessageContent::Text(String::new()),
+        }
+    }
+
+    /// Missing / null stays `None` (assistant tool-call turns). Empty string is `Some(Text(""))`.
+    fn parse_nullable(value: Option<&Value>) -> Option<Self> {
+        let content = value?;
+        if content.is_null() {
+            return None;
+        }
+        Some(
+            serde_json::from_value(content.clone())
+                .unwrap_or_else(|_| MessageContent::Text(String::new())),
+        )
+    }
+
+    fn routing_texts(&self) -> Vec<&str> {
+        match self {
+            MessageContent::Text(text) => {
+                if text.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    vec![text.as_str()]
+                }
+            }
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+                    ContentPart::Refusal { refusal } if !refusal.trim().is_empty() => {
+                        Some(refusal.as_str())
+                    }
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum ContentPart {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ImageUrl {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -566,27 +593,21 @@ impl ChatCompletionRequest {
 
         for message in &self.messages {
             match message {
-                ChatMessage::System { content, .. } if !content.trim().is_empty() => {
-                    parts.push(format!("system:{}", content.trim()));
+                ChatMessage::System { content, .. } => {
+                    for text in content.routing_texts() {
+                        parts.push(format!("system:{}", text.trim()));
+                    }
                 }
-                ChatMessage::Developer { content, .. } if !content.trim().is_empty() => {
-                    parts.push(format!("developer:{}", content.trim()));
+                ChatMessage::Developer { content, .. } => {
+                    for text in content.routing_texts() {
+                        parts.push(format!("developer:{}", text.trim()));
+                    }
                 }
-                ChatMessage::User { content, .. } => match content {
-                    UserMessageContent::Text(text) if !text.trim().is_empty() => {
+                ChatMessage::User { content, .. } => {
+                    for text in content.routing_texts() {
                         parts.push(format!("user:{}", text.trim()));
                     }
-                    UserMessageContent::Parts(content_parts) => {
-                        for part in content_parts {
-                            if let ContentPart::Text { text } = part {
-                                if !text.trim().is_empty() {
-                                    parts.push(format!("user:{}", text.trim()));
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                },
+                }
                 ChatMessage::Assistant {
                     content,
                     tool_calls,
@@ -594,8 +615,8 @@ impl ChatCompletionRequest {
                     ..
                 } => {
                     if let Some(content) = content {
-                        if !content.trim().is_empty() {
-                            parts.push(format!("assistant:{}", content.trim()));
+                        for text in content.routing_texts() {
+                            parts.push(format!("assistant:{}", text.trim()));
                         }
                     }
 
@@ -3797,7 +3818,10 @@ mod tests {
             ChatMessage::Assistant {
                 content, reasoning, ..
             } => {
-                assert_eq!(content.as_ref().unwrap(), "Hello there!");
+                assert_eq!(
+                    content,
+                    Some(MessageContent::Text("Hello there!".to_string()))
+                );
                 assert_eq!(
                     reasoning.as_ref().unwrap(),
                     "Let me think about how to greet the user..."
@@ -3870,10 +3894,43 @@ mod tests {
 
         match message {
             ChatMessage::System { content, .. } => {
-                assert_eq!(content, "You are a helpful assistant.");
+                assert_eq!(
+                    content,
+                    MessageContent::Text("You are a helpful assistant.".to_string())
+                );
             }
             _ => panic!("Expected System message"),
         }
+    }
+
+    #[test]
+    fn test_chat_message_system_and_developer_multipart_text_roundtrip() {
+        let json = r#"{
+            "role": "developer",
+            "content": [
+                {"type": "text", "text": "Always inspect before editing."},
+                {"type": "text", "text": "Never commit secrets."}
+            ]
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+        match &message {
+            ChatMessage::Developer {
+                content: MessageContent::Parts(parts),
+                ..
+            } => {
+                assert_eq!(parts.len(), 2);
+            }
+            other => panic!("Expected multipart developer, got {other:?}"),
+        }
+
+        let forwarded = serde_json::to_value(&message).unwrap();
+        assert!(forwarded["content"].is_array());
+        assert_eq!(
+            forwarded["content"][0]["text"],
+            "Always inspect before editing."
+        );
+        assert_eq!(forwarded["content"][1]["text"], "Never commit secrets.");
     }
 
     #[test]
@@ -3887,7 +3944,7 @@ mod tests {
 
         match message {
             ChatMessage::User { content, .. } => match content {
-                UserMessageContent::Text(text) => assert_eq!(text, "Hello!"),
+                MessageContent::Text(text) => assert_eq!(text, "Hello!"),
                 _ => panic!("Expected Text content"),
             },
             _ => panic!("Expected User message"),
@@ -3966,7 +4023,7 @@ mod tests {
     fn test_chat_message_roundtrip_serialization() {
         let original = ChatMessage::Assistant {
             role: "assistant".to_string(),
-            content: Some("Hello!".to_string()),
+            content: Some(MessageContent::Text("Hello!".to_string())),
             name: None,
             tool_calls: None,
             function_call: None,
@@ -3980,7 +4037,7 @@ mod tests {
             ChatMessage::Assistant {
                 content, reasoning, ..
             } => {
-                assert_eq!(content.as_ref().unwrap(), "Hello!");
+                assert_eq!(content, Some(MessageContent::Text("Hello!".to_string())));
                 assert_eq!(reasoning.as_ref().unwrap(), "Thinking...");
             }
             _ => panic!("Expected Assistant message"),
