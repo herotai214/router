@@ -197,3 +197,145 @@ async def test_stream_cancellation(grpc_test_server):
         pass
 
     assert chunks_received == 2
+
+
+@pytest.mark.asyncio
+async def test_unsupported_execution_mode_rejected(grpc_test_server):
+    """Verifies that PREFILL_ONLY or DECODE_ONLY modes are rejected with UNIMPLEMENTED."""
+    client = grpc_test_server["client"]
+    req = engine_client_pb2.GenerateRequest(
+        request_id="req-exec-mode-05",
+        prompt_token_ids=[1, 2, 3],
+        execution_mode=engine_client_pb2.ExecutionMode.PREFILL_ONLY,
+    )
+
+    with pytest.raises(grpc.aio.AioRpcError) as exc_info:
+        async for _ in client.GenerateStream(req):
+            pass
+
+    assert exc_info.value.code() == grpc.StatusCode.UNIMPLEMENTED
+    assert "not supported in PR 1" in exc_info.value.details()
+
+
+@pytest.mark.asyncio
+async def test_unsupported_multimodal_rejected(grpc_test_server):
+    """Verifies that multimodal input is rejected with UNIMPLEMENTED in PR 1."""
+    client = grpc_test_server["client"]
+    req = engine_client_pb2.GenerateRequest(
+        request_id="req-mm-06",
+        prompt_token_ids=[1, 2, 3],
+        multimodal_data=[
+            engine_client_pb2.MultimodalItem(
+                modality_type="image",
+                raw_data=b"fake-image-bytes",
+            )
+        ],
+    )
+
+    with pytest.raises(grpc.aio.AioRpcError) as exc_info:
+        async for _ in client.GenerateStream(req):
+            pass
+
+    assert exc_info.value.code() == grpc.StatusCode.UNIMPLEMENTED
+    assert "Multimodal generation is not supported in PR 1" in exc_info.value.details()
+
+
+@pytest.mark.asyncio
+async def test_invalid_dp_rank_rejected(grpc_test_server):
+    """Verifies that out-of-bounds dp_rank (>= dp_size) is rejected with INVALID_ARGUMENT."""
+    client = grpc_test_server["client"]
+    # grpc_test_server has dp_size=2, so dp_rank=5 is invalid
+    req = engine_client_pb2.GenerateRequest(
+        request_id="req-dp-07",
+        prompt_token_ids=[1, 2, 3],
+        dp_rank=5,
+    )
+
+    with pytest.raises(grpc.aio.AioRpcError) as exc_info:
+        async for _ in client.GenerateStream(req):
+            pass
+
+    assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "out of bounds" in exc_info.value.details()
+
+
+@pytest.mark.asyncio
+async def test_multi_token_step_emission(grpc_test_server):
+    """Verifies that multi-step / speculative decoding yielding multiple tokens in one step does not drop tokens."""
+
+    class MultiStepEngine:
+        def __init__(self):
+            pass
+
+        async def generate(self, prompt, sampling_params, request_id: str):
+            from vllm_router.worker_daemon import CompletionOutput, RequestOutput
+
+            # Step 1: emits 3 tokens at once: [501, 502, 503]
+            yield RequestOutput(
+                request_id=request_id,
+                prompt=None,
+                prompt_token_ids=[1, 2],
+                prompt_logprobs=None,
+                outputs=[
+                    CompletionOutput(
+                        index=0,
+                        text="Batch one",
+                        token_ids=[501, 502, 503],
+                        finish_reason=None,
+                    )
+                ],
+                finished=False,
+            )
+            # Step 2: emits 2 more tokens: [504, 505]
+            yield RequestOutput(
+                request_id=request_id,
+                prompt=None,
+                prompt_token_ids=[1, 2],
+                prompt_logprobs=None,
+                outputs=[
+                    CompletionOutput(
+                        index=0,
+                        text="Batch one and two",
+                        token_ids=[501, 502, 503, 504, 505],
+                        finish_reason="stop",
+                    )
+                ],
+                finished=True,
+            )
+
+    server = grpc.aio.server()
+    engine = MultiStepEngine()
+    servicer = EngineServiceServicer(
+        engine=engine,
+        model_name="mock-multistep",
+        max_model_len=4096,
+        dp_size=1,
+    )
+    engine_client_pb2_grpc.add_EngineServiceServicer_to_server(servicer, server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    await server.start()
+
+    channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
+    client = engine_client_pb2_grpc.EngineServiceStub(channel)
+
+    try:
+        req = engine_client_pb2.GenerateRequest(
+            request_id="req-multistep-08",
+            prompt_token_ids=[1, 2],
+        )
+
+        emitted_tokens = []
+        async for chunk in client.GenerateStream(req):
+            if chunk.token_id > 0:
+                emitted_tokens.append(chunk.token_id)
+
+        # All 5 tokens must be emitted in order, none dropped!
+        assert emitted_tokens == [501, 502, 503, 504, 505]
+
+        # Verify unary Generate also receives all 5 tokens
+        res = await client.Generate(req)
+        assert list(res.output_token_ids) == [501, 502, 503, 504, 505]
+        assert res.output_text == "Batch one and two"
+    finally:
+        await channel.close()
+        await server.stop(grace=0.5)

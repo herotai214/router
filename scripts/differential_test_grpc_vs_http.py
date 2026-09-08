@@ -320,25 +320,35 @@ async def main():
             )
 
             # ASSERT EQUALITY
+            # Reconstruct HTTP tokens from tokenizer to verify token sequence parity
+            http_tokens = tokenizer.encode(http_text, add_special_tokens=False)
+
             text_match = http_text == grpc_text
             finish_match = http_finish == grpc_finish
+            token_match = http_tokens == grpc_tokens
 
             print("\n--- VERIFICATION VERDICT ---")
             print(
                 f"  Text Match (Byte-for-Byte) : {'PASS (IDENTICAL)' if text_match else 'FAIL'}"
             )
             print(
+                f"  Token Sequence Match       : {'PASS (IDENTICAL)' if token_match else 'FAIL'}"
+            )
+            print(
                 f"  Finish Reason Match        : {'PASS (IDENTICAL)' if finish_match else 'FAIL'}"
             )
 
-            if not (text_match and finish_match):
+            if not (text_match and finish_match and token_match):
                 all_passed = False
                 print("MISMATCH DETECTED!")
-                print(f"  HTTP: {http_text}")
-                print(f"  gRPC: {grpc_text}")
+                print(f"  HTTP Text   : {http_text}")
+                print(f"  gRPC Text   : {grpc_text}")
+                print(f"  HTTP Tokens : {http_tokens}")
+                print(f"  gRPC Tokens : {grpc_tokens}")
 
             assert text_match, f"Text mismatch in {title}!"
             assert finish_match, f"Finish reason mismatch in {title}!"
+            assert token_match, f"Token sequence mismatch in {title}!"
 
         print("\n" + "=" * 80)
         if all_passed:

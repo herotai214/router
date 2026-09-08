@@ -18,6 +18,66 @@ import grpc
 from vllm_router.proto import engine_client_pb2, engine_client_pb2_grpc
 
 try:
+    from vllm import SamplingParams, TokensPrompt
+    from vllm.outputs import CompletionOutput, RequestOutput
+
+    HAS_VLLM = True
+except ImportError:
+    HAS_VLLM = False
+
+    class SamplingParams:  # type: ignore[no-redef]
+        """Lightweight fallback SamplingParams when vLLM is not installed (mock/CI)."""
+
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    class TokensPrompt:  # type: ignore[no-redef]
+        """Lightweight fallback TokensPrompt when vLLM is not installed (mock/CI)."""
+
+        def __init__(self, prompt_token_ids):
+            self.prompt_token_ids = prompt_token_ids
+
+    class CompletionOutput:  # type: ignore[no-redef]
+        """Lightweight fallback CompletionOutput when vLLM is not installed (mock/CI)."""
+
+        def __init__(
+            self,
+            index: int,
+            text: str,
+            token_ids: list,
+            cumulative_logprob: float = 0.0,
+            logprobs=None,
+            finish_reason: str | None = None,
+        ):
+            self.index = index
+            self.text = text
+            self.token_ids = token_ids
+            self.cumulative_logprob = cumulative_logprob
+            self.logprobs = logprobs
+            self.finish_reason = finish_reason
+
+    class RequestOutput:  # type: ignore[no-redef]
+        """Lightweight fallback RequestOutput when vLLM is not installed (mock/CI)."""
+
+        def __init__(
+            self,
+            request_id: str,
+            prompt: str | None,
+            prompt_token_ids: list,
+            prompt_logprobs,
+            outputs: list,
+            finished: bool,
+        ):
+            self.request_id = request_id
+            self.prompt = prompt
+            self.prompt_token_ids = prompt_token_ids
+            self.prompt_logprobs = prompt_logprobs
+            self.outputs = outputs
+            self.finished = finished
+
+
+try:
     from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
     HAS_GRPC_HEALTH = True
@@ -59,26 +119,38 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
         self._waiting_requests: int = 0
 
     def _get_metrics(self) -> engine_client_pb2.WorkerMetrics:
-        """Collect current queue and VRAM metrics if available."""
+        """Collect current queue and VRAM metrics from engine or internal counters."""
         kv_usage = 0.0
+        running = self._running_requests
+        waiting = self._waiting_requests
+
         try:
-            # Try to query stats from engine if available
+            # Query stats from engine if available
             if hasattr(self.engine, "get_stats"):
                 stats = self.engine.get_stats()
                 kv_usage = getattr(stats, "gpu_cache_usage", 0.0)
+                waiting = getattr(stats, "num_waiting_sys", waiting)
+                running = getattr(stats, "num_running_sys", running)
+            elif (
+                hasattr(self.engine, "stat_logger")
+                and self.engine.stat_logger is not None
+            ):
+                stats = getattr(self.engine.stat_logger, "stats", None)
+                if stats:
+                    kv_usage = getattr(stats, "gpu_cache_usage", 0.0)
+                    waiting = getattr(stats, "num_waiting_sys", waiting)
+                    running = getattr(stats, "num_running_sys", running)
         except Exception:
             pass
 
         return engine_client_pb2.WorkerMetrics(
-            running_requests=self._running_requests,
-            waiting_requests=self._waiting_requests,
+            running_requests=running,
+            waiting_requests=waiting,
             kv_cache_usage_percent=float(kv_usage),
         )
 
     def _build_sampling_params(self, pb_params: engine_client_pb2.SamplingParams):
         """Convert Protobuf SamplingParams to vLLM SamplingParams."""
-        from vllm import SamplingParams
-
         kwargs = {
             "temperature": pb_params.temperature if pb_params.temperature > 0 else 0.0,
             "top_p": pb_params.top_p if pb_params.top_p > 0 else 1.0,
@@ -105,9 +177,33 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
     ) -> AsyncGenerator[engine_client_pb2.GenerateStreamResponse, None]:
         """
         Stream generated tokens for incoming GenerateRequest over gRPC HTTP/2.
-        Supports pre-tokenized prompt_token_ids and cancellation propagation.
+        Supports pre-tokenized prompt_token_ids, cancellation propagation,
+        and multi-token delta emission for speculative/multi-step outputs.
         """
-        from vllm import TokensPrompt
+        # Validate data-parallel rank
+        if request.dp_rank >= self.dp_size:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"Requested dp_rank {request.dp_rank} is out of bounds for worker with dp_size {self.dp_size}.",
+            )
+            return
+
+        # Validate execution mode (P/D disaggregation scheduled for later PRs)
+        if request.execution_mode != engine_client_pb2.ExecutionMode.NORMAL:
+            await context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                f"ExecutionMode {engine_client_pb2.ExecutionMode.Name(request.execution_mode)} "
+                "is not supported in PR 1 (scheduled for disaggregated P/D in future PRs).",
+            )
+            return
+
+        # Validate multimodal input (scheduled for later PRs)
+        if request.multimodal_data:
+            await context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                "Multimodal generation is not supported in PR 1.",
+            )
+            return
 
         request_id = request.request_id or f"req-{uuid.uuid4().hex[:12]}"
         prompt_token_ids = list(request.prompt_token_ids)
@@ -125,7 +221,8 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
 
         sampling_params = self._build_sampling_params(request.sampling_params)
 
-        self._running_requests += 1
+        self._waiting_requests += 1
+        is_first_chunk = True
         prev_text = ""
         prev_token_count = 0
 
@@ -137,6 +234,11 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
             )
 
             async for request_output in generator:
+                if is_first_chunk:
+                    self._waiting_requests = max(0, self._waiting_requests - 1)
+                    self._running_requests += 1
+                    is_first_chunk = False
+
                 # Check client cancellation
                 if context.cancelled():
                     logger.info(f"Client cancelled stream for request {request_id}")
@@ -152,27 +254,50 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
                 current_text = output.text
                 current_token_ids = output.token_ids
 
-                # Compute deltas
+                # Compute text and token deltas
                 text_delta = current_text[len(prev_text) :]
                 prev_text = current_text
 
-                delta_token_id = 0
-                if len(current_token_ids) > prev_token_count:
-                    delta_token_id = current_token_ids[-1]
-                    prev_token_count = len(current_token_ids)
+                new_token_ids = current_token_ids[prev_token_count:]
+                prev_token_count = len(current_token_ids)
 
                 is_finished = request_output.finished
                 finish_reason = output.finish_reason or ""
 
-                response = engine_client_pb2.GenerateStreamResponse(
-                    request_id=request_id,
-                    token_id=delta_token_id,
-                    text_delta=text_delta,
-                    is_finished=is_finished,
-                    finish_reason=finish_reason,
-                    metrics=self._get_metrics(),
-                )
-                yield response
+                if not new_token_ids:
+                    response = engine_client_pb2.GenerateStreamResponse(
+                        request_id=request_id,
+                        token_id=0,
+                        text_delta=text_delta,
+                        is_finished=is_finished,
+                        finish_reason=finish_reason,
+                        metrics=self._get_metrics(),
+                    )
+                    yield response
+                elif len(new_token_ids) == 1:
+                    response = engine_client_pb2.GenerateStreamResponse(
+                        request_id=request_id,
+                        token_id=new_token_ids[0],
+                        text_delta=text_delta,
+                        is_finished=is_finished,
+                        finish_reason=finish_reason,
+                        metrics=self._get_metrics(),
+                    )
+                    yield response
+                else:
+                    # Multi-step or speculative decoding produced multiple tokens in one step.
+                    # Emit each token so no tokens are dropped from the stream.
+                    for idx, tok_id in enumerate(new_token_ids):
+                        is_last = idx == len(new_token_ids) - 1
+                        response = engine_client_pb2.GenerateStreamResponse(
+                            request_id=request_id,
+                            token_id=tok_id,
+                            text_delta=text_delta if is_last else "",
+                            is_finished=is_finished if is_last else False,
+                            finish_reason=finish_reason if is_last else "",
+                            metrics=self._get_metrics(),
+                        )
+                        yield response
 
         except asyncio.CancelledError:
             logger.info(f"Stream cancelled by runtime for request {request_id}")
@@ -185,7 +310,10 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
             )
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
         finally:
-            self._running_requests = max(0, self._running_requests - 1)
+            if is_first_chunk:
+                self._waiting_requests = max(0, self._waiting_requests - 1)
+            else:
+                self._running_requests = max(0, self._running_requests - 1)
 
     async def Generate(
         self,
@@ -365,9 +493,17 @@ class MockAsyncEngine:
     def __init__(self, model_name: str):
         self.model_name = model_name
 
-    async def generate(self, prompt, sampling_params, request_id: str):
-        from vllm.outputs import CompletionOutput, RequestOutput
+    def get_stats(self):
+        """Mock engine statistics for metrics testing."""
 
+        class MockStats:
+            gpu_cache_usage = 0.15
+            num_waiting_sys = 0
+            num_running_sys = 1
+
+        return MockStats()
+
+    async def generate(self, prompt, sampling_params, request_id: str):
         words = [
             "Hello",
             " world",
@@ -430,6 +566,12 @@ async def serve(args):
         logger.info("Initializing MockAsyncEngine for offline testing...")
         engine = MockAsyncEngine(model_name=args.model)
     else:
+        if not HAS_VLLM:
+            raise RuntimeError(
+                "vLLM is not installed in the current environment. "
+                "Please install vllm or pass --mock-engine for offline testing."
+            )
+
         logger.info(f"Initializing AsyncLLMEngine for model: {args.model}")
         try:
             from vllm import AsyncEngineArgs, AsyncLLMEngine
@@ -446,6 +588,19 @@ async def serve(args):
             "enable_prefix_caching": args.enable_prefix_caching,
             "block_size": block_size,
         }
+        if args.dp_size > 1:
+            import inspect
+
+            sig = inspect.signature(AsyncEngineArgs)
+            if "data_parallel_size" in sig.parameters:
+                engine_args_kwargs["data_parallel_size"] = args.dp_size
+            else:
+                logger.warning(
+                    f"--dp-size={args.dp_size} specified, but AsyncEngineArgs does not accept "
+                    "'data_parallel_size'. For multi-process DP, launch separate worker "
+                    "daemon processes per GPU rank or use tensor parallelism."
+                )
+
         if args.max_model_len is not None:
             engine_args_kwargs["max_model_len"] = args.max_model_len
 
