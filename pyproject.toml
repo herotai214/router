@@ -23,6 +23,8 @@ dependencies = [
     "uvicorn",
     "fastapi",
     "requests>=2.25.0",
+    "grpcio>=1.60.0",
+    "protobuf>=5.0.0",
 ]
 
 [project.optional-dependencies]
@@ -30,10 +32,12 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
+    "grpcio-tools>=1.60.0",
 ]
 
 [project.scripts]
 vllm-router = "vllm_router.launch_router:main"
+vllm-worker-daemon = "vllm_router.worker_daemon:main"
 
 
 # https://github.com/PyO3/setuptools-rust?tab=readme-ov-file
