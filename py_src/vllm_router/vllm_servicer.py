@@ -1,7 +1,7 @@
 """
-Standalone gRPC Worker Daemon for vllm-router.
+vLLM gRPC Servicer for vllm-router.
 
-Exposes AsyncLLMEngine via gRPC/HTTP2 using the EngineService contract.
+Exposes AsyncLLMEngine via gRPC/HTTP2 using the VllmEngine contract.
 Enables high-performance binary transport, prompt_token_ids ingestion,
 and native cluster admin controls.
 """
@@ -11,70 +11,21 @@ import asyncio
 import logging
 import signal
 import uuid
-from typing import AsyncGenerator
+from dataclasses import dataclass
+from typing import Any, AsyncGenerator
 
 import grpc
 
-from vllm_router.proto import engine_client_pb2, engine_client_pb2_grpc
+from vllm_router.proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 
 try:
     from vllm import SamplingParams, TokensPrompt
-    from vllm.outputs import CompletionOutput, RequestOutput
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.engine.async_llm_engine import AsyncLLMEngine
 
     HAS_VLLM = True
 except ImportError:
     HAS_VLLM = False
-
-    class SamplingParams:  # type: ignore[no-redef]
-        """Lightweight fallback SamplingParams when vLLM is not installed (mock/CI)."""
-
-        def __init__(self, **kwargs):
-            for k, v in kwargs.items():
-                setattr(self, k, v)
-
-    class TokensPrompt:  # type: ignore[no-redef]
-        """Lightweight fallback TokensPrompt when vLLM is not installed (mock/CI)."""
-
-        def __init__(self, prompt_token_ids):
-            self.prompt_token_ids = prompt_token_ids
-
-    class CompletionOutput:  # type: ignore[no-redef]
-        """Lightweight fallback CompletionOutput when vLLM is not installed (mock/CI)."""
-
-        def __init__(
-            self,
-            index: int,
-            text: str,
-            token_ids: list,
-            cumulative_logprob: float = 0.0,
-            logprobs=None,
-            finish_reason: str | None = None,
-        ):
-            self.index = index
-            self.text = text
-            self.token_ids = token_ids
-            self.cumulative_logprob = cumulative_logprob
-            self.logprobs = logprobs
-            self.finish_reason = finish_reason
-
-    class RequestOutput:  # type: ignore[no-redef]
-        """Lightweight fallback RequestOutput when vLLM is not installed (mock/CI)."""
-
-        def __init__(
-            self,
-            request_id: str,
-            prompt: str | None,
-            prompt_token_ids: list,
-            prompt_logprobs,
-            outputs: list,
-            finished: bool,
-        ):
-            self.request_id = request_id
-            self.prompt = prompt
-            self.prompt_token_ids = prompt_token_ids
-            self.prompt_logprobs = prompt_logprobs
-            self.outputs = outputs
-            self.finished = finished
 
 
 try:
@@ -93,12 +44,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
 )
-logger = logging.getLogger("vllm_worker_daemon")
+logger = logging.getLogger("vllm_servicer")
 
 
-class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
+class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     """
-    gRPC Servicer implementing vllm.engine.v1.EngineService.
+    gRPC Servicer implementing vllm.engine.v1.VllmEngine.
     Dispatches generation, metadata discovery, health checks, and admin controls.
     """
 
@@ -118,7 +69,7 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
         self._running_requests: int = 0
         self._waiting_requests: int = 0
 
-    def _get_metrics(self) -> engine_client_pb2.WorkerMetrics:
+    def _get_metrics(self) -> vllm_engine_pb2.WorkerMetrics:
         """Collect current queue and VRAM metrics from engine or internal counters."""
         kv_usage = 0.0
         running = self._running_requests
@@ -143,14 +94,24 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
         except Exception:
             pass
 
-        return engine_client_pb2.WorkerMetrics(
+        return vllm_engine_pb2.WorkerMetrics(
             running_requests=running,
             waiting_requests=waiting,
             kv_cache_usage_percent=float(kv_usage),
         )
 
-    def _build_sampling_params(self, pb_params: engine_client_pb2.SamplingParams):
+    def _build_sampling_params(self, pb_params: vllm_engine_pb2.SamplingParams):
         """Convert Protobuf SamplingParams to vLLM SamplingParams."""
+        if getattr(self.engine, "is_mock", False):
+            return None
+        if not HAS_VLLM:
+            logger.critical(
+                "vLLM is not installed. Real engine requires vLLM SamplingParams."
+            )
+            raise RuntimeError(
+                "vLLM is not installed in the current Python environment."
+            )
+
         kwargs = {
             "temperature": pb_params.temperature if pb_params.temperature > 0 else 0.0,
             "top_p": pb_params.top_p if pb_params.top_p > 0 else 1.0,
@@ -172,9 +133,9 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
 
     async def GenerateStream(
         self,
-        request: engine_client_pb2.GenerateRequest,
+        request: vllm_engine_pb2.GenerateRequest,
         context: grpc.aio.ServicerContext,
-    ) -> AsyncGenerator[engine_client_pb2.GenerateStreamResponse, None]:
+    ) -> AsyncGenerator[vllm_engine_pb2.GenerateStreamResponse, None]:
         """
         Stream generated tokens for incoming GenerateRequest over gRPC HTTP/2.
         Supports pre-tokenized prompt_token_ids, cancellation propagation,
@@ -189,10 +150,10 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
             return
 
         # Validate execution mode (P/D disaggregation scheduled for later PRs)
-        if request.execution_mode != engine_client_pb2.ExecutionMode.NORMAL:
+        if request.execution_mode != vllm_engine_pb2.ExecutionMode.NORMAL:
             await context.abort(
                 grpc.StatusCode.UNIMPLEMENTED,
-                f"ExecutionMode {engine_client_pb2.ExecutionMode.Name(request.execution_mode)} "
+                f"ExecutionMode {vllm_engine_pb2.ExecutionMode.Name(request.execution_mode)} "
                 "is not supported in PR 1 (scheduled for disaggregated P/D in future PRs).",
             )
             return
@@ -211,7 +172,16 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
         if not prompt_token_ids and request.prompt_text:
             prompt = request.prompt_text
         elif prompt_token_ids:
-            prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
+            if getattr(self.engine, "is_mock", False):
+                prompt = {"prompt_token_ids": prompt_token_ids}
+            elif HAS_VLLM:
+                prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
+            else:
+                await context.abort(
+                    grpc.StatusCode.INTERNAL,
+                    "vLLM is not installed on this worker.",
+                )
+                return
         else:
             await context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
@@ -265,9 +235,8 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
                 finish_reason = output.finish_reason or ""
 
                 if not new_token_ids:
-                    response = engine_client_pb2.GenerateStreamResponse(
+                    response = vllm_engine_pb2.GenerateStreamResponse(
                         request_id=request_id,
-                        token_id=0,
                         text_delta=text_delta,
                         is_finished=is_finished,
                         finish_reason=finish_reason,
@@ -275,7 +244,7 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
                     )
                     yield response
                 elif len(new_token_ids) == 1:
-                    response = engine_client_pb2.GenerateStreamResponse(
+                    response = vllm_engine_pb2.GenerateStreamResponse(
                         request_id=request_id,
                         token_id=new_token_ids[0],
                         text_delta=text_delta,
@@ -289,7 +258,7 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
                     # Emit each token so no tokens are dropped from the stream.
                     for idx, tok_id in enumerate(new_token_ids):
                         is_last = idx == len(new_token_ids) - 1
-                        response = engine_client_pb2.GenerateStreamResponse(
+                        response = vllm_engine_pb2.GenerateStreamResponse(
                             request_id=request_id,
                             token_id=tok_id,
                             text_delta=text_delta if is_last else "",
@@ -317,24 +286,26 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
 
     async def Generate(
         self,
-        request: engine_client_pb2.GenerateRequest,
+        request: vllm_engine_pb2.GenerateRequest,
         context: grpc.aio.ServicerContext,
-    ) -> engine_client_pb2.GenerateResponse:
+    ) -> vllm_engine_pb2.GenerateResponse:
         """Unary generation returning full output in a single response."""
         accumulated_text = []
         accumulated_token_ids = []
         finish_reason = ""
-        request_id = request.request_id or f"req-{uuid.uuid4().hex[:12]}"
+        if not request.request_id:
+            request.request_id = f"req-{uuid.uuid4().hex[:12]}"
+        request_id = request.request_id
 
         async for chunk in self.GenerateStream(request, context):
             if chunk.text_delta:
                 accumulated_text.append(chunk.text_delta)
-            if chunk.token_id > 0:
+            if chunk.HasField("token_id"):
                 accumulated_token_ids.append(chunk.token_id)
             if chunk.is_finished:
                 finish_reason = chunk.finish_reason
 
-        return engine_client_pb2.GenerateResponse(
+        return vllm_engine_pb2.GenerateResponse(
             request_id=request_id,
             output_token_ids=accumulated_token_ids,
             output_text="".join(accumulated_text),
@@ -344,11 +315,11 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
 
     async def GetModelInfo(
         self,
-        request: engine_client_pb2.ModelInfoRequest,
+        request: vllm_engine_pb2.ModelInfoRequest,
         context: grpc.aio.ServicerContext,
-    ) -> engine_client_pb2.ModelInfoResponse:
+    ) -> vllm_engine_pb2.ModelInfoResponse:
         """Returns model metadata and capability info for router discovery."""
-        return engine_client_pb2.ModelInfoResponse(
+        return vllm_engine_pb2.ModelInfoResponse(
             model_name=self.model_name,
             max_model_len=self.max_model_len,
             dp_size=self.dp_size,
@@ -358,80 +329,42 @@ class EngineServiceServicer(engine_client_pb2_grpc.EngineServiceServicer):
 
     async def HealthCheck(
         self,
-        request: engine_client_pb2.HealthCheckRequest,
+        request: vllm_engine_pb2.HealthCheckRequest,
         context: grpc.aio.ServicerContext,
-    ) -> engine_client_pb2.HealthCheckResponse:
+    ) -> vllm_engine_pb2.HealthCheckResponse:
         """Probes engine health and serving status."""
-        status = engine_client_pb2.HealthCheckResponse.ServingStatus.SERVING
+        status = vllm_engine_pb2.HealthCheckResponse.ServingStatus.SERVING
         try:
             if hasattr(self.engine, "check_health"):
                 await self.engine.check_health()
         except Exception as e:
             logger.warning(f"Engine health check failed: {e}")
-            status = engine_client_pb2.HealthCheckResponse.ServingStatus.NOT_SERVING
+            status = vllm_engine_pb2.HealthCheckResponse.ServingStatus.NOT_SERVING
 
-        return engine_client_pb2.HealthCheckResponse(status=status)
-
-    async def StartProfile(
-        self,
-        request: engine_client_pb2.EmptyRequest,
-        context: grpc.aio.ServicerContext,
-    ) -> engine_client_pb2.AdminResponse:
-        """Starts CUDA / Ascend profiler trace."""
-        try:
-            if hasattr(self.engine, "start_profile"):
-                await self.engine.start_profile()
-                return engine_client_pb2.AdminResponse(
-                    success=True, message="Profiler started successfully"
-                )
-            return engine_client_pb2.AdminResponse(
-                success=False, message="Engine does not support start_profile"
-            )
-        except Exception as e:
-            logger.error(f"Failed to start profile: {e}")
-            return engine_client_pb2.AdminResponse(success=False, message=str(e))
-
-    async def StopProfile(
-        self,
-        request: engine_client_pb2.EmptyRequest,
-        context: grpc.aio.ServicerContext,
-    ) -> engine_client_pb2.AdminResponse:
-        """Stops CUDA / Ascend profiler trace."""
-        try:
-            if hasattr(self.engine, "stop_profile"):
-                await self.engine.stop_profile()
-                return engine_client_pb2.AdminResponse(
-                    success=True, message="Profiler stopped successfully"
-                )
-            return engine_client_pb2.AdminResponse(
-                success=False, message="Engine does not support stop_profile"
-            )
-        except Exception as e:
-            logger.error(f"Failed to stop profile: {e}")
-            return engine_client_pb2.AdminResponse(success=False, message=str(e))
+        return vllm_engine_pb2.HealthCheckResponse(status=status)
 
     async def ResetPrefixCache(
         self,
-        request: engine_client_pb2.EmptyRequest,
+        request: vllm_engine_pb2.EmptyRequest,
         context: grpc.aio.ServicerContext,
-    ) -> engine_client_pb2.AdminResponse:
+    ) -> vllm_engine_pb2.AdminResponse:
         """Clears prefix KV cache blocks in VRAM."""
         try:
             if hasattr(self.engine, "reset_prefix_cache"):
                 await self.engine.reset_prefix_cache()
-                return engine_client_pb2.AdminResponse(
+                return vllm_engine_pb2.AdminResponse(
                     success=True, message="Prefix cache reset successfully"
                 )
-            return engine_client_pb2.AdminResponse(
+            return vllm_engine_pb2.AdminResponse(
                 success=False, message="Engine does not support reset_prefix_cache"
             )
         except Exception as e:
             logger.error(f"Failed to reset prefix cache: {e}")
-            return engine_client_pb2.AdminResponse(success=False, message=str(e))
+            return vllm_engine_pb2.AdminResponse(success=False, message=str(e))
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="vLLM gRPC Engine Worker Daemon")
+    parser = argparse.ArgumentParser(description="vLLM gRPC Engine Servicer")
     parser.add_argument(
         "--model", type=str, required=True, help="Model name or local filesystem path"
     )
@@ -472,9 +405,9 @@ def parse_args():
     )
     parser.add_argument(
         "--enable-prefix-caching",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable automatic prefix caching",
+        help="Enable/disable automatic prefix caching (default: enabled)",
     )
     parser.add_argument(
         "--block-size", type=int, default=16, help="Token block size for PagedAttention"
@@ -487,8 +420,30 @@ def parse_args():
     return parser.parse_args()
 
 
+@dataclass
+class _MockOutput:
+    index: int
+    text: str
+    token_ids: list[int]
+    cumulative_logprob: float = 0.0
+    logprobs: Any = None
+    finish_reason: str | None = None
+
+
+@dataclass
+class _MockRequestOutput:
+    request_id: str
+    prompt: Any
+    prompt_token_ids: list[int]
+    prompt_logprobs: Any
+    outputs: list[_MockOutput]
+    finished: bool
+
+
 class MockAsyncEngine:
     """Mock AsyncLLMEngine for GPU-free local unit testing and CI validation."""
+
+    is_mock: bool = True
 
     def __init__(self, model_name: str):
         self.model_name = model_name
@@ -516,13 +471,13 @@ class MockAsyncEngine:
             " test",
             ".",
         ]
-        token_ids = []
+        token_ids: list[int] = []
         current_text = ""
         for i, word in enumerate(words):
             await asyncio.sleep(0.01)
             token_ids.append(1000 + i)
             current_text += word
-            output = CompletionOutput(
+            output = _MockOutput(
                 index=0,
                 text=current_text,
                 token_ids=list(token_ids),
@@ -530,7 +485,7 @@ class MockAsyncEngine:
                 logprobs=None,
                 finish_reason="stop" if i == len(words) - 1 else None,
             )
-            yield RequestOutput(
+            yield _MockRequestOutput(
                 request_id=request_id,
                 prompt=None,
                 prompt_token_ids=[1, 2, 3],
@@ -542,12 +497,6 @@ class MockAsyncEngine:
     async def check_health(self):
         return True
 
-    async def start_profile(self):
-        logger.info("[MockEngine] start_profile invoked")
-
-    async def stop_profile(self):
-        logger.info("[MockEngine] stop_profile invoked")
-
     async def reset_prefix_cache(self):
         logger.info("[MockEngine] reset_prefix_cache invoked")
 
@@ -557,7 +506,7 @@ class MockAsyncEngine:
 
 async def serve(args):
     if setproctitle:
-        setproctitle.setproctitle(f"vllm::worker_daemon:{args.port}")
+        setproctitle.setproctitle(f"vllm::servicer:{args.port}")
 
     max_model_len = args.max_model_len or 4096
     block_size = args.block_size
@@ -567,17 +516,14 @@ async def serve(args):
         engine = MockAsyncEngine(model_name=args.model)
     else:
         if not HAS_VLLM:
-            raise RuntimeError(
-                "vLLM is not installed in the current environment. "
-                "Please install vllm or pass --mock-engine for offline testing."
+            logger.critical(
+                "vLLM is not installed in the current Python environment. "
+                "Cannot start the vLLM Servicer with a real engine. "
+                "Please install vllm (`pip install vllm`) or pass --mock-engine for testing."
             )
+            raise SystemExit("Error: vLLM is not installed.")
 
         logger.info(f"Initializing AsyncLLMEngine for model: {args.model}")
-        try:
-            from vllm import AsyncEngineArgs, AsyncLLMEngine
-        except ImportError:
-            from vllm.engine.arg_utils import AsyncEngineArgs
-            from vllm.engine.async_llm_engine import AsyncLLMEngine
 
         engine_args_kwargs = {
             "model": args.model,
@@ -597,8 +543,8 @@ async def serve(args):
             else:
                 logger.warning(
                     f"--dp-size={args.dp_size} specified, but AsyncEngineArgs does not accept "
-                    "'data_parallel_size'. For multi-process DP, launch separate worker "
-                    "daemon processes per GPU rank or use tensor parallelism."
+                    "'data_parallel_size'. For multi-process DP, launch separate Servicer "
+                    "processes per GPU rank or use tensor parallelism."
                 )
 
         if args.max_model_len is not None:
@@ -627,28 +573,28 @@ async def serve(args):
         ]
     )
 
-    servicer = EngineServiceServicer(
+    servicer = VllmEngineServicer(
         engine=engine,
         model_name=args.model,
         max_model_len=max_model_len,
         dp_size=args.dp_size,
         block_size=block_size,
     )
-    engine_client_pb2_grpc.add_EngineServiceServicer_to_server(servicer, server)
+    vllm_engine_pb2_grpc.add_VllmEngineServicer_to_server(servicer, server)
 
     if HAS_GRPC_HEALTH:
         health_servicer = health.HealthServicer()
         health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
         health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
         health_servicer.set(
-            "vllm.engine.v1.EngineService", health_pb2.HealthCheckResponse.SERVING
+            "vllm.engine.v1.VllmEngine", health_pb2.HealthCheckResponse.SERVING
         )
 
     listen_addr = f"{args.host}:{args.port}"
     server.add_insecure_port(listen_addr)
 
     logger.info(
-        f"Starting gRPC Engine Worker Daemon on {listen_addr} (model={args.model}, dp_size={args.dp_size})"
+        f"Starting vLLM Engine Servicer on {listen_addr} (model={args.model}, dp_size={args.dp_size})"
     )
     await server.start()
 
@@ -669,7 +615,7 @@ async def serve(args):
     await stop_event.wait()
     logger.info("Draining gRPC server streams...")
     await server.stop(grace=5.0)
-    logger.info("Worker daemon terminated cleanly.")
+    logger.info("vLLM Servicer terminated cleanly.")
 
 
 def main():

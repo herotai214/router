@@ -2,8 +2,8 @@ syntax = "proto3";
 
 package vllm.engine.v1;
 
-// Service exposed by the Python Worker Daemon for vllm-router
-service EngineService {
+// vLLM-specific Engine gRPC service implemented by VllmEngineServicer.
+service VllmEngine {
   // Bi-directional / Server streaming for token generation
   rpc GenerateStream (GenerateRequest) returns (stream GenerateStreamResponse);
 
@@ -16,9 +16,8 @@ service EngineService {
   // Health and readiness probing
   rpc HealthCheck (HealthCheckRequest) returns (HealthCheckResponse);
 
-  // Cluster admin and profiling controls
-  rpc StartProfile (EmptyRequest) returns (AdminResponse);
-  rpc StopProfile (EmptyRequest) returns (AdminResponse);
+  // Prefix KV cache admin. Start/Stop profile RPCs are omitted until
+  // the Servicer can actually enable vLLM's profiler (--profiler-config).
   rpc ResetPrefixCache (EmptyRequest) returns (AdminResponse);
 }
 
@@ -60,7 +59,7 @@ message MultimodalItem {
 
 message GenerateStreamResponse {
   string request_id = 1;
-  uint32 token_id = 2;
+  optional uint32 token_id = 2;
   string text_delta = 3;
   bool is_finished = 4;
   string finish_reason = 5;

@@ -1,14 +1,12 @@
 """
-Differential Testing Harness: HTTP Backend (Stock vLLM API Server) vs. gRPC Worker Daemon.
+Differential harness: stock HTTP API server vs gRPC Servicer.
 
-Runs both servers in parallel:
-- Target A: HTTP API Server on GPU 1 (Port 18200)
-- Target B: gRPC Worker Daemon on GPU 0 (Port 50055)
+Skipped in CPU CI (`pytest --ignore=py_test/e2e`) and skipped whenever
+vLLM is not installed. Run manually against two GPUs:
 
-Tests identical prompts with greedy decoding (temperature=0.0, seed=42) and asserts:
-1. Exact text sequence identity (Token-by-token and full string equality)
-2. Exact finish reason parity ("stop" / "length")
-3. Comparative metadata inspection (OpenAI JSON vs. Protobuf binary)
+    pytest py_test/e2e/test_differential_grpc_vs_http.py -v
+    # or:
+    python py_test/e2e/test_differential_grpc_vs_http.py
 """
 
 import asyncio
@@ -17,21 +15,20 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Dict, List, Tuple
 
-ROUTER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROUTER_DIR, "py_src"))
+import pytest
 
-import grpc  # noqa: E402
-import requests  # noqa: E402
-from transformers import AutoTokenizer  # noqa: E402
+from vllm_router.vllm_servicer import HAS_VLLM
 
-from vllm_router.proto import engine_client_pb2, engine_client_pb2_grpc  # noqa: E402
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.skipif(not HAS_VLLM, reason="vLLM is required"),
+]
 
-MODEL_PATH = os.environ.get(
-    "MODEL_PATH",
-    "Qwen/Qwen3.5-4B",
-)
+ROUTER_DIR = Path(__file__).resolve().parents[2]
+MODEL_PATH = os.environ.get("MODEL_PATH", "Qwen/Qwen3.5-4B")
 HTTP_PORT = 18200
 GRPC_PORT = 50055
 HOST = "127.0.0.1"
@@ -40,6 +37,8 @@ HOST = "127.0.0.1"
 async def wait_for_http_health(
     url: str, proc: subprocess.Popen, timeout_s: int = 360
 ) -> bool:
+    import requests
+
     print(f"Waiting for HTTP server at {url} to become healthy...")
     t0 = time.time()
     while time.time() - t0 < timeout_s:
@@ -58,11 +57,9 @@ async def wait_for_http_health(
     return False
 
 
-async def wait_for_grpc_health(
-    client: engine_client_pb2_grpc.EngineServiceStub,
-    proc: subprocess.Popen,
-    timeout_s: int = 360,
-) -> bool:
+async def wait_for_grpc_health(client, proc: subprocess.Popen, timeout_s: int = 360):
+    from vllm_router.proto import vllm_engine_pb2
+
     print("Waiting for gRPC server to become healthy...")
     t0 = time.time()
     while time.time() - t0 < timeout_s:
@@ -72,12 +69,9 @@ async def wait_for_grpc_health(
             )
         try:
             res = await asyncio.wait_for(
-                client.HealthCheck(engine_client_pb2.HealthCheckRequest()), timeout=2.0
+                client.HealthCheck(vllm_engine_pb2.HealthCheckRequest()), timeout=2.0
             )
-            if (
-                res.status
-                == engine_client_pb2.HealthCheckResponse.ServingStatus.SERVING
-            ):
+            if res.status == vllm_engine_pb2.HealthCheckResponse.ServingStatus.SERVING:
                 print(f"gRPC server healthy after {time.time() - t0:.1f}s!")
                 return True
         except Exception:
@@ -89,6 +83,8 @@ async def wait_for_grpc_health(
 def query_http_stream(
     prompt: str, max_tokens: int = 30
 ) -> Tuple[str, str, List[str], Dict]:
+    import requests
+
     url = f"http://{HOST}:{HTTP_PORT}/v1/completions"
     payload = {
         "model": MODEL_PATH,
@@ -135,14 +131,16 @@ def query_http_stream(
 
 
 async def query_grpc_stream(
-    client: engine_client_pb2_grpc.EngineServiceStub,
+    client,
     prompt_token_ids: List[int],
     max_tokens: int = 30,
 ) -> Tuple[str, str, List[str], List[int], Dict]:
-    req = engine_client_pb2.GenerateRequest(
-        request_id=f"diff-test-{int(time.time()*1000)}",
+    from vllm_router.proto import vllm_engine_pb2
+
+    req = vllm_engine_pb2.GenerateRequest(
+        request_id=f"diff-test-{int(time.time() * 1000)}",
         prompt_token_ids=prompt_token_ids,
-        sampling_params=engine_client_pb2.SamplingParams(
+        sampling_params=vllm_engine_pb2.SamplingParams(
             temperature=0.0,
             seed=42,
             max_tokens=max_tokens,
@@ -160,7 +158,7 @@ async def query_grpc_stream(
     async for chunk in stream:
         if chunk.text_delta:
             text_chunks.append(chunk.text_delta)
-        if chunk.token_id > 0:
+        if chunk.HasField("token_id"):
             token_ids.append(chunk.token_id)
         if chunk.is_finished:
             finish_reason = chunk.finish_reason
@@ -182,7 +180,12 @@ async def query_grpc_stream(
     )
 
 
-async def main():
+async def run_differential_harness():
+    import grpc
+    from transformers import AutoTokenizer
+
+    from vllm_router.proto import vllm_engine_pb2_grpc
+
     print("=" * 80)
     print("DIFFERENTIAL TESTING: HTTP API SERVER vs. gRPC WORKER DAEMON")
     print(f"Model: {MODEL_PATH}")
@@ -190,7 +193,6 @@ async def main():
 
     py_bin = sys.executable
 
-    # 1. Start HTTP Server on GPU 1
     env_http = os.environ.copy()
     env_http["CUDA_VISIBLE_DEVICES"] = "1"
     http_log = open("/tmp/diff_test_http.log", "w")
@@ -216,17 +218,16 @@ async def main():
         http_cmd, env=env_http, stdout=http_log, stderr=subprocess.STDOUT
     )
 
-    # 2. Start gRPC Worker Daemon on GPU 0
     env_grpc = os.environ.copy()
     env_grpc["CUDA_VISIBLE_DEVICES"] = "0"
     env_grpc["PYTHONPATH"] = (
-        f"{os.path.join(ROUTER_DIR, 'py_src')}:{env_grpc.get('PYTHONPATH', '')}"
+        f"{ROUTER_DIR / 'py_src'}{os.pathsep}{env_grpc.get('PYTHONPATH', '')}"
     )
     grpc_log = open("/tmp/diff_test_grpc.log", "w")
     grpc_cmd = [
         py_bin,
         "-m",
-        "vllm_router.worker_daemon",
+        "vllm_router.vllm_servicer",
         "--model",
         MODEL_PATH,
         "--host",
@@ -240,16 +241,15 @@ async def main():
         "--trust-remote-code",
         "--enforce-eager",
     ]
-    print(f"Launching gRPC Worker Daemon on GPU 0 (Port {GRPC_PORT})...")
+    print(f"Launching gRPC Servicer on GPU 0 (Port {GRPC_PORT})...")
     proc_grpc = subprocess.Popen(
         grpc_cmd, env=env_grpc, stdout=grpc_log, stderr=subprocess.STDOUT
     )
 
     grpc_channel = grpc.aio.insecure_channel(f"{HOST}:{GRPC_PORT}")
-    grpc_client = engine_client_pb2_grpc.EngineServiceStub(grpc_channel)
+    grpc_client = vllm_engine_pb2_grpc.VllmEngineStub(grpc_channel)
 
     try:
-        # Wait for both servers to be healthy in parallel
         print(
             "\nWaiting for both servers to finish model initialization and kernel warmup..."
         )
@@ -288,12 +288,10 @@ async def main():
                 f"Pre-tokenized Token IDs ({len(prompt_token_ids)} tokens): {prompt_token_ids[:10]}..."
             )
 
-            # Run HTTP request
             http_text, http_finish, http_chunks, http_meta = query_http_stream(
                 prompt, max_tokens=max_tokens
             )
 
-            # Run gRPC request
             grpc_text, grpc_finish, grpc_chunks, grpc_tokens, grpc_meta = (
                 await query_grpc_stream(
                     grpc_client, prompt_token_ids, max_tokens=max_tokens
@@ -319,8 +317,6 @@ async def main():
                 f"  Protobuf Meta : running_reqs={grpc_meta.get('running_requests')}, kv_cache={grpc_meta.get('kv_cache_usage_percent')}"
             )
 
-            # ASSERT EQUALITY
-            # Reconstruct HTTP tokens from tokenizer to verify token sequence parity
             http_tokens = tokenizer.encode(http_text, add_special_tokens=False)
 
             text_match = http_text == grpc_text
@@ -377,5 +373,12 @@ async def main():
         print("Servers terminated cleanly.")
 
 
+@pytest.mark.asyncio
+async def test_differential_grpc_vs_http():
+    await run_differential_harness()
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    if not HAS_VLLM:
+        raise SystemExit("vLLM is required for this GPU harness.")
+    asyncio.run(run_differential_harness())

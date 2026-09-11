@@ -1,5 +1,10 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "setuptools-rust>=1.5.2"]
+requires = [
+    "setuptools>=45",
+    "wheel",
+    "setuptools-rust>=1.5.2",
+    "grpcio-tools>=1.60.0",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -37,7 +42,7 @@ dev = [
 
 [project.scripts]
 vllm-router = "vllm_router.launch_router:main"
-vllm-worker-daemon = "vllm_router.worker_daemon:main"
+vllm-servicer = "vllm_router.vllm_servicer:main"
 
 
 # https://github.com/PyO3/setuptools-rust?tab=readme-ov-file
