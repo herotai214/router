@@ -25,7 +25,7 @@ use super::openai::{
     final_response, finish_reason_name, format_sse, now_secs, stream_chunk, SSE_DONE,
 };
 use super::pb::inference_client::InferenceClient;
-use super::preprocess::{tokenize_chat_request_timed, TokenizerCache};
+use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
 use super::vllm_frontend::{decode_stream, emit_detok, DynTokenizer, IncrementalDecoderTrait};
 use crate::protocols::spec::{ChatCompletionRequest, Usage};
 
@@ -64,6 +64,8 @@ impl GrpcEngineBackend {
         Ok(client)
     }
 
+    /// Tokenize then send. Prefer `EngineFrontend::prepare` + `dispatch_prepared`
+    /// so tokenize sits outside policy / retry.
     pub async fn dispatch_chat(
         &self,
         worker_url: &str,
@@ -71,19 +73,32 @@ impl GrpcEngineBackend {
         tokenizer: &TokenizerCache,
     ) -> Response {
         let t_req = Instant::now();
-        let frontend = match tokenizer.resolve(request.model.as_deref()).await {
+        let handle = match tokenizer.resolve(request.model.as_deref()).await {
             Ok(p) => p,
             Err(e) => {
                 return (StatusCode::BAD_REQUEST, format!("tokenizer: {e}")).into_response();
             }
         };
         let resolve_ms = t_req.elapsed().as_secs_f64() * 1000.0;
-        let tokenized = match tokenize_chat_request_timed(request, &frontend) {
+        let tokenized = match tokenize_chat_request_timed(request, &handle) {
             Ok(out) => out,
             Err(e) => {
                 return (StatusCode::BAD_REQUEST, format!("preprocess: {e}")).into_response();
             }
         };
+        self.dispatch_prepared(worker_url, request, tokenized, handle, resolve_ms, t_req)
+            .await
+    }
+
+    pub async fn dispatch_prepared(
+        &self,
+        worker_url: &str,
+        request: &ChatCompletionRequest,
+        tokenized: TokenizeOut,
+        handle: FrontendHandle,
+        resolve_ms: f64,
+        t_req: Instant,
+    ) -> Response {
         let n_prompt_tokens = tokenized.token_ids.len();
         let adapt_ms = tokenized.adapt_ms;
         let template_ms = tokenized.template_ms;
@@ -95,7 +110,7 @@ impl GrpcEngineBackend {
         let model = request.model.clone().unwrap_or_else(|| "unknown".into());
         let created = now_secs();
         let skip_special = request.skip_special_tokens;
-        let detok_tokenizer = frontend.tokenizer();
+        let detok_tokenizer = handle.tokenizer();
         let detok_prompt_ids = tokenized.token_ids.clone();
         let proto = chat_to_generate_request(request, tokenized.token_ids, request_id.clone());
 

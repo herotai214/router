@@ -91,8 +91,7 @@ pub struct Router {
     api_key: Option<String>,
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
-    tokenizer_cache: Arc<crate::backend::TokenizerCache>,
-    grpc_backend: crate::backend::GrpcEngineBackend,
+    frontend: crate::backend::EngineFrontend,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
@@ -106,6 +105,9 @@ impl Router {
     ) -> Result<Self, String> {
         // Update active workers gauge
         RouterMetrics::set_active_workers(worker_urls.len());
+
+        // All-http or all-grpc. Mixed schemes fail here (not a silent fallback).
+        crate::backend::classify_worker_urls(&worker_urls)?;
 
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
         if !worker_urls.is_empty() {
@@ -229,8 +231,7 @@ impl Router {
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
-            tokenizer_cache: Arc::new(crate::backend::TokenizerCache::from_env()),
-            grpc_backend: crate::backend::GrpcEngineBackend::new(),
+            frontend: crate::backend::EngineFrontend::from_env(),
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
         })
@@ -238,7 +239,7 @@ impl Router {
 
     /// Test hook: pin token ids so gRPC e2e does not load a model.
     pub fn pin_test_token_ids(&self, token_ids: Vec<u32>) {
-        self.tokenizer_cache.pin_test_token_ids(token_ids);
+        self.frontend.pin_test_token_ids(token_ids);
     }
 
     /// Get the current list of worker URLs
@@ -627,6 +628,44 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
+
+        // Re-check live URLs. Mix is rejected at init / add_worker; this
+        // catches a registry that somehow became mixed.
+        let pool = match crate::backend::classify_worker_urls(&self.get_worker_urls()) {
+            Ok(kind) => kind,
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+            }
+        };
+
+        // All-grpc chat: tokenize once, outside policy and retry.
+        // Policy still uses extract_text_for_routing (session / empty).
+        // token_ids stay on PreparedChat for a later token-level policy —
+        // do not dump 131k ids into the cache_aware tree.
+        let prepared = if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc))
+            && route == "/v1/chat/completions"
+        {
+            let chat: ChatCompletionRequest =
+                match serde_json::to_value(typed_req).and_then(serde_json::from_value) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("gRPC chat convert failed: {e}"),
+                        )
+                            .into_response();
+                    }
+                };
+            match self.frontend.prepare(&chat).await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    return (StatusCode::BAD_REQUEST, e).into_response();
+                }
+            }
+        } else {
+            None
+        };
+
         let text = typed_req.extract_text_for_routing();
 
         let response = RetryExecutor::execute_response_with_retry(
@@ -675,6 +714,7 @@ impl Router {
                         worker.url(),
                         is_stream,
                         load_incremented,
+                        prepared.clone(),
                     )
                     .await;
 
@@ -853,6 +893,7 @@ impl Router {
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
+        prepared: Option<crate::backend::PreparedChat>,
     ) -> Response {
         if crate::backend::is_grpc_url(worker_url) {
             // This-version router 501: gRPC path is chat-only. Not a missing
@@ -864,6 +905,13 @@ impl Router {
                 )
                     .into_response();
             }
+            let Some(prepared) = prepared else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "gRPC chat requires Frontend.prepare before dispatch",
+                )
+                    .into_response();
+            };
             let chat: ChatCompletionRequest =
                 match serde_json::to_value(typed_req).and_then(serde_json::from_value) {
                     Ok(req) => req,
@@ -875,10 +923,7 @@ impl Router {
                             .into_response();
                     }
                 };
-            let response = self
-                .grpc_backend
-                .dispatch_chat(worker_url, &chat, &self.tokenizer_cache)
-                .await;
+            let response = self.frontend.dispatch(worker_url, &chat, prepared).await;
             if load_incremented
                 && (response.status().is_success() || !is_retryable_status(response.status()))
             {
@@ -964,7 +1009,7 @@ impl Router {
                 .and_then(serde_json::from_value::<ChatCompletionRequest>)
             {
                 Ok(chat) => {
-                    let cache = Arc::clone(&self.tokenizer_cache);
+                    let cache = self.frontend.tokenizer_cache();
                     Some(tokio::spawn(async move {
                         let frontend = cache.resolve(chat.model.as_deref()).await.ok()?;
                         crate::backend::preprocess::tokenize_chat_request_timed(&chat, &frontend)
@@ -1210,6 +1255,10 @@ impl Router {
     }
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
+        let mut urls = self.get_worker_urls();
+        urls.push(worker_url.to_string());
+        crate::backend::classify_worker_urls(&urls)?;
+
         let start_time = std::time::Instant::now();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.worker_startup_timeout_secs))
@@ -2007,8 +2056,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
-            tokenizer_cache: Arc::new(crate::backend::TokenizerCache::new()),
-            grpc_backend: crate::backend::GrpcEngineBackend::new(),
+            frontend: crate::backend::EngineFrontend::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
         }
@@ -2033,6 +2081,16 @@ mod tests {
         let url = result.unwrap();
         // DashMap doesn't guarantee order, so just check we get one of the workers
         assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
+    }
+
+    #[tokio::test]
+    async fn test_add_worker_rejects_mixed_scheme() {
+        let router = create_test_regular_router();
+        let err = router
+            .add_worker("grpc://127.0.0.1:50051")
+            .await
+            .unwrap_err();
+        assert!(err.contains("mixed"), "{err}");
     }
 
     #[tokio::test]
@@ -2081,8 +2139,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
-            tokenizer_cache: Arc::new(crate::backend::TokenizerCache::new()),
-            grpc_backend: crate::backend::GrpcEngineBackend::new(),
+            frontend: crate::backend::EngineFrontend::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
         }

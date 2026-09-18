@@ -1,19 +1,23 @@
 //! Switchable worker backends.
 //!
-//! After the HTTP router picks a worker URL:
-//! - `http(s)://` reverse-proxies OpenAI JSON from `routers/http/router.rs`
-//!   (same HTTP client as completions/embeddings; no GenerateRequest to build).
-//! - `grpc(s)://` uses `preprocess` + `convert` + `grpc::dispatch_chat`.
+//! Worker pool is all-`http(s)://` or all-`grpc(s)://`. Mixed schemes fail
+//! at init / `add_worker` (gRPC is `token_ids` only).
+//!
+//! - All-HTTP: policy selects, then `router.rs` reverse-proxies OpenAI JSON
+//!   (no chat/tokenizer frontend on the critical path).
+//! - All-gRPC: `EngineFrontend::prepare(chat)` → `token_ids`, then policy
+//!   selects, then `EngineFrontend::dispatch` (`convert` + GenerateStream +
+//!   detok).
 //!
 //! gRPC wire types come from crates.io `vllm-proto`. Chat+tokenize is
 //! `vllm-chat` + `vllm-tokenizer` only (Cargo git, not `pip install`).
-//! HTTP does not tokenize on the critical path.
 //!
 //! `VLLM_ROUTER_STAGES=1` emits stage clocks. HTTP shadow tokenize runs only
 //! then; gRPC tokenize always runs.
 
 pub mod convert;
 pub mod detect;
+pub mod frontend;
 pub mod grpc;
 pub mod health;
 pub mod openai;
@@ -29,8 +33,10 @@ pub fn stages_enabled() -> bool {
 }
 
 pub use detect::{
-    connection_mode_from_url, grpc_connect_uri, is_grpc_url, parse_dp_rank, strip_dp_suffix,
+    classify_worker_urls, connection_mode_from_url, grpc_connect_uri, is_grpc_url, parse_dp_rank,
+    strip_dp_suffix, WorkerPoolKind,
 };
+pub use frontend::{EngineFrontend, PreparedChat};
 pub use grpc::GrpcEngineBackend;
 pub use health::check_grpc_health;
 pub use preprocess::TokenizerCache;

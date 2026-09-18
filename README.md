@@ -285,6 +285,14 @@ prompt or HTTP token-id input. Chat-only on `grpc://` is a **router
 501** (`/v1/chat/completions` only); other OpenAI routes still work on
 `http://`.
 
+A worker pool is **all-`http(s)://` or all-`grpc(s)://`**. Mixed
+schemes fail at init / `add_worker` (gRPC does not accept text).
+All-HTTP keeps `policy.select` then reverse-proxy (no chat/tokenizer
+frontend on the critical path). All-gRPC is
+`Frontend.prepare(chat) → token_ids`, then `policy.select`, then
+`Frontend.dispatch(ids, url)` (convert + GenerateStream + detok).
+Policy still uses `extract_text_for_routing()` this version.
+
 `TokenizerCache` (in `src/backend/preprocess.rs`) caches loaded
 `vllm-chat` / `vllm-tokenizer` objects per model key in-process. It
 does not reuse prior-request token ids or engine KV.
@@ -292,16 +300,19 @@ does not reuse prior-request token ids or engine KV.
 #### Backend modules (`src/backend/`)
 
 Northbound is always HTTP `/v1/chat/completions` in
-`routers/http/router.rs`. After a worker URL is chosen, that file
-switches on the scheme. Pipeline on `grpc://`:
-`detect → preprocess → convert → grpc → openai` (all router-local;
-the worker is reached inside `grpc.rs`). Startup and periodic probes
-use `health.rs` (`grpc.health.v1`), not that generate path.
+`routers/http/router.rs`. Detect runs at init (and `add_worker`) to
+lock the pool kind and strip `@dp_rank` / tonic URI. Pipeline on an
+all-`grpc://` pool:
+`frontend.prepare → policy → frontend.dispatch` (dispatch =
+`convert + grpc + openai`; all router-local; the worker is reached
+inside `grpc.rs`). Startup and periodic probes use `health.rs`
+(`grpc.health.v1`), not that generate path.
 
 | File | Role |
 |---|---|
 | `mod.rs` | `stages_enabled()`, re-exports, `pb` = crates.io `vllm-proto` |
-| `detect.rs` | `grpc://` / `grpcs://`, `ConnectionMode`, strip `@dp_rank`, tonic URI (`grpc://host:port` → h2c `http://host:port`; still gRPC) |
+| `detect.rs` | `grpc://` / `grpcs://`, `WorkerPoolKind`, reject mixed schemes, strip `@dp_rank`, tonic URI (`grpc://host:port` → h2c `http://host:port`; still gRPC) |
+| `frontend.rs` | `EngineFrontend`: `prepare(chat)` then `dispatch(ids, url)`. Wraps preprocess + convert + grpc |
 | `health.rs` | `grpc.health.v1` Check on `--grpc-port` (empty service = overall `SERVING`). Used for worker + startup probes |
 | `preprocess.rs` | `TokenizerCache` + chat template/encode → `token_ids`. Load key: `VLLM_ROUTER_MODEL`, else request `model`. Required on `grpc://`. HTTP only if `VLLM_ROUTER_STAGES=1` (shadow, off the first-byte path) |
 | `vllm_frontend.rs` | Private adapter onto `vllm-chat` / `vllm-tokenizer` / `vllm-text` (`load_model_backends`, render, encode, detok) |
