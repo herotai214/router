@@ -16,6 +16,7 @@ use crate::protocols::spec::ChatCompletionRequest;
 /// Tokenized chat ready for policy + `dispatch`.
 #[derive(Clone)]
 pub struct PreparedChat {
+    pub request: ChatCompletionRequest,
     pub tokenized: TokenizeOut,
     pub handle: FrontendHandle,
     pub resolve_ms: f64,
@@ -60,17 +61,29 @@ impl EngineFrontend {
     }
 
     /// Chat template + encode. Call once, before `policy.select`.
-    pub async fn prepare(&self, request: &ChatCompletionRequest) -> Result<PreparedChat, String> {
+    pub async fn prepare(
+        &self,
+        mut request: ChatCompletionRequest,
+    ) -> Result<PreparedChat, String> {
         let t_req = Instant::now();
         let handle = self
             .tokenizer
             .resolve(request.model.as_deref())
             .await
             .map_err(|e| format!("tokenizer: {e}"))?;
+        if request.temperature.is_none() {
+            request.temperature = Some(
+                handle
+                    .default_temperature()
+                    .map_err(|e| format!("sampling defaults: {e}"))?
+                    .unwrap_or(1.0),
+            );
+        }
         let resolve_ms = t_req.elapsed().as_secs_f64() * 1000.0;
-        let tokenized = tokenize_chat_request_timed(request, &handle)
+        let tokenized = tokenize_chat_request_timed(&request, &handle)
             .map_err(|e| format!("preprocess: {e}"))?;
         Ok(PreparedChat {
+            request,
             tokenized,
             handle,
             resolve_ms,
@@ -79,16 +92,11 @@ impl EngineFrontend {
     }
 
     /// Convert + GenerateStream + detok on the selected worker URL.
-    pub async fn dispatch(
-        &self,
-        worker_url: &str,
-        request: &ChatCompletionRequest,
-        prepared: PreparedChat,
-    ) -> Response {
+    pub async fn dispatch(&self, worker_url: &str, prepared: PreparedChat) -> Response {
         self.grpc
             .dispatch_prepared(
                 worker_url,
-                request,
+                &prepared.request,
                 prepared.tokenized,
                 prepared.handle,
                 prepared.resolve_ms,

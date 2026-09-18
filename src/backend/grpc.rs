@@ -19,10 +19,11 @@ use tonic::transport::Channel;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use super::convert::chat_to_generate_request;
+use super::convert::{chat_to_generate_request, requires_worker_output_text};
 use super::detect::{grpc_connect_uri, parse_dp_rank};
 use super::openai::{
-    final_response, finish_reason_name, format_sse, now_secs, stream_chunk, SSE_DONE,
+    final_response, finish_reason_name, format_sse, now_secs, stream_chunk, stream_usage_chunk,
+    SSE_DONE,
 };
 use super::pb::inference_client::InferenceClient;
 use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
@@ -30,6 +31,33 @@ use super::vllm_frontend::{decode_stream, emit_detok, DynTokenizer, IncrementalD
 use crate::protocols::spec::{ChatCompletionRequest, Usage};
 
 const DP_RANK_METADATA: &str = "x-data-parallel-rank";
+
+#[derive(Clone)]
+pub struct GrpcStreamTask(Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>);
+
+impl GrpcStreamTask {
+    pub(crate) fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(handle))))
+    }
+
+    pub fn take(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.0.lock().ok()?.take()
+    }
+}
+
+fn grpc_status_code(status: &tonic::Status) -> StatusCode {
+    match status.code() {
+        tonic::Code::InvalidArgument
+        | tonic::Code::FailedPrecondition
+        | tonic::Code::OutOfRange => StatusCode::BAD_REQUEST,
+        tonic::Code::NotFound => StatusCode::NOT_FOUND,
+        tonic::Code::AlreadyExists | tonic::Code::Aborted => StatusCode::CONFLICT,
+        tonic::Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
+        tonic::Code::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
+        tonic::Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_GATEWAY,
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct GrpcEngineBackend {
@@ -112,7 +140,11 @@ impl GrpcEngineBackend {
         let skip_special = request.skip_special_tokens;
         let detok_tokenizer = handle.tokenizer();
         let detok_prompt_ids = tokenized.token_ids.clone();
-        let proto = chat_to_generate_request(request, tokenized.token_ids, request_id.clone());
+        let proto = match chat_to_generate_request(request, tokenized.token_ids, request_id.clone())
+        {
+            Ok(proto) => proto,
+            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
 
         let t_connect = Instant::now();
         let mut client = match self.client_for(worker_url).await {
@@ -137,7 +169,7 @@ impl GrpcEngineBackend {
             Err(status) => {
                 warn!(code = ?status.code(), msg = %status.message(), "GenerateStream failed");
                 return (
-                    StatusCode::BAD_GATEWAY,
+                    grpc_status_code(&status),
                     format!("grpc GenerateStream: {}", status.message()),
                 )
                     .into_response();
@@ -167,6 +199,12 @@ impl GrpcEngineBackend {
             tok: detok_tokenizer,
             prompt_ids: detok_prompt_ids,
             skip_special,
+            prefer_worker_text: requires_worker_output_text(request),
+            include_usage: request
+                .stream_options
+                .as_ref()
+                .and_then(|options| options.include_usage)
+                .unwrap_or(false),
             stages,
             t_req,
         };
@@ -189,6 +227,8 @@ struct ChatReply {
     tok: Option<DynTokenizer>,
     prompt_ids: Vec<u32>,
     skip_special: bool,
+    prefer_worker_text: bool,
+    include_usage: bool,
     stages: serde_json::Value,
     t_req: Instant,
 }
@@ -224,13 +264,15 @@ async fn stream_openai(
         tok,
         prompt_ids,
         skip_special,
+        prefer_worker_text,
+        include_usage,
         mut stages,
         t_req,
     } = reply;
     let header_stages = stages.clone();
     let stages_on = crate::backend::stages_enabled();
     let (tx, rx) = mpsc::unbounded_channel::<Result<String, std::io::Error>>();
-    tokio::spawn(async move {
+    let producer = tokio::spawn(async move {
         let mut detok = tok
             .as_ref()
             .map(|t| decode_stream(&**t, &prompt_ids, skip_special));
@@ -251,7 +293,17 @@ async fn stream_openai(
                     if let Some(outputs) = &msg.outputs {
                         completion_tokens = completion_tokens.saturating_add(outputs.num_tokens);
                     }
-                    let (text, finish) = output_text_and_finish(&msg, &mut detok);
+                    let (text, finish) =
+                        match output_text_and_finish(&msg, &mut detok, prefer_worker_text) {
+                            Ok(output) => output,
+                            Err(error) => {
+                                let _ = tx.send(Ok(format!(
+                                    "data: {{\"error\":{}}}\n\n",
+                                    serde_json::to_string(&error).unwrap_or_default()
+                                )));
+                                return;
+                            }
+                        };
                     if !first_token_logged && !text.is_empty() {
                         stages["first_token_ms"] =
                             serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
@@ -264,12 +316,6 @@ async fn stream_openai(
                         first_token_logged = true;
                     }
                     if !text.is_empty() || finish.is_some() || first {
-                        let usage = finish.as_ref().map(|_| Usage {
-                            prompt_tokens,
-                            completion_tokens,
-                            total_tokens: prompt_tokens + completion_tokens,
-                            completion_tokens_details: None,
-                        });
                         let chunk = stream_chunk(
                             &request_id,
                             &model,
@@ -277,7 +323,7 @@ async fn stream_openai(
                             &text,
                             first,
                             finish.clone(),
-                            usage,
+                            None,
                         );
                         if tx.send(Ok(format_sse(&chunk))).is_err() {
                             break;
@@ -285,6 +331,16 @@ async fn stream_openai(
                         first = false;
                     }
                     if finish.is_some() {
+                        if include_usage {
+                            let usage = Usage {
+                                prompt_tokens,
+                                completion_tokens,
+                                total_tokens: prompt_tokens + completion_tokens,
+                                completion_tokens_details: None,
+                            };
+                            let chunk = stream_usage_chunk(&request_id, &model, created, usage);
+                            let _ = tx.send(Ok(format_sse(&chunk)));
+                        }
                         let _ = tx.send(Ok(SSE_DONE.to_string()));
                         return;
                     }
@@ -298,7 +354,9 @@ async fn stream_openai(
                 }
             }
         }
-        let _ = tx.send(Ok(SSE_DONE.to_string()));
+        let _ = tx.send(Ok(
+            "data: {\"error\":\"gRPC stream closed before finish_info\"}\n\n".to_string(),
+        ));
     });
 
     let body = Body::from_stream(UnboundedReceiverStream::new(rx));
@@ -309,9 +367,13 @@ async fn stream_openai(
     if stages_on {
         builder = builder.header("x-router-stages", stages_header(&header_stages));
     }
-    builder
+    let mut response = builder
         .body(body)
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    response
+        .extensions_mut()
+        .insert(GrpcStreamTask::new(producer));
+    response
 }
 
 async fn collect_openai(
@@ -325,6 +387,8 @@ async fn collect_openai(
         tok,
         prompt_ids,
         skip_special,
+        prefer_worker_text,
+        include_usage: _,
         mut stages,
         t_req,
     } = reply;
@@ -332,8 +396,8 @@ async fn collect_openai(
         .as_ref()
         .map(|t| decode_stream(&**t, &prompt_ids, skip_special));
     let mut text = String::new();
-    let mut finish = Some("stop".to_string());
-    let mut prompt_tokens = 0u32;
+    let mut finish = None;
+    let mut prompt_tokens = prompt_ids.len() as u32;
     let mut completion_tokens = 0u32;
     while let Some(item) = stream.next().await {
         match item {
@@ -345,7 +409,13 @@ async fn collect_openai(
                 if let Some(info) = &msg.prompt_info {
                     prompt_tokens = info.num_prompt_tokens;
                 }
-                let (delta, reason) = output_text_and_finish(&msg, &mut detok);
+                let (delta, reason) =
+                    match output_text_and_finish(&msg, &mut detok, prefer_worker_text) {
+                        Ok(output) => output,
+                        Err(error) => {
+                            return (StatusCode::BAD_GATEWAY, error).into_response();
+                        }
+                    };
                 if stages.get("first_token_ms").is_none() && !delta.is_empty() {
                     stages["first_token_ms"] =
                         serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
@@ -369,6 +439,13 @@ async fn collect_openai(
             }
         }
     }
+    if finish.is_none() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            "gRPC stream closed before finish_info",
+        )
+            .into_response();
+    }
     let body = final_response(
         &request_id,
         &model,
@@ -390,22 +467,43 @@ async fn collect_openai(
 fn output_text_and_finish(
     msg: &super::pb::GenerateResponse,
     detok: &mut Option<Box<dyn IncrementalDecoderTrait + '_>>,
-) -> (String, Option<String>) {
+    prefer_worker_text: bool,
+) -> Result<(String, Option<String>), String> {
     let Some(outputs) = &msg.outputs else {
-        return (String::new(), None);
+        return Ok((String::new(), None));
     };
     let finish = outputs
         .finish_info
         .as_ref()
         .and_then(|info| finish_reason_name(info.finish_reason));
-    let decoded = match (detok.as_deref_mut(), outputs.token_ids.is_empty()) {
-        (Some(decoder), false) => emit_detok(decoder, &outputs.token_ids).unwrap_or_default(),
-        _ => String::new(),
-    };
-    let text = if !decoded.is_empty() {
-        decoded
-    } else {
+    if prefer_worker_text {
+        return Ok((outputs.text.clone(), finish));
+    }
+    let has_decoder = detok.is_some();
+    let mut decoded = String::new();
+    if !outputs.token_ids.is_empty() {
+        if let Some(decoder) = detok.as_deref_mut() {
+            decoded = emit_detok(decoder, &outputs.token_ids)
+                .map_err(|error| format!("detokenization failed: {error}"))?;
+        }
+    }
+    // vLLM may send finish_info in a separate response with no token_ids.
+    // Always flush on terminal output so buffered UTF-8/special-token state
+    // cannot be silently dropped.
+    if finish.is_some() {
+        if let Some(decoder) = detok.as_deref_mut() {
+            let (last, _) = decoder
+                .flush(None)
+                .map_err(|error| format!("detokenization flush failed: {error}"))?;
+            if let Some(last) = last {
+                decoded.push_str(&last);
+            }
+        }
+    }
+    let text = if outputs.token_ids.is_empty() || !has_decoder {
         outputs.text.clone()
+    } else {
+        decoded
     };
-    (text, finish)
+    Ok((text, finish))
 }

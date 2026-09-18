@@ -26,7 +26,9 @@ use axum::{
 use futures_util::StreamExt;
 use reqwest::Client;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
@@ -79,6 +81,79 @@ fn emit_http_first_sse<E>(
     let _ = tx.send(Ok(bytes::Bytes::from(comment)));
 }
 
+struct LoadTrackedBody {
+    inner: Pin<
+        Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Send + 'static>,
+    >,
+    worker: Option<Arc<dyn Worker>>,
+    producer_abort: Option<tokio::task::AbortHandle>,
+}
+
+impl LoadTrackedBody {
+    fn release(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            worker.decrement_load();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
+        }
+    }
+}
+
+impl futures_util::Stream for LoadTrackedBody {
+    type Item = Result<bytes::Bytes, axum::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let item = self.inner.as_mut().poll_next(cx);
+        if matches!(item, Poll::Ready(None)) {
+            self.release();
+            self.producer_abort.take();
+        }
+        item
+    }
+}
+
+impl Drop for LoadTrackedBody {
+    fn drop(&mut self) {
+        if let Some(abort) = self.producer_abort.take() {
+            abort.abort();
+        }
+        self.release();
+    }
+}
+
+fn hold_load_until_body_done(mut response: Response, worker: Arc<dyn Worker>) -> Response {
+    let producer = response
+        .extensions_mut()
+        .remove::<crate::backend::grpc::GrpcStreamTask>()
+        .and_then(|task| task.take());
+    let producer_abort = producer.as_ref().map(tokio::task::JoinHandle::abort_handle);
+    let fallback_worker = if let Some(producer) = producer {
+        tokio::spawn(async move {
+            let _ = producer.await;
+            worker.decrement_load();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
+        });
+        None
+    } else {
+        Some(worker)
+    };
+    let (parts, body) = response.into_parts();
+    let stream = LoadTrackedBody {
+        inner: Box::pin(body.into_data_stream()),
+        worker: fallback_worker,
+        producer_abort,
+    };
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+struct TypedDispatch<'a> {
+    headers: Option<&'a HeaderMap>,
+    route: &'a str,
+    worker_url: &'a str,
+    is_stream: bool,
+    load_incremented: bool,
+    prepared: Option<crate::backend::PreparedChat>,
+}
+
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
 pub struct Router {
@@ -91,6 +166,7 @@ pub struct Router {
     api_key: Option<String>,
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
+    health_config: HealthConfig,
     frontend: crate::backend::EngineFrontend,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
@@ -231,6 +307,7 @@ impl Router {
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
+            health_config,
             frontend: crate::backend::EngineFrontend::from_env(),
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
@@ -656,7 +733,7 @@ impl Router {
                             .into_response();
                     }
                 };
-            match self.frontend.prepare(&chat).await {
+            match self.frontend.prepare(chat).await {
                 Ok(p) => Some(p),
                 Err(e) => {
                     return (StatusCode::BAD_REQUEST, e).into_response();
@@ -708,13 +785,15 @@ impl Router {
 
                 let response = self
                     .send_typed_request(
-                        headers,
                         typed_req,
-                        route,
-                        worker.url(),
-                        is_stream,
-                        load_incremented,
-                        prepared.clone(),
+                        TypedDispatch {
+                            headers,
+                            route,
+                            worker_url: worker.url(),
+                            is_stream,
+                            load_incremented,
+                            prepared: prepared.clone(),
+                        },
                     )
                     .await;
 
@@ -887,14 +966,17 @@ impl Router {
     // Send typed request directly without conversion
     async fn send_typed_request<T: serde::Serialize>(
         &self,
-        headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &str,
-        worker_url: &str,
-        is_stream: bool,
-        load_incremented: bool, // Whether load was incremented for this request
-        prepared: Option<crate::backend::PreparedChat>,
+        dispatch: TypedDispatch<'_>,
     ) -> Response {
+        let TypedDispatch {
+            headers,
+            route,
+            worker_url,
+            is_stream,
+            load_incremented,
+            prepared,
+        } = dispatch;
         if crate::backend::is_grpc_url(worker_url) {
             // This-version router 501: gRPC path is chat-only. Not a missing
             // upstream RPC; http:// workers still proxy other routes.
@@ -912,24 +994,17 @@ impl Router {
                 )
                     .into_response();
             };
-            let chat: ChatCompletionRequest =
-                match serde_json::to_value(typed_req).and_then(serde_json::from_value) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("gRPC chat convert failed: {e}"),
-                        )
-                            .into_response();
-                    }
-                };
-            let response = self.frontend.dispatch(worker_url, &chat, prepared).await;
+            let mut response = self.frontend.dispatch(worker_url, prepared).await;
             if load_incremented
                 && (response.status().is_success() || !is_retryable_status(response.status()))
             {
                 if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
+                    if is_stream && response.status().is_success() {
+                        response = hold_load_until_body_done(response, worker);
+                    } else {
+                        worker.decrement_load();
+                        RouterMetrics::set_running_requests(worker_url, worker.load());
+                    }
                 }
             }
             return response;
@@ -1277,123 +1352,116 @@ impl Router {
                 ));
             }
 
-            match client.get(format!("{}/health", worker_url)).send().await {
-                Ok(res) => {
-                    if res.status().is_success() {
-                        if self.intra_node_data_parallel_size > 1 {
-                            // Expand worker URL into multiple DP-aware URLs based on configured intra_node_data_parallel_size
-                            // (e.g., "http://host:8000" → "http://host:8000@0", "@1", etc.)
-                            // without querying the worker
-                            let url_vec = vec![String::from(worker_url)];
-                            let dp_url_vec = dp_utils::get_dp_aware_workers(
-                                &url_vec,
-                                &self.api_key,
-                                self.intra_node_data_parallel_size,
-                            )
-                            .await
-                            .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?;
-                            let mut worker_added: bool = false;
-                            for dp_url in &dp_url_vec {
-                                if self.worker_registry.get_by_url(dp_url).is_some() {
-                                    warn!("Worker {} already exists", dp_url);
-                                    continue;
-                                }
-                                info!("Added worker: {}", dp_url);
-                                // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-                                let (base_url, dp_rank) = dp_utils::parse_worker_url(dp_url);
-                                let new_worker = DPAwareWorker::new(
-                                    base_url,
-                                    dp_rank.unwrap_or(0),
-                                    self.intra_node_data_parallel_size,
-                                    WorkerType::Regular,
-                                )
-                                .with_circuit_breaker_config(self.circuit_breaker_config.clone());
+            let health_result = if crate::backend::is_grpc_url(worker_url) {
+                crate::backend::check_grpc_health(worker_url, Duration::from_secs(2)).await
+            } else {
+                match client.get(format!("{}/health", worker_url)).send().await {
+                    Ok(res) if res.status().is_success() => Ok(()),
+                    Ok(res) => Err(format!("HTTP health status {}", res.status())),
+                    Err(error) => Err(error.to_string()),
+                }
+            };
 
-                                let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
-                                self.worker_registry.register(worker_arc.clone());
-
-                                // Notify PolicyRegistry about the new worker
-                                let model_id = worker_arc.model_id();
-                                let policy = self.policy_registry.on_worker_added(model_id, None);
-
-                                // If this is a cache-aware policy, update it with all workers for this model
-                                if policy.name() == "cache_aware" {
-                                    if let Some(cache_aware) = policy
-                                        .as_any()
-                                        .downcast_ref::<crate::policies::CacheAwarePolicy>(
-                                    ) {
-                                        let model_workers =
-                                            self.worker_registry.get_by_model_fast(model_id);
-                                        cache_aware.init_workers(&model_workers);
-                                    }
-                                }
-
-                                worker_added = true;
+            match health_result {
+                Ok(()) => {
+                    if self.intra_node_data_parallel_size > 1 {
+                        // Expand worker URL into multiple DP-aware URLs based on configured intra_node_data_parallel_size
+                        // (e.g., "http://host:8000" → "http://host:8000@0", "@1", etc.)
+                        // without querying the worker
+                        let url_vec = vec![String::from(worker_url)];
+                        let dp_url_vec = dp_utils::get_dp_aware_workers(
+                            &url_vec,
+                            &self.api_key,
+                            self.intra_node_data_parallel_size,
+                        )
+                        .await
+                        .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?;
+                        let mut worker_added: bool = false;
+                        for dp_url in &dp_url_vec {
+                            if self.worker_registry.get_by_url(dp_url).is_some() {
+                                warn!("Worker {} already exists", dp_url);
+                                continue;
                             }
-                            if !worker_added {
-                                return Err(format!("No worker added for {}", worker_url));
-                            }
-                        } else {
-                            if self.worker_registry.get_by_url(worker_url).is_some() {
-                                return Err(format!("Worker {} already exists", worker_url));
-                            }
-                            info!("Added worker: {}", worker_url);
-
+                            info!("Added worker: {}", dp_url);
                             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-                            let new_worker =
-                                BasicWorker::new(worker_url.to_string(), WorkerType::Regular)
-                                    .with_circuit_breaker_config(
-                                        self.circuit_breaker_config.clone(),
-                                    );
+                            let (base_url, dp_rank) = dp_utils::parse_worker_url(dp_url);
+                            let new_worker = DPAwareWorker::new(
+                                base_url,
+                                dp_rank.unwrap_or(0),
+                                self.intra_node_data_parallel_size,
+                                WorkerType::Regular,
+                            )
+                            .with_circuit_breaker_config(self.circuit_breaker_config.clone())
+                            .with_health_config(self.health_config.clone());
 
-                            let worker_arc = Arc::new(new_worker);
+                            let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                             self.worker_registry.register(worker_arc.clone());
 
                             // Notify PolicyRegistry about the new worker
                             let model_id = worker_arc.model_id();
                             let policy = self.policy_registry.on_worker_added(model_id, None);
 
-                            // If this is a cache-aware policy, add this worker to it
+                            // If this is a cache-aware policy, update it with all workers for this model
                             if policy.name() == "cache_aware" {
                                 if let Some(cache_aware) = policy
                                     .as_any()
                                     .downcast_ref::<crate::policies::CacheAwarePolicy>(
                                 ) {
-                                    // Get all workers for this model
                                     let model_workers =
                                         self.worker_registry.get_by_model_fast(model_id);
                                     cache_aware.init_workers(&model_workers);
                                 }
                             }
+
+                            worker_added = true;
                         }
-
-                        RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
-
-                        return Ok(format!("Successfully added worker: {}", worker_url));
+                        if !worker_added {
+                            return Err(format!("No worker added for {}", worker_url));
+                        }
                     } else {
-                        debug!(
-                            "Worker {} health check pending - status: {}",
-                            worker_url,
-                            res.status()
-                        );
-                        // if the url does not have http or https prefix, warn users
-                        if !worker_url.starts_with("http://") && !worker_url.starts_with("https://")
-                        {
-                            warn!("The worker url {} does not have http or https prefix. Please add the prefix to the url.", worker_url);
+                        if self.worker_registry.get_by_url(worker_url).is_some() {
+                            return Err(format!("Worker {} already exists", worker_url));
                         }
+                        info!("Added worker: {}", worker_url);
 
-                        tokio::time::sleep(Duration::from_secs(
-                            self.worker_startup_check_interval_secs,
-                        ))
-                        .await;
-                        continue;
+                        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
+                        let new_worker =
+                            BasicWorker::new(worker_url.to_string(), WorkerType::Regular)
+                                .with_circuit_breaker_config(self.circuit_breaker_config.clone())
+                                .with_health_config(self.health_config.clone());
+
+                        let worker_arc = Arc::new(new_worker);
+                        self.worker_registry.register(worker_arc.clone());
+
+                        // Notify PolicyRegistry about the new worker
+                        let model_id = worker_arc.model_id();
+                        let policy = self.policy_registry.on_worker_added(model_id, None);
+
+                        // If this is a cache-aware policy, add this worker to it
+                        if policy.name() == "cache_aware" {
+                            if let Some(cache_aware) = policy
+                                .as_any()
+                                .downcast_ref::<crate::policies::CacheAwarePolicy>(
+                            ) {
+                                // Get all workers for this model
+                                let model_workers =
+                                    self.worker_registry.get_by_model_fast(model_id);
+                                cache_aware.init_workers(&model_workers);
+                            }
+                        }
                     }
+
+                    RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
+
+                    return Ok(format!("Successfully added worker: {}", worker_url));
                 }
                 Err(e) => {
                     debug!("Worker {} health check pending - error: {}", worker_url, e);
 
-                    // if the url does not have http or https prefix, warn users
-                    if !worker_url.starts_with("http://") && !worker_url.starts_with("https://") {
+                    if !worker_url.starts_with("http://")
+                        && !worker_url.starts_with("https://")
+                        && !crate::backend::is_grpc_url(worker_url)
+                    {
                         warn!("The worker url {} does not have http or https prefix. Please add the prefix to the url.", worker_url);
                     }
 
@@ -2056,6 +2124,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
@@ -2091,6 +2160,74 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("mixed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn streaming_body_holds_load_until_consumed_or_dropped() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "grpc://worker:50051".to_string(),
+            WorkerType::Regular,
+        ));
+
+        worker.increment_load();
+        let response =
+            hold_load_until_body_done(Response::new(Body::from("complete")), worker.clone());
+        assert_eq!(worker.load(), 1);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(worker.load(), 0);
+
+        worker.increment_load();
+        let response =
+            hold_load_until_body_done(Response::new(Body::from("cancelled")), worker.clone());
+        assert_eq!(worker.load(), 1);
+        drop(response);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn grpc_stream_load_follows_producer_and_drop_cancels_it() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "grpc://worker:50051".to_string(),
+            WorkerType::Regular,
+        ));
+
+        worker.increment_load();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let producer = tokio::spawn(async move {
+            let _ = finish_rx.await;
+        });
+        let mut response = Response::new(Body::from("buffered"));
+        response
+            .extensions_mut()
+            .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
+        let response = hold_load_until_body_done(response, worker.clone());
+        finish_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while worker.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // The body is still buffered, but backend generation has finished.
+        assert_eq!(worker.load(), 0);
+        drop(response);
+
+        worker.increment_load();
+        let producer = tokio::spawn(std::future::pending::<()>());
+        let mut response = Response::new(Body::from("buffered"));
+        response
+            .extensions_mut()
+            .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
+        let response = hold_load_until_body_done(response, worker.clone());
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while worker.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -2139,6 +2276,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
@@ -2349,7 +2487,10 @@ mod tests {
         use std::sync::Arc;
         use tokio::net::TcpListener;
 
-        let start = std::time::Instant::now();
+        // Start the delay on the first health request, not when the task is
+        // spawned. Under a loaded test runner, spawn-to-request scheduling can
+        // otherwise exceed the delay and make the first assertion flaky.
+        let first_request = Arc::new(std::sync::OnceLock::<std::time::Instant>::new());
         let ready_after = Arc::new(delay);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2359,10 +2500,11 @@ mod tests {
             .route(
                 "/health",
                 get(
-                    move |State((start, ready_after)): State<(
-                        std::time::Instant,
+                    move |State((first_request, ready_after)): State<(
+                        Arc<std::sync::OnceLock<std::time::Instant>>,
                         Arc<std::time::Duration>,
                     )>| async move {
+                        let start = first_request.get_or_init(std::time::Instant::now);
                         if start.elapsed() >= *ready_after {
                             StatusCode::OK
                         } else {
@@ -2371,7 +2513,7 @@ mod tests {
                     },
                 ),
             )
-            .with_state((start, ready_after));
+            .with_state((first_request, ready_after));
 
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();

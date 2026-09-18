@@ -295,7 +295,29 @@ Policy still uses `extract_text_for_routing()` this version.
 
 `TokenizerCache` (in `src/backend/preprocess.rs`) caches loaded
 `vllm-chat` / `vllm-tokenizer` objects per model key in-process. It
-does not reuse prior-request token ids or engine KV.
+does not reuse prior-request token ids or engine KV. Cold loads are
+single-flight, and one model no longer pins the cache for later model keys.
+
+The request lowering in `vllm_frontend.rs` intentionally tracks vLLM
+0.29's private `prepare_chat_request` conversion. That upstream function
+is `pub(super)` and coupled to `vllm-server`, so it cannot be imported by
+this crate. Replace the local adapter if vLLM exposes a public
+frontend-only lowering API.
+
+Omitted sampling temperature is resolved from the loaded model's
+`generation_config.json`, then falls back to OpenAI's `1.0`; protobuf
+omission is not used because vLLM 0.29 gRPC rewrites it to greedy `0.0`.
+When hidden stop strings/tokens are configured, the router requests worker
+text so the exact character trim boundary is preserved; token IDs alone
+cannot encode that boundary.
+
+Reasoning/tool history, tool definitions, tool choice, template kwargs,
+documents, and response format are preserved while rendering. Active
+tool calling and `reasoning_effort` currently return a clear 400 because
+the gRPC response adapter does not yet expose `vllm-chat`'s output
+parsers; returning raw text as `content` would silently violate OpenAI
+tool/reasoning response semantics. Multimodal content is likewise rejected
+until media features are sent in `GenerateRequest.media`.
 
 #### Backend modules (`src/backend/`)
 
@@ -314,14 +336,23 @@ inside `grpc.rs`). Startup and periodic probes use `health.rs`
 | `detect.rs` | `grpc://` / `grpcs://`, `WorkerPoolKind`, reject mixed schemes, strip `@dp_rank`, tonic URI (`grpc://host:port` → h2c `http://host:port`; still gRPC) |
 | `frontend.rs` | `EngineFrontend`: `prepare(chat)` then `dispatch(ids, url)`. Wraps preprocess + convert + grpc |
 | `health.rs` | `grpc.health.v1` Check on `--grpc-port` (empty service = overall `SERVING`). Used for worker + startup probes |
-| `preprocess.rs` | `TokenizerCache` + chat template/encode → `token_ids`. Load key: `VLLM_ROUTER_MODEL`, else request `model`. Required on `grpc://`. HTTP only if `VLLM_ROUTER_STAGES=1` (shadow, off the first-byte path) |
+| `preprocess.rs` | `TokenizerCache` + chat template/encode → `token_ids`. Load key: valid local `VLLM_ROUTER_TOKENIZER`, else `VLLM_ROUTER_MODEL`, else request `model`. Required on `grpc://`. HTTP only if `VLLM_ROUTER_STAGES=1` (shadow, off the first-byte path) |
 | `vllm_frontend.rs` | Private adapter onto `vllm-chat` / `vllm-tokenizer` / `vllm-text` (`load_model_backends`, render, encode, detok) |
 | `convert.rs` | OpenAI fields → `GenerateRequest` with `prompt = TokenIds` (does not fill proto `media` / KV-transfer fields) |
 | `grpc.rs` | Cached tonic `InferenceClient`, `GenerateStream` |
 | `openai.rs` | Proto chunks → OpenAI JSON/SSE for the **client** (not a southbound hop) |
 
-`VLLM_ROUTER_MODEL` wins as the load key. `VLLM_ROUTER_TOKENIZER` is an
-unused last-resort fallback if that and request `model` are empty.
+The diagnostic `engine_ms` stage is a first-output residual, not direct
+EngineCore telemetry: it includes queueing/prefill/generation effects left
+after subtracting router frontend and transfer spans. Compare it only when
+the first-output boundary is equivalent across arms.
+
+Set `VLLM_ROUTER_TOKENIZER` to a local tokenizer/model directory (or a
+tokenizer file inside it, which is normalized to its parent directory)
+when the northbound served model name is an alias. Otherwise
+`VLLM_ROUTER_MODEL`, then request `model`, supplies the load key. The
+request model remains the southbound protobuf model name; a tokenizer
+filesystem path no longer overwrites that alias.
 
 #### How to start `vllm-rs` (v0.29)
 

@@ -58,6 +58,23 @@ pub fn stream_chunk(
     }
 }
 
+pub fn stream_usage_chunk(
+    id: &str,
+    model: &str,
+    created: u64,
+    usage: Usage,
+) -> ChatCompletionStreamResponse {
+    ChatCompletionStreamResponse {
+        id: id.to_string(),
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model: model.to_string(),
+        system_fingerprint: None,
+        choices: Vec::new(),
+        usage: Some(usage),
+    }
+}
+
 pub fn format_sse(chunk: &ChatCompletionStreamResponse) -> String {
     format!(
         "data: {}\n\n",

@@ -33,7 +33,8 @@ def main() -> None:
         add_generation_prompt=True,
         return_dict=True,
     )
-    ids = enc["input_ids"] if isinstance(enc, dict) else enc
+    # transformers returns BatchEncoding (a Mapping, not necessarily dict).
+    ids = enc["input_ids"] if hasattr(enc, "__getitem__") and "input_ids" in enc else enc
     if ids and isinstance(ids[0], (list, tuple)):
         ids = ids[0]
     print(json.dumps([int(x) for x in ids]))

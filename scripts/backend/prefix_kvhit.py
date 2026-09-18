@@ -114,64 +114,95 @@ def post_chat(url: str, model: str, user: str, max_tokens: int, timeout: float) 
     )
     t0 = time.perf_counter()
     ttft_ms = None
+    last_output_ms = None
     usage: dict = {}
     text_parts: list[str] = []
     stages = None
+    saw_done = False
+    saw_finish = False
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             headers = {k.lower(): v for k, v in resp.headers.items()}
             stages = headers.get("x-router-stages")
-            buf = b""
-            while True:
-                chunk = resp.read(256)
-                if not chunk:
+            for line in resp:
+                raw = line.decode("utf-8", errors="replace").strip()
+                if raw.startswith(": router-stages "):
+                    stages = raw[len(": router-stages ") :]
+                    continue
+                if not raw.startswith("data: "):
+                    continue
+                data = raw[6:]
+                if data == "[DONE]":
+                    saw_done = True
                     break
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    raw = line.decode("utf-8", errors="replace").strip()
-                    if raw.startswith(": router-stages "):
-                        stages = raw[len(": router-stages ") :]
-                        continue
-                    if not raw.startswith("data: "):
-                        continue
-                    data = raw[6:]
-                    if data == "[DONE]":
-                        buf = b""
-                        break
-                    try:
-                        obj = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    if obj.get("usage"):
-                        usage = obj["usage"]
-                    choices = obj.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = (choices[0].get("delta") or {}).get("content") or ""
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(f"malformed SSE data: {data!r}") from exc
+                if obj.get("error") is not None:
+                    raise RuntimeError(f"SSE error: {obj['error']}")
+                if obj.get("usage"):
+                    usage = obj["usage"]
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                if choice.get("finish_reason") is not None:
+                    saw_finish = True
+                delta_obj = choice.get("delta") or {}
+                delta = (
+                    delta_obj.get("content")
+                    or delta_obj.get("reasoning")
+                    or delta_obj.get("reasoning_content")
+                    or ""
+                )
+                meaningful = bool(delta) or bool(delta_obj.get("tool_calls"))
+                if meaningful:
+                    observed_ms = (time.perf_counter() - t0) * 1000.0
+                    if ttft_ms is None:
+                        ttft_ms = observed_ms
+                    last_output_ms = observed_ms
                     if delta:
-                        if ttft_ms is None:
-                            ttft_ms = (time.perf_counter() - t0) * 1000.0
                         text_parts.append(delta)
     except urllib.error.HTTPError as exc:
         raise SystemExit(f"HTTP {exc.code}: {exc.read().decode(errors='replace')}") from exc
-    e2e_ms = (time.perf_counter() - t0) * 1000.0
+    except (OSError, RuntimeError) as exc:
+        raise SystemExit(f"stream failed after partial_chars={sum(map(len, text_parts))}: {exc}") from exc
+    total_duration_ms = (time.perf_counter() - t0) * 1000.0
     if ttft_ms is None:
         raise SystemExit(
-            f"no streamed first-token content from {url} after {e2e_ms:.1f}ms "
+            f"no streamed first output from {url} after {total_duration_ms:.1f}ms "
             f"(usage={usage} chars_out={sum(len(p) for p in text_parts)})"
         )
+    if not saw_finish or not saw_done:
+        raise SystemExit(
+            f"incomplete SSE stream finish={saw_finish} done={saw_done} "
+            f"partial_chars={sum(map(len, text_parts))}"
+        )
+    n_prompt = usage.get("prompt_tokens")
     n_out = usage.get("completion_tokens")
-    if n_out is None:
-        n_out = 0
-    decode_ms = max(0.0, e2e_ms - ttft_ms)
-    decode_tok_s = (float(n_out) / (decode_ms / 1000.0)) if decode_ms > 1.0 and n_out else None
-    e2e_tok_s = (float(n_out) / (e2e_ms / 1000.0)) if e2e_ms > 1.0 and n_out else None
-    tpot_ms = (decode_ms / float(n_out)) if n_out else None
+    if not isinstance(n_prompt, int) or not isinstance(n_out, int):
+        raise SystemExit(f"missing/invalid usage: {usage}")
+    assert last_output_ms is not None
+    decode_ms = max(0.0, last_output_ms - ttft_ms)
+    decode_tokens = max(0, int(n_out) - 1)
+    decode_tok_s = (
+        float(decode_tokens) / (decode_ms / 1000.0)
+        if decode_ms > 1.0 and decode_tokens
+        else None
+    )
+    e2e_tok_s = (
+        float(n_out) / (total_duration_ms / 1000.0)
+        if total_duration_ms > 1.0 and n_out
+        else None
+    )
+    tpot_ms = (decode_ms / float(decode_tokens)) if decode_tokens else None
     return {
         "ttft_ms": ttft_ms,
-        "e2e_ms": e2e_ms,
-        "prompt_tokens": usage.get("prompt_tokens"),
+        "e2e_ms": total_duration_ms,
+        "total_duration_ms": total_duration_ms,
+        "last_output_ms": last_output_ms,
+        "prompt_tokens": n_prompt,
         "completion_tokens": n_out or None,
         "chars_out": sum(len(p) for p in text_parts),
         "decode_tok_s": decode_tok_s,
@@ -220,6 +251,8 @@ def main() -> None:
                     "hit_rate": args.hit_rate,
                     "miss_chars": len(miss_user),
                     "hit_chars": len(hit_user),
+                    "miss_user": miss_user,
+                    "hit_user": hit_user,
                 }
             )
         )

@@ -256,3 +256,80 @@ async fn e2e_http_forwards_messages_grpc_forwards_token_ids() {
     assert!(!grpc_seen[0].had_text_prompt);
     assert!(!grpc_seen[0].token_ids.is_empty());
 }
+
+#[tokio::test]
+async fn dynamically_added_grpc_worker_uses_grpc_health() {
+    let grpc = MockVllmRsServer::spawn().await;
+    let config = test_config(Vec::new());
+    let ctx = create_test_context(config);
+    let router = Router::new(Vec::new(), &ctx).await.unwrap();
+
+    let result = router.add_worker(&grpc.grpc_url).await.unwrap();
+    assert!(result.contains("Successfully added worker"));
+    assert_eq!(router.get_worker_urls(), vec![grpc.grpc_url]);
+}
+
+#[tokio::test]
+async fn grpc_stream_emits_openai_compatible_usage_chunk() {
+    let grpc = MockVllmRsServer::spawn().await;
+    let config = test_config(vec![grpc.grpc_url.clone()]);
+    let ctx = create_test_context(config.clone());
+    let router = Router::new(vec![grpc.grpc_url.clone()], &ctx)
+        .await
+        .unwrap();
+    router.pin_test_token_ids(vec![1, 2, 3]);
+    let app = create_test_app(Arc::new(router), reqwest::Client::new(), &config);
+    let body = json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello world"}],
+        "max_tokens": 8,
+        "stream": true,
+        "stream_options": {"include_usage": true}
+    });
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let text = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let chunks: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    let usage_chunks: Vec<_> = chunks
+        .iter()
+        .filter(|chunk| chunk.get("usage").is_some_and(|usage| !usage.is_null()))
+        .collect();
+    assert_eq!(usage_chunks.len(), 1, "{text}");
+    assert_eq!(usage_chunks[0]["choices"], json!([]));
+    assert_eq!(
+        usage_chunks[0]["usage"],
+        json!({
+            "prompt_tokens": 3,
+            "completion_tokens": 3,
+            "total_tokens": 6
+        })
+    );
+    assert!(chunks
+        .iter()
+        .filter(|chunk| chunk["choices"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()))
+        .all(|chunk| chunk.get("usage").is_none() || chunk["usage"].is_null()));
+    assert!(text.contains("data: [DONE]"));
+}
