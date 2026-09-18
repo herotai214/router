@@ -46,16 +46,12 @@ impl EngineFrontend {
 
     pub fn from_env() -> Self {
         Self {
-            tokenizer: Arc::new(TokenizerCache::from_env()),
+            tokenizer: Arc::new(TokenizerCache::new()),
             grpc: GrpcEngineBackend::new(),
         }
     }
 
-    pub fn tokenizer_cache(&self) -> Arc<TokenizerCache> {
-        Arc::clone(&self.tokenizer)
-    }
-
-    /// Tests only. Does not load a real tokenizer.
+    /// Tests only: bypass model loading by returning these fake prompt ids.
     pub fn pin_test_token_ids(&self, token_ids: Vec<u32>) {
         self.tokenizer.pin_test_token_ids(token_ids);
     }

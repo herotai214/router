@@ -26,7 +26,7 @@ use super::openai::{
     SSE_DONE,
 };
 use super::pb::inference_client::InferenceClient;
-use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
+use super::preprocess::{FrontendHandle, TokenizeOut};
 use super::vllm_frontend::{decode_stream, emit_detok, DynTokenizer, IncrementalDecoderTrait};
 use crate::protocols::spec::{ChatCompletionRequest, Usage};
 
@@ -90,32 +90,6 @@ impl GrpcEngineBackend {
         let client = InferenceClient::new(channel);
         self.clients.insert(uri, client.clone());
         Ok(client)
-    }
-
-    /// Tokenize then send. Prefer `EngineFrontend::prepare` + `dispatch_prepared`
-    /// so tokenize sits outside policy / retry.
-    pub async fn dispatch_chat(
-        &self,
-        worker_url: &str,
-        request: &ChatCompletionRequest,
-        tokenizer: &TokenizerCache,
-    ) -> Response {
-        let t_req = Instant::now();
-        let handle = match tokenizer.resolve(request.model.as_deref()).await {
-            Ok(p) => p,
-            Err(e) => {
-                return (StatusCode::BAD_REQUEST, format!("tokenizer: {e}")).into_response();
-            }
-        };
-        let resolve_ms = t_req.elapsed().as_secs_f64() * 1000.0;
-        let tokenized = match tokenize_chat_request_timed(request, &handle) {
-            Ok(out) => out,
-            Err(e) => {
-                return (StatusCode::BAD_REQUEST, format!("preprocess: {e}")).into_response();
-            }
-        };
-        self.dispatch_prepared(worker_url, request, tokenized, handle, resolve_ms, t_req)
-            .await
     }
 
     pub async fn dispatch_prepared(
@@ -234,6 +208,8 @@ struct ChatReply {
 }
 
 fn fill_engine_ms(stages: &mut serde_json::Value) {
+    // Diagnostic residual only. This subtracts router frontend and gRPC
+    // invoke spans from first output; it is not direct EngineCore telemetry.
     let first = stages.get("first_token_ms").and_then(|v| v.as_f64());
     let pre = stages
         .get("resolve_ms")

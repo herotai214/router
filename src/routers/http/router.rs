@@ -39,37 +39,17 @@ fn insert_router_stages(headers: &mut HeaderMap, stages: &serde_json::Value) {
     }
 }
 
-type ShadowTok = tokio::task::JoinHandle<Option<crate::backend::preprocess::TokenizeOut>>;
-
-fn http_stages_json(
-    http_ttfb_ms: f64,
-    first_sse_ms: f64,
-    tok: Option<&crate::backend::preprocess::TokenizeOut>,
-) -> serde_json::Value {
-    let mut stages = serde_json::json!({
+// Diagnostic only. For HTTP this measures router -> worker header wait and
+// first SSE byte; `engine_ms` is a residual, not EngineCore telemetry.
+fn http_stages_json(http_ttfb_ms: f64, first_sse_ms: f64) -> serde_json::Value {
+    serde_json::json!({
         "path": "http_proxy",
         "http_ttfb_ms": http_ttfb_ms,
         "http_first_sse_ms": first_sse_ms,
         "xfer_ms": http_ttfb_ms,
         "first_token_ms": first_sse_ms,
         "engine_ms": first_sse_ms - http_ttfb_ms,
-    });
-    if let Some(tok) = tok {
-        stages["encode_backend"] = serde_json::json!(tok.encode_backend);
-        stages["n_prompt_tokens"] = serde_json::json!(tok.token_ids.len());
-        stages["adapt_ms"] = serde_json::json!(tok.adapt_ms);
-        stages["template_ms"] = serde_json::json!(tok.template_ms);
-        stages["encode_ms"] = serde_json::json!(tok.encode_ms);
-        stages["frontend_ms"] = serde_json::json!(tok.frontend_ms());
-    }
-    stages
-}
-
-async fn take_shadow(shadow: Option<ShadowTok>) -> Option<crate::backend::preprocess::TokenizeOut> {
-    match shadow {
-        Some(handle) => handle.await.ok().flatten(),
-        None => None,
-    }
+    })
 }
 
 fn emit_http_first_sse<E>(
@@ -1074,28 +1054,9 @@ impl Router {
             request_builder = request_builder.header("X-data-parallel-rank", dp_rank.to_string());
         }
 
-        // Opt-in: VLLM_ROUTER_STAGES=1. Shadow tokenize is CPU-only and must
-        // not sit on the first-byte path (awaiting it would inflate HTTP TTFT
-        // on a KV hit). Stream arms emit a cheap comment immediately, then
-        // log the tokenizer split when the join finishes.
+        // Opt-in: VLLM_ROUTER_STAGES=1. HTTP remains a transparent proxy; the
+        // stage split reports worker header wait and first SSE byte only.
         let stages_on = crate::backend::stages_enabled();
-        let shadow: Option<ShadowTok> = if stages_on && route == "/v1/chat/completions" {
-            match serde_json::to_value(typed_req)
-                .and_then(serde_json::from_value::<ChatCompletionRequest>)
-            {
-                Ok(chat) => {
-                    let cache = self.frontend.tokenizer_cache();
-                    Some(tokio::spawn(async move {
-                        let frontend = cache.resolve(chat.model.as_deref()).await.ok()?;
-                        crate::backend::preprocess::tokenize_chat_request_timed(&chat, &frontend)
-                            .ok()
-                    }))
-                }
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
 
         let t_send = Instant::now();
         let res = match otel_http::send_client_request(
@@ -1142,8 +1103,7 @@ impl Router {
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
             if stages_on {
-                let tok = take_shadow(shadow).await;
-                let http_stages = http_stages_json(http_ttfb_ms, first_ms, tok.as_ref());
+                let http_stages = http_stages_json(http_ttfb_ms, first_ms);
                 insert_router_stages(&mut response_headers, &http_stages);
                 info!(stages = %http_stages, "http proxy stages");
             }
@@ -1188,7 +1148,7 @@ impl Router {
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
             if stages_on {
-                let header_stages = http_stages_json(http_ttfb_ms, http_ttfb_ms, None);
+                let header_stages = http_stages_json(http_ttfb_ms, http_ttfb_ms);
                 insert_router_stages(&mut response_headers, &header_stages);
             }
 
@@ -1200,7 +1160,6 @@ impl Router {
                 let mut stream = stream;
                 let mut decremented = false;
                 let mut first_sse = true;
-                let mut shadow = shadow;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
@@ -1208,22 +1167,8 @@ impl Router {
                                 first_sse = false;
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
                                 if stages_on {
-                                    let stages = http_stages_json(http_ttfb_ms, first_ms, None);
+                                    let stages = http_stages_json(http_ttfb_ms, first_ms);
                                     emit_http_first_sse(&tx, &stages);
-                                    if let Some(handle) = shadow.take() {
-                                        let tx_log = tx.clone();
-                                        tokio::spawn(async move {
-                                            let tok = take_shadow(Some(handle)).await;
-                                            let full = http_stages_json(
-                                                http_ttfb_ms,
-                                                first_ms,
-                                                tok.as_ref(),
-                                            );
-                                            info!(stages = %full, "http proxy stages");
-                                            let comment = format!(": router-stages {full}\n\n");
-                                            let _ = tx_log.send(Ok(bytes::Bytes::from(comment)));
-                                        });
-                                    }
                                 }
                             }
                             // Check for stream end marker
@@ -1270,7 +1215,7 @@ impl Router {
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
             if stages_on {
-                let header_stages = http_stages_json(http_ttfb_ms, http_ttfb_ms, None);
+                let header_stages = http_stages_json(http_ttfb_ms, http_ttfb_ms);
                 insert_router_stages(&mut response_headers, &header_stages);
             }
 
@@ -1281,7 +1226,6 @@ impl Router {
             tokio::spawn(async move {
                 let mut stream = stream;
                 let mut first_sse = true;
-                let mut shadow = shadow;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
@@ -1289,22 +1233,8 @@ impl Router {
                                 first_sse = false;
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
                                 if stages_on {
-                                    let stages = http_stages_json(http_ttfb_ms, first_ms, None);
+                                    let stages = http_stages_json(http_ttfb_ms, first_ms);
                                     emit_http_first_sse(&tx, &stages);
-                                    if let Some(handle) = shadow.take() {
-                                        let tx_log = tx.clone();
-                                        tokio::spawn(async move {
-                                            let tok = take_shadow(Some(handle)).await;
-                                            let full = http_stages_json(
-                                                http_ttfb_ms,
-                                                first_ms,
-                                                tok.as_ref(),
-                                            );
-                                            info!(stages = %full, "http proxy stages");
-                                            let comment = format!(": router-stages {full}\n\n");
-                                            let _ = tx_log.send(Ok(bytes::Bytes::from(comment)));
-                                        });
-                                    }
                                 }
                             }
                             if tx.send(Ok(bytes)).is_err() {

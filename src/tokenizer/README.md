@@ -1,11 +1,5 @@
 # Tokenizer Architecture
 
-This directory is the **in-tree** HuggingFace / Tiktoken tokenizer
-(cache-aware routing, stop sequences, older HTTP helpers). It is **not**
-the gRPC preprocess path. `grpc://` workers use `vllm-chat` +
-`vllm-tokenizer` via `src/backend/` (`TokenizerCache` in
-`preprocess.rs`). See the router README **gRPC worker backend** section.
-
 ## 1. Executive Summary
 
 ### High-Level Overview

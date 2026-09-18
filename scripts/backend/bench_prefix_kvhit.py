@@ -8,12 +8,19 @@ directory.
 
   export ROUTER_URL=http://127.0.0.1:30000
   export MODEL=my-served-model
-  python scripts/backend/prefix_kvhit.py
+  python scripts/backend/bench_prefix_kvhit.py
 
 By default the script writes a short synthetic chat body into a temp
 file (repeated paragraph; no tokenizer required). Pass ``--tokens N``
 and ``--model-dir /path/to/hf`` to size the user text to an exact
 input length via transformers.
+
+Returned JSON reports client-observed ``ttft_ms``, ``e2e_ms`` /
+``total_duration_ms``, ``last_output_ms``, token counts, throughput, and
+``tpot_ms``. The optional ``stages`` field is raw router diagnostic JSON
+from ``VLLM_ROUTER_STAGES=1``. Stage fields such as ``xfer_ms`` and
+``engine_ms`` are boundary/residual diagnostics, not direct network or
+EngineCore telemetry.
 
 Hit rates:
   0.99 — same body twice (second request should prefix-hit)

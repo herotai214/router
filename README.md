@@ -279,6 +279,9 @@ HTTP `http://` workers stay a reverse proxy of OpenAI `messages`.
 `grpc://` workers receive **`token_ids`** produced on the router
 (`vllm-chat` + `vllm-tokenizer`, Cargo git tag `v0.29.0`, not
 `pip install`). There is no in-repo tokenizer fallback.
+`vllm-tokenizer` pulls `fastokens`, which depends on PCRE2; this repo
+sets `PCRE2_SYS_STATIC=1` in `.cargo/config.toml` so plain `cargo build`
+does not depend on a system `libpcre2-8` installation.
 
 This is the **current default wire**, not a forever ban on a gRPC text
 prompt or HTTP token-id input. Chat-only on `grpc://` is a **router
@@ -336,7 +339,7 @@ inside `grpc.rs`). Startup and periodic probes use `health.rs`
 | `detect.rs` | `grpc://` / `grpcs://`, `WorkerPoolKind`, reject mixed schemes, strip `@dp_rank`, tonic URI (`grpc://host:port` → h2c `http://host:port`; still gRPC) |
 | `frontend.rs` | `EngineFrontend`: `prepare(chat)` then `dispatch(ids, url)`. Wraps preprocess + convert + grpc |
 | `health.rs` | `grpc.health.v1` Check on `--grpc-port` (empty service = overall `SERVING`). Used for worker + startup probes |
-| `preprocess.rs` | `TokenizerCache` + chat template/encode → `token_ids`. Load key: valid local `VLLM_ROUTER_TOKENIZER`, else `VLLM_ROUTER_MODEL`, else request `model`. Required on `grpc://`. HTTP only if `VLLM_ROUTER_STAGES=1` (shadow, off the first-byte path) |
+| `preprocess.rs` | `TokenizerCache` + chat template/encode → `token_ids`. Load key: valid local `VLLM_ROUTER_TOKENIZER`, else `VLLM_ROUTER_MODEL`, else request `model`. Required on `grpc://`; HTTP remains a transparent reverse proxy |
 | `vllm_frontend.rs` | Private adapter onto `vllm-chat` / `vllm-tokenizer` / `vllm-text` (`load_model_backends`, render, encode, detok) |
 | `convert.rs` | OpenAI fields → `GenerateRequest` with `prompt = TokenIds` (does not fill proto `media` / KV-transfer fields) |
 | `grpc.rs` | Cached tonic `InferenceClient`, `GenerateStream` |
@@ -392,7 +395,7 @@ vllm-router \
 ```
 
 `--max-num-seqs`, `--max-model-len`, and prefix-cache flags are **worker**
-options. `prefix_kvhit.py` only tunes body length (`--chars` / `--tokens`)
+options. `bench_prefix_kvhit.py` only tunes body length (`--chars` / `--tokens`)
 and hit rate (`--hit-rate`). See [`scripts/backend`](scripts/backend).
 
 `grpc://host:port` is rewritten to h2c `http://host:port` for tonic; that
@@ -433,7 +436,7 @@ and a prefix miss/hit client live in
 #### Tests
 
 These lock **this version’s wire**, not a policy that gRPC may never
-grow a text prompt. No GPU and no live `vllm-rs` except `prefix_kvhit.py`.
+grow a text prompt. No GPU and no live `vllm-rs` except `bench_prefix_kvhit.py`.
 
 | What | Purpose | How |
 |---|---|---|
@@ -441,7 +444,7 @@ grow a text prompt. No GPU and no live `vllm-rs` except `prefix_kvhit.py`.
 | `tests/common/mock_vllm_rs.rs` | In-process `Inference` + `grpc.health.v1` (SERVING) used by that e2e test | pulled in automatically |
 | `src/backend/detect.rs` / `convert.rs` / `openai.rs` / `health.rs` | Scheme/URI, `TokenIds`-only proto, SSE shape, health helper | `cargo test --lib backend::` |
 | `src/backend/preprocess.rs` + `tests/python_vllm_chat_ids.py` | rust `vllm-chat` ids vs Python `vllm.tokenizers` on the same messages. **Skips** unless `VLLM_ROUTER_MODEL` is a model dir with `tokenizer.json` and Python can `import vllm` | see below |
-| `scripts/backend/prefix_kvhit.py` | Live miss-then-hit against a running router | after `serve_*.sh` (see [`scripts/backend`](scripts/backend)) |
+| `scripts/backend/bench_prefix_kvhit.py` | Live miss-then-hit against a running router | after `serve_*.sh` (see [`scripts/backend`](scripts/backend)) |
 
 Always-on (CI):
 

@@ -2,12 +2,14 @@
 
 vLLM 0.29 worker + this rust router. These scripts do not set Slurm,
 Docker, or device IDs. Engine knobs (`--max-num-seqs`, …) are **worker
-CLI flags**, not router flags. `prefix_kvhit.py` does not start engines.
+CLI flags**, not router flags. `bench_prefix_kvhit.py` does not start engines.
 
 Optional env: `HOST`, `WORKER_PORT`, `GRPC_PORT`, `ROUTER_PORT`,
-`ROUTER_BIN`, `VLLM_RS`, `VLLM_ROUTER_MODEL` (load key; wins).
-`VLLM_ROUTER_TOKENIZER` is an unused last-resort fallback.
-`VLLM_ROUTER_STAGES=1` turns on router stage clocks / HTTP shadow tokenize.
+`ROUTER_BIN`, `VLLM_RS`, `VLLM_ROUTER_MODEL`, `VLLM_ROUTER_TOKENIZER`.
+`VLLM_ROUTER_TOKENIZER` may point at a model directory or tokenizer file;
+the router normalizes tokenizer files to their parent model directory.
+`VLLM_ROUTER_STAGES=1` turns on optional router stage clocks; these are
+diagnostic boundaries/residuals, not direct network or EngineCore telemetry.
 
 ## Check `vllm-rs`
 
@@ -65,7 +67,7 @@ Worker flags we actually tune in tests (forwarded to EngineCore):
 | `--gpu-memory-utilization` | KV / weight budget |
 | `--enable-prefix-caching` | Second request can KV-hit |
 
-These are **not** in `prefix_kvhit.py`. HTTP launchers take them as extra
+These are **not** in `bench_prefix_kvhit.py`. HTTP launchers take them as extra
 args; gRPC needs `--` first (see below).
 
 ## Wrapper scripts
@@ -98,11 +100,13 @@ export MODEL=/path/or/hf-id
   --enable-prefix-caching
 ```
 
-## `prefix_kvhit.py` (length, hit %, output)
+## `bench_prefix_kvhit.py` benchmark client
 
 Client only: one miss POST then one hit POST to
 `/v1/chat/completions`. Defaults: `--hit-rate 0.99`, `--chars 8000`,
 `--max-tokens 16`.
+`tests/test_bench_prefix_kvhit.py` is the unit test for this client script; it
+does not test live prefix-cache behavior.
 
 | What | Flag | Env | Meaning |
 |---|---|---|---|
@@ -118,12 +122,12 @@ Client only: one miss POST then one hit POST to
 export ROUTER_URL=http://127.0.0.1:30000
 export MODEL=/path/or/hf-id
 
-python scripts/backend/prefix_kvhit.py \
+python scripts/backend/bench_prefix_kvhit.py \
   --hit-rate 0.99 \
   --chars 8000 \
   --max-tokens 16
 
-python scripts/backend/prefix_kvhit.py \
+python scripts/backend/bench_prefix_kvhit.py \
   --hit-rate 0.30 \
   --tokens 131072 \
   --model-dir "$MODEL" \

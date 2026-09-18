@@ -12,8 +12,8 @@
 //! gRPC wire types come from crates.io `vllm-proto`. Chat+tokenize is
 //! `vllm-chat` + `vllm-tokenizer` only (Cargo git, not `pip install`).
 //!
-//! `VLLM_ROUTER_STAGES=1` emits stage clocks. HTTP shadow tokenize runs only
-//! then; gRPC tokenize always runs.
+//! `VLLM_ROUTER_STAGES=1` emits stage clocks. gRPC always tokenizes; HTTP
+//! remains a transparent proxy and reports worker header/first-byte timings.
 
 pub mod convert;
 pub mod detect;
@@ -24,7 +24,7 @@ pub mod openai;
 pub mod preprocess;
 mod vllm_frontend;
 
-/// Opt-in router stage clocks / HTTP shadow tokenize.
+/// Opt-in router stage clocks.
 pub fn stages_enabled() -> bool {
     matches!(
         std::env::var("VLLM_ROUTER_STAGES").as_deref(),

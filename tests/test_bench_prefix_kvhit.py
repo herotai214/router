@@ -1,3 +1,11 @@
+"""Unit tests for the prefix-KV-hit benchmark client.
+
+This file does not validate vLLM prefix-cache behavior and does not start a
+router or worker. It tests `scripts/backend/bench_prefix_kvhit.py` itself: SSE
+parsing, error handling, completion validation, and TPOT timing boundaries. The
+live prefix-cache check is the benchmark client script against a running router.
+"""
+
 import importlib.util
 import json
 import threading
@@ -8,11 +16,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).parents[1] / "scripts" / "backend" / "prefix_kvhit.py"
-SPEC = importlib.util.spec_from_file_location("prefix_kvhit", SCRIPT)
+SCRIPT = Path(__file__).parents[1] / "scripts" / "backend" / "bench_prefix_kvhit.py"
+SPEC = importlib.util.spec_from_file_location("bench_prefix_kvhit", SCRIPT)
 assert SPEC and SPEC.loader
-PREFIX_KVHIT = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(PREFIX_KVHIT)
+BENCH_PREFIX_KVHIT = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(BENCH_PREFIX_KVHIT)
 
 
 @contextmanager
@@ -74,14 +82,14 @@ class PrefixKvhitSseTests(unittest.TestCase):
             (0, "[DONE]"),
         ]
         with sse_server(events) as url:
-            result = PREFIX_KVHIT.post_chat(url, "model", "hello", 2, 2)
+            result = BENCH_PREFIX_KVHIT.post_chat(url, "model", "hello", 2, 2)
         self.assertLess(result["tpot_ms"], 50)
         self.assertGreater(result["total_duration_ms"], 100)
 
     def test_top_level_sse_error_fails_measurement(self):
         with sse_server([(0, chunk("partial")), (0, '{"error":"worker failed"}')]) as url:
             with self.assertRaises(SystemExit):
-                PREFIX_KVHIT.post_chat(url, "model", "hello", 2, 2)
+                BENCH_PREFIX_KVHIT.post_chat(url, "model", "hello", 2, 2)
 
     def test_missing_done_fails_measurement(self):
         events = [
@@ -103,7 +111,7 @@ class PrefixKvhitSseTests(unittest.TestCase):
         ]
         with sse_server(events) as url:
             with self.assertRaises(SystemExit):
-                PREFIX_KVHIT.post_chat(url, "model", "hello", 2, 2)
+                BENCH_PREFIX_KVHIT.post_chat(url, "model", "hello", 2, 2)
 
 
 if __name__ == "__main__":

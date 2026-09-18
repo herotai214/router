@@ -66,11 +66,7 @@ impl TokenizerCache {
         }
     }
 
-    pub fn from_env() -> Self {
-        Self::new()
-    }
-
-    /// Tests only. Does not load this crate’s HuggingFace stack.
+    /// Tests only: bypass model loading by returning these fake prompt ids.
     pub fn pin_test_token_ids(&self, token_ids: Vec<u32>) {
         *self.pinned.write() = Some(Frontend::TestIds(token_ids));
     }
