@@ -134,30 +134,19 @@ mod tests {
             Some(WorkerPoolKind::Http)
         );
         assert_eq!(
-            classify_worker_urls(&[
-                "https://a:8000".into(),
-                "http://b:8001".into(),
-            ])
-            .unwrap(),
+            classify_worker_urls(&["https://a:8000".into(), "http://b:8001".into(),]).unwrap(),
             Some(WorkerPoolKind::Http)
         );
         assert_eq!(
-            classify_worker_urls(&[
-                "grpc://a:50051".into(),
-                "grpc://b:50051@0".into(),
-            ])
-            .unwrap(),
+            classify_worker_urls(&["grpc://a:50051".into(), "grpc://b:50051@0".into(),]).unwrap(),
             Some(WorkerPoolKind::Grpc)
         );
     }
 
     #[test]
     fn rejects_mixed_schemes() {
-        let err = classify_worker_urls(&[
-            "http://a:8000".into(),
-            "grpc://a:50051".into(),
-        ])
-        .unwrap_err();
+        let err =
+            classify_worker_urls(&["http://a:8000".into(), "grpc://a:50051".into()]).unwrap_err();
         assert!(err.contains("mixed"));
         assert!(err.contains("grpc://a:50051"));
     }

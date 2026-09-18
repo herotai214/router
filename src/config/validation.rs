@@ -483,9 +483,8 @@ impl ConfigValidator {
     /// HTTP never enters that frontend. Those two wires cannot share one
     /// request path, so handling a mixed pool is left as future work.
     fn reject_mixed_worker_urls(urls: &[String]) -> ConfigResult<()> {
-        crate::backend::classify_worker_urls(urls).map_err(|reason| {
-            ConfigError::ValidationFailed { reason }
-        })?;
+        crate::backend::classify_worker_urls(urls)
+            .map_err(|reason| ConfigError::ValidationFailed { reason })?;
         Ok(())
     }
 
