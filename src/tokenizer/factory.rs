@@ -44,6 +44,16 @@ pub fn create_tokenizer_with_chat_template(
         return Err(Error::msg(format!("File not found: {}", file_path)));
     }
 
+    if path.is_dir() {
+        let tokenizer_json = path.join("tokenizer.json");
+        if tokenizer_json.is_file() {
+            return create_tokenizer_with_chat_template(
+                tokenizer_json.to_str().unwrap(),
+                chat_template_path,
+            );
+        }
+    }
+
     // Try to determine tokenizer type from extension
     let extension = path
         .extension()

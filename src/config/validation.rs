@@ -478,16 +478,27 @@ impl ConfigValidator {
                 });
             }
 
-            if !url.starts_with("http://") && !url.starts_with("https://") {
+            let scheme_ok = url.starts_with("http://")
+                || url.starts_with("https://")
+                || url.starts_with("grpc://")
+                || url.starts_with("grpcs://");
+            if !scheme_ok {
                 return Err(ConfigError::InvalidValue {
                     field: "worker_url".to_string(),
                     value: url.clone(),
-                    reason: "URL must start with http:// or https://".to_string(),
+                    reason: "URL must start with http://, https://, grpc://, or grpcs://"
+                        .to_string(),
                 });
             }
 
+            // Strip optional `@dp_rank` before URL parse (`grpc://host:port@0`).
+            let to_parse = url
+                .rsplit_once('@')
+                .and_then(|(prefix, rank)| rank.parse::<u32>().ok().map(|_| prefix))
+                .unwrap_or(url.as_str());
+
             // Basic URL validation
-            match ::url::Url::parse(url) {
+            match ::url::Url::parse(to_parse) {
                 Ok(parsed) => {
                     // Additional validation
                     if parsed.host_str().is_none() {

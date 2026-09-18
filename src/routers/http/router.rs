@@ -31,6 +31,54 @@ use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 
+fn insert_router_stages(headers: &mut HeaderMap, stages: &serde_json::Value) {
+    if let Ok(value) = HeaderValue::from_str(&stages.to_string()) {
+        headers.insert("x-router-stages", value);
+    }
+}
+
+type ShadowTok = tokio::task::JoinHandle<Option<crate::backend::preprocess::TokenizeOut>>;
+
+fn http_stages_json(
+    http_ttfb_ms: f64,
+    first_sse_ms: f64,
+    tok: Option<&crate::backend::preprocess::TokenizeOut>,
+) -> serde_json::Value {
+    let mut stages = serde_json::json!({
+        "path": "http_proxy",
+        "http_ttfb_ms": http_ttfb_ms,
+        "http_first_sse_ms": first_sse_ms,
+        "xfer_ms": http_ttfb_ms,
+        "first_token_ms": first_sse_ms,
+        "engine_ms": first_sse_ms - http_ttfb_ms,
+    });
+    if let Some(tok) = tok {
+        stages["encode_backend"] = serde_json::json!(tok.encode_backend);
+        stages["n_prompt_tokens"] = serde_json::json!(tok.token_ids.len());
+        stages["adapt_ms"] = serde_json::json!(tok.adapt_ms);
+        stages["template_ms"] = serde_json::json!(tok.template_ms);
+        stages["encode_ms"] = serde_json::json!(tok.encode_ms);
+        stages["frontend_ms"] = serde_json::json!(tok.frontend_ms());
+    }
+    stages
+}
+
+async fn take_shadow(shadow: Option<ShadowTok>) -> Option<crate::backend::preprocess::TokenizeOut> {
+    match shadow {
+        Some(handle) => handle.await.ok().flatten(),
+        None => None,
+    }
+}
+
+fn emit_http_first_sse<E>(
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, E>>,
+    stages: &serde_json::Value,
+) {
+    let comment = format!(": router-stages {stages}\n\n");
+    info!(%stages, "http proxy stages");
+    let _ = tx.send(Ok(bytes::Bytes::from(comment)));
+}
+
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
 pub struct Router {
@@ -43,6 +91,8 @@ pub struct Router {
     api_key: Option<String>,
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
+    tokenizer_cache: Arc<crate::backend::TokenizerCache>,
+    grpc_backend: crate::backend::GrpcEngineBackend,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
@@ -179,9 +229,16 @@ impl Router {
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
+            tokenizer_cache: Arc::new(crate::backend::TokenizerCache::from_env()),
+            grpc_backend: crate::backend::GrpcEngineBackend::new(),
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
         })
+    }
+
+    /// Test hook: pin token ids so gRPC e2e does not load a model.
+    pub fn pin_test_token_ids(&self, token_ids: Vec<u32>) {
+        self.tokenizer_cache.pin_test_token_ids(token_ids);
     }
 
     /// Get the current list of worker URLs
@@ -280,16 +337,25 @@ impl Router {
                 let url_clone = base_url.clone();
 
                 let check_health = tokio::spawn(async move {
-                    let health_url = format!("{}/health", url_clone);
-                    match client_clone.get(&health_url).send().await {
-                        Ok(res) => {
-                            if res.status().is_success() {
-                                None
-                            } else {
-                                Some((url_clone, format!("status: {}", res.status())))
-                            }
+                    if crate::backend::is_grpc_url(&url_clone) {
+                        match crate::backend::check_grpc_health(&url_clone, Duration::from_secs(2))
+                            .await
+                        {
+                            Ok(()) => None,
+                            Err(e) => Some((url_clone, e)),
                         }
-                        Err(_) => Some((url_clone, "not ready".to_string())),
+                    } else {
+                        let health_url = format!("{}/health", url_clone);
+                        match client_clone.get(&health_url).send().await {
+                            Ok(res) => {
+                                if res.status().is_success() {
+                                    None
+                                } else {
+                                    Some((url_clone, format!("status: {}", res.status())))
+                                }
+                            }
+                            Err(_) => Some((url_clone, "not ready".to_string())),
+                        }
                     }
                 });
 
@@ -379,6 +445,14 @@ impl Router {
         } else {
             worker_url
         };
+
+        if crate::backend::is_grpc_url(health_url) {
+            return match crate::backend::check_grpc_health(health_url, Duration::from_secs(2)).await
+            {
+                Ok(()) => StatusCode::OK.into_response(),
+                Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+            };
+        }
 
         let request_builder = self.client.get(format!("{}/health", health_url));
 
@@ -780,6 +854,42 @@ impl Router {
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
     ) -> Response {
+        if crate::backend::is_grpc_url(worker_url) {
+            // This-version router 501: gRPC path is chat-only. Not a missing
+            // upstream RPC; http:// workers still proxy other routes.
+            if route != "/v1/chat/completions" {
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    format!("gRPC backend currently supports /v1/chat/completions, not {route}"),
+                )
+                    .into_response();
+            }
+            let chat: ChatCompletionRequest =
+                match serde_json::to_value(typed_req).and_then(serde_json::from_value) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("gRPC chat convert failed: {e}"),
+                        )
+                            .into_response();
+                    }
+                };
+            let response = self
+                .grpc_backend
+                .dispatch_chat(worker_url, &chat, &self.tokenizer_cache)
+                .await;
+            if load_incremented
+                && (response.status().is_success() || !is_retryable_status(response.status()))
+            {
+                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
+                    worker.decrement_load();
+                    RouterMetrics::set_running_requests(worker_url, worker.load());
+                }
+            }
+            return response;
+        }
+
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
                 let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
@@ -844,6 +954,30 @@ impl Router {
             request_builder = request_builder.header("X-data-parallel-rank", dp_rank.to_string());
         }
 
+        // Opt-in: VLLM_ROUTER_STAGES=1. Shadow tokenize is CPU-only and must
+        // not sit on the first-byte path (awaiting it would inflate HTTP TTFT
+        // on a KV hit). Stream arms emit a cheap comment immediately, then
+        // log the tokenizer split when the join finishes.
+        let stages_on = crate::backend::stages_enabled();
+        let shadow: Option<ShadowTok> = if stages_on && route == "/v1/chat/completions" {
+            match serde_json::to_value(typed_req)
+                .and_then(serde_json::from_value::<ChatCompletionRequest>)
+            {
+                Ok(chat) => {
+                    let cache = Arc::clone(&self.tokenizer_cache);
+                    Some(tokio::spawn(async move {
+                        let frontend = cache.resolve(chat.model.as_deref()).await.ok()?;
+                        crate::backend::preprocess::tokenize_chat_request_timed(&chat, &frontend)
+                            .ok()
+                    }))
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        let t_send = Instant::now();
         let res = match otel_http::send_client_request(
             request_builder,
             headers,
@@ -881,10 +1015,18 @@ impl Router {
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
         if !is_stream {
             // For non-streaming requests, preserve headers
-            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
+            if stages_on {
+                let tok = take_shadow(shadow).await;
+                let http_stages = http_stages_json(http_ttfb_ms, first_ms, tok.as_ref());
+                insert_router_stages(&mut response_headers, &http_stages);
+                info!(stages = %http_stages, "http proxy stages");
+            }
 
             let response = match res.bytes().await {
                 Ok(body) => {
@@ -925,6 +1067,10 @@ impl Router {
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            if stages_on {
+                let header_stages = http_stages_json(http_ttfb_ms, http_ttfb_ms, None);
+                insert_router_stages(&mut response_headers, &header_stages);
+            }
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -933,9 +1079,33 @@ impl Router {
             tokio::spawn(async move {
                 let mut stream = stream;
                 let mut decremented = false;
+                let mut first_sse = true;
+                let mut shadow = shadow;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            if first_sse {
+                                first_sse = false;
+                                let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
+                                if stages_on {
+                                    let stages = http_stages_json(http_ttfb_ms, first_ms, None);
+                                    emit_http_first_sse(&tx, &stages);
+                                    if let Some(handle) = shadow.take() {
+                                        let tx_log = tx.clone();
+                                        tokio::spawn(async move {
+                                            let tok = take_shadow(Some(handle)).await;
+                                            let full = http_stages_json(
+                                                http_ttfb_ms,
+                                                first_ms,
+                                                tok.as_ref(),
+                                            );
+                                            info!(stages = %full, "http proxy stages");
+                                            let comment = format!(": router-stages {full}\n\n");
+                                            let _ = tx_log.send(Ok(bytes::Bytes::from(comment)));
+                                        });
+                                    }
+                                }
+                            }
                             // Check for stream end marker
                             if bytes
                                 .as_ref()
@@ -979,6 +1149,10 @@ impl Router {
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            if stages_on {
+                let header_stages = http_stages_json(http_ttfb_ms, http_ttfb_ms, None);
+                insert_router_stages(&mut response_headers, &header_stages);
+            }
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -986,9 +1160,33 @@ impl Router {
             // Spawn task to forward stream
             tokio::spawn(async move {
                 let mut stream = stream;
+                let mut first_sse = true;
+                let mut shadow = shadow;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            if first_sse {
+                                first_sse = false;
+                                let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
+                                if stages_on {
+                                    let stages = http_stages_json(http_ttfb_ms, first_ms, None);
+                                    emit_http_first_sse(&tx, &stages);
+                                    if let Some(handle) = shadow.take() {
+                                        let tx_log = tx.clone();
+                                        tokio::spawn(async move {
+                                            let tok = take_shadow(Some(handle)).await;
+                                            let full = http_stages_json(
+                                                http_ttfb_ms,
+                                                first_ms,
+                                                tok.as_ref(),
+                                            );
+                                            info!(stages = %full, "http proxy stages");
+                                            let comment = format!(": router-stages {full}\n\n");
+                                            let _ = tx_log.send(Ok(bytes::Bytes::from(comment)));
+                                        });
+                                    }
+                                }
+                            }
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
                             }
@@ -1809,6 +2007,8 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            tokenizer_cache: Arc::new(crate::backend::TokenizerCache::new()),
+            grpc_backend: crate::backend::GrpcEngineBackend::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
         }
@@ -1881,6 +2081,8 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            tokenizer_cache: Arc::new(crate::backend::TokenizerCache::new()),
+            grpc_backend: crate::backend::GrpcEngineBackend::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
         }
