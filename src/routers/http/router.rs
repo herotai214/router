@@ -1675,18 +1675,87 @@ impl RouterTrait for Router {
     }
 
     async fn health_generate(&self, req: Request<Body>) -> Response {
+        match self.select_first_worker() {
+            Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
+                // vLLM Rust gRPC exposes canonical grpc.health.v1 for
+                // readiness. That is not equivalent to /health_generate,
+                // which router HTTP/PD paths treat as a generation-capability
+                // probe, so all-gRPC mode returns an explicit 501.
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    "/health_generate is not implemented for gRPC workers; use /health for gRPC readiness",
+                )
+                    .into_response();
+            }
+            Ok(_) => {}
+            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+        }
         self.proxy_get_request(req, "health_generate").await
     }
 
     async fn get_server_info(&self, req: Request<Body>) -> Response {
+        match self.select_first_worker() {
+            Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
+                return match crate::backend::get_grpc_server_info(
+                    &worker_url,
+                    Duration::from_secs(2),
+                )
+                .await
+                {
+                    Ok(info) => (
+                        StatusCode::OK,
+                        Json(crate::backend::server_info_json(&info)),
+                    )
+                        .into_response(),
+                    Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+                };
+            }
+            Ok(_) => {}
+            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+        }
         self.proxy_get_request(req, "get_server_info").await
     }
 
     async fn get_models(&self, req: Request<Body>) -> Response {
+        match self.select_first_worker() {
+            Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
+                return match crate::backend::get_grpc_model_info(
+                    &worker_url,
+                    Duration::from_secs(2),
+                )
+                .await
+                {
+                    Ok(info) => (
+                        StatusCode::OK,
+                        Json(crate::backend::openai_models_json(&info)),
+                    )
+                        .into_response(),
+                    Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+                };
+            }
+            Ok(_) => {}
+            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+        }
         self.proxy_get_request(req, "v1/models").await
     }
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {
+        match self.select_first_worker() {
+            Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
+                return match crate::backend::get_grpc_model_info(
+                    &worker_url,
+                    Duration::from_secs(2),
+                )
+                .await
+                {
+                    Ok(info) => (StatusCode::OK, Json(crate::backend::model_info_json(&info)))
+                        .into_response(),
+                    Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+                };
+            }
+            Ok(_) => {}
+            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+        }
         self.proxy_get_request(req, "get_model_info").await
     }
 
@@ -2061,6 +2130,33 @@ mod tests {
         }
     }
 
+    fn create_test_grpc_router() -> Router {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::RoundRobin,
+        ));
+
+        let worker = BasicWorker::new("grpc://127.0.0.1:15002".to_string(), WorkerType::Regular);
+        worker_registry.register(Arc::new(worker));
+
+        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
+        Router {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            health_config: HealthConfig::default(),
+            frontend: crate::backend::EngineFrontend::new(),
+            _worker_loads: Arc::new(rx),
+            _load_monitor_handle: None,
+        }
+    }
+
     #[test]
     fn test_router_get_worker_urls_regular() {
         let router = create_test_regular_router();
@@ -2080,6 +2176,16 @@ mod tests {
         let url = result.unwrap();
         // DashMap doesn't guarantee order, so just check we get one of the workers
         assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
+    }
+
+    #[tokio::test]
+    async fn test_grpc_health_generate_is_explicitly_not_implemented() {
+        let router = create_test_grpc_router();
+        let response = router.health_generate(Request::new(Body::empty())).await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("not implemented for gRPC workers"));
     }
 
     #[tokio::test]

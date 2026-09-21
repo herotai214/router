@@ -15,6 +15,7 @@
 //! `VLLM_ROUTER_STAGES=1` emits stage clocks. gRPC always tokenizes; HTTP
 //! remains a transparent proxy and reports worker header/first-byte timings.
 
+pub mod control;
 pub mod convert;
 pub mod detect;
 pub mod frontend;
@@ -32,6 +33,10 @@ pub fn stages_enabled() -> bool {
     )
 }
 
+pub use control::{
+    get_grpc_model_info, get_grpc_server_info, model_info_json, openai_models_json,
+    server_info_json,
+};
 pub use detect::{
     classify_worker_urls, connection_mode_from_url, grpc_connect_uri, is_grpc_url, parse_dp_rank,
     strip_dp_suffix, WorkerPoolKind,

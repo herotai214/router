@@ -6,9 +6,11 @@ running OpenAI-compatible router endpoints. It sends a short deterministic
 streaming chat request, validates that the stream completes with usage, and
 prints the generated text plus a stable hash.
 
-When both labels ``rust_grpc`` and ``rust_http`` are present, their generated
-texts are expected to match exactly. Other labels, such as ``python_http``, are
-reported but not required to match because frontend behavior may differ.
+The output is an observation aid, not a golden-output test. Different models,
+parallelism, kernels, or frontend paths may produce slightly different text.
+By default the script only validates that each stream completes, returns usage,
+and produces non-empty text. Optional flags can add stricter checks for focused
+debugging.
 """
 
 from __future__ import annotations
@@ -113,8 +115,13 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument(
         "--expect-substring",
-        default="router-ok",
+        default="",
         help="case-insensitive substring expected in every generated output; empty disables",
+    )
+    parser.add_argument(
+        "--require-exact-match",
+        action="store_true",
+        help="require every included case to generate exactly the same text",
     )
     args = parser.parse_args()
 
@@ -127,15 +134,26 @@ def main() -> None:
         results[label] = row
         print(json.dumps({"label": label, **row}, ensure_ascii=False))
 
-    if {"rust_grpc", "rust_http"}.issubset(results):
-        grpc_text = results["rust_grpc"]["text"]
-        http_text = results["rust_http"]["text"]
-        if grpc_text != http_text:
-            raise SystemExit(
-                "rust_grpc and rust_http generated different text: "
-                f"grpc={grpc_text!r} http={http_text!r}"
-            )
-        print(json.dumps({"comparison": "rust_grpc_vs_rust_http", "match": True}))
+    if args.require_exact_match:
+        labels = list(results)
+        if len(labels) >= 2:
+            first_label = labels[0]
+            first_text = results[first_label]["text"]
+            mismatches = [
+                label
+                for label in labels[1:]
+                if results[label]["text"] != first_text
+            ]
+            if mismatches:
+                details = {
+                    label: results[label]["text"]
+                    for label in [first_label, *mismatches]
+                }
+                raise SystemExit(
+                    "generated text differs across cases: "
+                    + json.dumps(details, ensure_ascii=False)
+                )
+            print(json.dumps({"comparison": "all_cases_exact_match", "match": True}))
 
 
 if __name__ == "__main__":

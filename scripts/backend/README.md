@@ -188,10 +188,13 @@ wave request. This avoids accidentally measuring a warmed exact-prefix body.
 
 ## `e2e_chat_correctness.py` live observation
 
-Client only: validates one short streaming chat request against one or more
-already-running routers. It checks HTTP/SSE completion, usage fields, non-empty
-text, and a configurable expected substring. When both `rust_grpc` and
-`rust_http` labels are present, their generated text must match exactly.
+Client only: observes one short streaming chat request against one or more
+already-running routers. It checks HTTP/SSE completion, usage fields, and
+non-empty text, then prints generated text and SHA-256 hashes for manual
+inspection. Golden text is intentionally not required by default because model,
+parallelism, and kernel choices can produce small output differences. Use
+`--expect-substring` or `--require-exact-match` only when a stricter focused
+check is useful.
 
 ```bash
 python scripts/backend/e2e_chat_correctness.py \

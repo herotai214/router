@@ -102,18 +102,16 @@ pub fn chat_to_generate_request(
     };
     decoding.structured_output = structured_output(request)?;
 
+    if request.top_k == Some(-1) {
+        return Err(
+            "top_k=-1 is not supported by the vLLM gRPC protocol; omit top_k or use a positive value"
+                .to_string(),
+        );
+    }
+
     Ok(pb::GenerateRequest {
         request_id,
-        model: request
-            .model
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                std::env::var("VLLM_ROUTER_MODEL")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-            })
-            .unwrap_or_default(),
+        model: request.model.clone().unwrap_or_default(),
         prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
             ids: token_ids,
         })),
@@ -124,7 +122,7 @@ pub fn chat_to_generate_request(
         temperature: Some(request.temperature.unwrap_or(1.0)),
         sampling: Some(pb::RandomSampling {
             num_sequences: request.n.unwrap_or(0),
-            top_k: request.top_k.unwrap_or(0).max(0) as u32,
+            top_k: request.top_k.unwrap_or(0) as u32,
             top_p: request.top_p.unwrap_or(0.0),
             min_p: request.min_p.unwrap_or(0.0),
             seed: request.seed,
@@ -342,6 +340,27 @@ mod tests {
         let proto = chat_to_generate_request(&req, vec![1], "r".into()).unwrap();
         assert_eq!(proto.temperature, Some(1.0));
         assert_eq!(proto.stopping.unwrap().max_new_tokens, 0);
+    }
+
+    #[test]
+    fn missing_model_stays_empty_on_grpc_wire() {
+        std::env::set_var("VLLM_ROUTER_MODEL", "/tmp/local-tokenizer-assets");
+        let req = chat(serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        let proto = chat_to_generate_request(&req, vec![1], "r".into()).unwrap();
+        std::env::remove_var("VLLM_ROUTER_MODEL");
+        assert_eq!(proto.model, "");
+    }
+
+    #[test]
+    fn rejects_top_k_minus_one_for_grpc() {
+        let req = chat(serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_k": -1
+        }));
+        let err = chat_to_generate_request(&req, vec![1], "r".into()).unwrap_err();
+        assert!(err.contains("top_k=-1"));
     }
 
     #[test]

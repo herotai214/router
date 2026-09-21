@@ -132,6 +132,9 @@ impl GrpcEngineBackend {
         let proto = match chat_to_generate_request(request, tokenized.token_ids, request_id.clone())
         {
             Ok(proto) => proto,
+            Err(error) if error.contains("not supported by the vLLM gRPC protocol") => {
+                return (StatusCode::NOT_IMPLEMENTED, error).into_response();
+            }
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         };
 
