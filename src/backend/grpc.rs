@@ -4,7 +4,7 @@
 //! Does not talk ZMQ. Channel cache is per connect URI.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -59,9 +59,10 @@ fn grpc_status_code(status: &tonic::Status) -> StatusCode {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct GrpcEngineBackend {
     clients: Arc<DashMap<String, InferenceClient<Channel>>>,
+    connect_timeout: Duration,
 }
 
 impl std::fmt::Debug for GrpcEngineBackend {
@@ -72,9 +73,22 @@ impl std::fmt::Debug for GrpcEngineBackend {
     }
 }
 
+impl Default for GrpcEngineBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GrpcEngineBackend {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_connect_timeout(Duration::from_secs(10))
+    }
+
+    pub fn with_connect_timeout(connect_timeout: Duration) -> Self {
+        Self {
+            clients: Arc::new(DashMap::new()),
+            connect_timeout,
+        }
     }
 
     async fn client_for(&self, worker_url: &str) -> Result<InferenceClient<Channel>, String> {
@@ -84,6 +98,7 @@ impl GrpcEngineBackend {
         }
         let channel = Channel::from_shared(uri.clone())
             .map_err(|e| format!("invalid grpc uri {uri}: {e}"))?
+            .connect_timeout(self.connect_timeout)
             .connect()
             .await
             .map_err(|e| format!("grpc connect {uri}: {e}"))?;

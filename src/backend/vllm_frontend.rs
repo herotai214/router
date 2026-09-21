@@ -11,9 +11,9 @@ use serde_json::Value;
 use vllm_chat::{
     load_model_backends, ChatContent, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatTool,
     ChatToolChoice, GenerationPromptMode, LoadModelBackendsOptions, LoadedModelBackends,
-    ReasoningEffort, ResolvedToolContext,
+    ReasoningEffort, ResolvedToolContext, SamplingParams,
 };
-use vllm_text::Prompt;
+use vllm_text::{Prompt, TextDecodeOptions};
 use vllm_tokenizer::{IncrementalDecoder, Tokenizer};
 
 pub use vllm_chat::ChatMessage as UpstreamChatMessage;
@@ -121,23 +121,29 @@ pub fn chat_request_from_openai(input: OpenAiChatRequest) -> Result<ChatRequest>
         input.parallel_tool_calls,
     )?;
 
-    let mut request = ChatRequest::for_test();
-    request.request_id = input.request_id;
-    request.messages = input.messages;
-    request.add_special_tokens = input.add_special_tokens;
-    request.chat_options = ChatOptions {
-        generation_prompt_mode,
-        reasoning_effort: input.reasoning_effort,
-        response_format: input.response_format,
-        template_kwargs: input.template_kwargs,
-        ..ChatOptions::default()
+    let request = ChatRequest {
+        request_id: input.request_id,
+        messages: input.messages,
+        sampling_params: SamplingParams::default(),
+        chat_options: ChatOptions {
+            generation_prompt_mode,
+            reasoning_effort: input.reasoning_effort,
+            response_format: input.response_format,
+            template_kwargs: input.template_kwargs,
+            ..ChatOptions::default()
+        },
+        tool_context,
+        decode_options: TextDecodeOptions::default(),
+        intermediate: true,
+        prompt_truncation: None,
+        priority: input.priority,
+        documents: input.documents,
+        cache_salt: input.cache_salt,
+        add_special_tokens: input.add_special_tokens,
+        data_parallel_rank: input.data_parallel_rank,
+        session_id: input.session_id,
+        lora_request: None,
     };
-    request.tool_context = tool_context;
-    request.documents = input.documents;
-    request.priority = input.priority;
-    request.cache_salt = input.cache_salt;
-    request.data_parallel_rank = input.data_parallel_rank;
-    request.session_id = input.session_id;
     request.validate()?;
     Ok(request)
 }

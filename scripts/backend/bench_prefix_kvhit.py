@@ -15,12 +15,14 @@ file (repeated paragraph; no tokenizer required). Pass ``--tokens N``
 and ``--model-dir /path/to/hf`` to size the user text to an exact
 input length via transformers.
 
-Returned JSON reports client-observed ``ttft_ms``, ``e2e_ms`` /
-``total_duration_ms``, ``last_output_ms``, token counts, throughput, and
-``tpot_ms``. The optional ``stages`` field is raw router diagnostic JSON
-from ``VLLM_ROUTER_STAGES=1``. Stage fields such as ``xfer_ms`` and
-``engine_ms`` are boundary/residual diagnostics, not direct network or
-EngineCore telemetry.
+Returned JSON reports a concurrent hit-request wave by default. Pass
+``--warmup`` to first send a serial miss/hit pair that primes prefix cache
+state before the wave. Per-request rows include client-observed ``ttft_ms``,
+``e2e_ms`` / ``total_duration_ms``, ``last_output_ms``, token counts,
+throughput, and ``tpot_ms``. The optional ``stages`` field is raw router
+diagnostic JSON from ``VLLM_ROUTER_STAGES=1``. Stage fields such as
+``xfer_ms`` and ``engine_ms`` are boundary/residual diagnostics, not direct
+network or EngineCore telemetry.
 
 Hit rates:
   0.99 — same body twice (second request should prefix-hit)
@@ -31,9 +33,11 @@ Hit rates:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -58,6 +62,22 @@ def make_bodies(hit_rate: float, text: str) -> tuple[str, str]:
     split = max(1, int(len(text) * hit_rate))
     prefix, tail = text[:split], text[split:]
     return text, prefix + f" TAIL-{int(time.time() * 1000)} " + tail
+
+
+def make_wave_bodies(hit_rate: float, text: str, requests: int) -> list[str]:
+    """Return request bodies for the concurrent wave.
+
+    The 0% case must not reuse the serial warmup hit body; otherwise the wave
+    measures a warmed exact-prefix body instead of misses.
+    """
+    if hit_rate >= 0.99:
+        return [text] * requests
+    stamp = time.time_ns()
+    if hit_rate <= 0.0:
+        return [f"TAG-WAVE-{stamp}-{idx} {text}" for idx in range(requests)]
+    split = max(1, int(len(text) * hit_rate))
+    prefix, tail = text[:split], text[split:]
+    return [prefix + f" TAIL-WAVE-{stamp}-{idx} " + tail for idx in range(requests)]
 
 
 def make_user_text(chars: int) -> str:
@@ -219,6 +239,59 @@ def post_chat(url: str, model: str, user: str, max_tokens: int, timeout: float) 
     }
 
 
+def summarize_rows(rows: list[dict]) -> dict:
+    def values(key: str) -> list[float]:
+        return [float(row[key]) for row in rows if isinstance(row.get(key), (int, float))]
+
+    summary = {"count": len(rows)}
+    for key in ("ttft_ms", "e2e_ms", "tpot_ms"):
+        vals = values(key)
+        if vals:
+            summary[key] = {
+                "min": min(vals),
+                "avg": sum(vals) / len(vals),
+                "max": max(vals),
+            }
+    return summary
+
+
+def post_hit_wave(
+    url: str,
+    model: str,
+    users: list[str],
+    max_tokens: int,
+    timeout: float,
+    concurrency: int,
+) -> dict:
+    rows: list[dict] = []
+    requests = len(users)
+
+    for batch_start in range(0, requests, concurrency):
+        batch_size = min(concurrency, requests - batch_start)
+        barrier = threading.Barrier(batch_size)
+
+        def worker(local_idx: int) -> dict:
+            request_index = batch_start + local_idx
+            barrier.wait()
+            row = post_chat(url, model, users[request_index], max_tokens, timeout)
+            row["request_index"] = request_index
+            row["batch_index"] = batch_start // concurrency
+            return row
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as executor:
+            futures = [executor.submit(worker, idx) for idx in range(batch_size)]
+            for future in concurrent.futures.as_completed(futures):
+                rows.append(future.result())
+
+    rows.sort(key=lambda row: row["request_index"])
+    return {
+        "concurrency": concurrency,
+        "requests": requests,
+        "summary": summarize_rows(rows),
+        "requests_detail": rows,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--router-url", default=_env("ROUTER_URL", "http://127.0.0.1:30000"))
@@ -239,6 +312,23 @@ def main() -> None:
         choices=("miss", "hit"),
         default="",
         help="post one request only (wave). default is serial miss then hit",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="concurrent hit requests in the main wave",
+    )
+    parser.add_argument(
+        "--requests",
+        type=int,
+        default=0,
+        help="number of hit requests in the main wave; default is max(1, 2 * --concurrency)",
+    )
+    parser.add_argument(
+        "--warmup",
+        action="store_true",
+        help="first post a serial miss/hit pair before the concurrent hit wave",
     )
     args = parser.parse_args()
 
@@ -282,9 +372,26 @@ def main() -> None:
         row = post_chat(args.router_url, args.model, body, args.max_tokens, args.timeout)
         print(json.dumps({"once": args.once, "req": row}, indent=2))
         return
-    miss = post_chat(args.router_url, args.model, miss_user, args.max_tokens, args.timeout)
-    hit = post_chat(args.router_url, args.model, hit_user, args.max_tokens, args.timeout)
-    print(json.dumps({"miss": miss, "hit": hit}, indent=2))
+    if args.concurrency < 1:
+        raise SystemExit("--concurrency must be >= 1")
+    if args.requests < 0:
+        raise SystemExit("--requests must be >= 0")
+    result = {}
+    if args.warmup:
+        result["warmup"] = {
+            "miss": post_chat(args.router_url, args.model, miss_user, args.max_tokens, args.timeout),
+            "hit": post_chat(args.router_url, args.model, hit_user, args.max_tokens, args.timeout),
+        }
+    wave_requests = args.requests or max(1, 2 * args.concurrency)
+    result["wave"] = post_hit_wave(
+        args.router_url,
+        args.model,
+        make_wave_bodies(args.hit_rate, user, wave_requests),
+        args.max_tokens,
+        args.timeout,
+        args.concurrency,
+    )
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

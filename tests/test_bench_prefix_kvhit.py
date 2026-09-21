@@ -113,6 +113,38 @@ class PrefixKvhitSseTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 BENCH_PREFIX_KVHIT.post_chat(url, "model", "hello", 2, 2)
 
+    def test_hit_wave_runs_requests_concurrently(self):
+        usage = json.dumps(
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "total_tokens": 4,
+                },
+            }
+        )
+        events = [
+            (0.2, chunk("a")),
+            (0, chunk(finish_reason="stop")),
+            (0, usage),
+            (0, "[DONE]"),
+        ]
+        with sse_server(events) as url:
+            start = time.perf_counter()
+            result = BENCH_PREFIX_KVHIT.post_hit_wave(url, "model", ["hello"] * 4, 1, 2, 4)
+            elapsed = time.perf_counter() - start
+        self.assertEqual(result["concurrency"], 4)
+        self.assertEqual(result["requests"], 4)
+        self.assertEqual(result["summary"]["count"], 4)
+        self.assertLess(elapsed, 0.6)
+
+    def test_zero_hit_wave_bodies_are_unique(self):
+        bodies = BENCH_PREFIX_KVHIT.make_wave_bodies(0.0, "payload", 4)
+        self.assertEqual(len(bodies), 4)
+        self.assertEqual(len(set(bodies)), 4)
+        self.assertTrue(all(body.endswith(" payload") for body in bodies))
+
 
 if __name__ == "__main__":
     unittest.main()

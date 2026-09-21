@@ -102,42 +102,114 @@ export MODEL=/path/or/hf-id
 
 ## `bench_prefix_kvhit.py` benchmark client
 
-Client only: one miss POST then one hit POST to
-`/v1/chat/completions`. Defaults: `--hit-rate 0.99`, `--chars 8000`,
-`--max-tokens 16`.
+Client only: posts to `/v1/chat/completions` on an already-running router.
+By default it runs one concurrent wave. Pass `--warmup` to first send a serial
+miss/hit pair that primes prefix-cache state before the wave. Defaults:
+`--hit-rate 0.99`, `--chars 8000`, `--max-tokens 16`,
+`--concurrency 1`, and `--requests 2 * concurrency`.
 `tests/test_bench_prefix_kvhit.py` is the unit test for this client script; it
 does not test live prefix-cache behavior.
 
 | What | Flag | Env | Meaning |
 |---|---|---|---|
-| Shared-prefix fraction | `--hit-rate` | `HIT_RATE` | `0.99` same body twice; `0.30` shared prefix + unique tail; `0.00` unique tag on the second request |
+| Shared-prefix fraction | `--hit-rate` | `HIT_RATE` | `0.99` same body; `0.30` shared prefix + unique tail; `0.00` unique leading tag |
 | Body size (no tokenizer) | `--chars` | `KVHIT_CHARS` | synthetic user text length |
 | Exact input tokens | `--tokens` + `--model-dir` | `MODEL_DIR` | sizes via `transformers` chat template; `--tokens` requires a model dir |
 | Decode length | `--max-tokens` | | output tokens (`max_tokens` in the JSON) |
+| Wave concurrency | `--concurrency` | | simultaneous requests per batch |
+| Wave request count | `--requests` | | total requests in the wave; use `2 * C` for two batches at concurrency `C` |
+| Cache warmup | `--warmup` | | serial miss/hit before the concurrent wave |
 | Router | `--router-url` | `ROUTER_URL` | default `http://127.0.0.1:30000` |
 | Served name | `--model` | `MODEL` | request `model` field |
 | HTTP timeout | `--timeout` | | seconds (raise for long ISL) |
 
 ```bash
-export ROUTER_URL=http://127.0.0.1:30000
-export MODEL=/path/or/hf-id
-
 python scripts/backend/bench_prefix_kvhit.py \
+  --router-url http://127.0.0.1:30000 \
+  --model /path/or/hf-id \
   --hit-rate 0.99 \
-  --chars 8000 \
-  --max-tokens 16
+  --tokens 131072 \
+  --model-dir /path/or/hf-id \
+  --max-tokens 512 \
+  --warmup \
+  --concurrency 8 \
+  --requests 16 \
+  --timeout 1800
 
 python scripts/backend/bench_prefix_kvhit.py \
-  --hit-rate 0.30 \
+  --router-url http://127.0.0.1:30000 \
+  --model /path/or/hf-id \
+  --hit-rate 0.00 \
   --tokens 131072 \
-  --model-dir "$MODEL" \
+  --model-dir /path/or/hf-id \
   --max-tokens 512 \
+  --warmup \
+  --concurrency 8 \
+  --requests 16 \
   --timeout 1800
 ```
 
 `--max-num-seqs` lives on the **worker**, not here. For a concurrency-`C`
-wave, start the worker with `--max-num-seqs` ≥ `C` and run `C` clients
-yourself.
+wave, start the worker with `--max-num-seqs >= C`.
+
+Output is newline-delimited JSON: one metadata object, then the result object.
+The result has optional `warmup.miss` / `warmup.hit` rows and a `wave` object:
+
+```json
+{
+  "wave": {
+    "concurrency": 8,
+    "requests": 16,
+    "summary": {"ttft_ms": {"min": 0, "avg": 0, "max": 0}},
+    "requests_detail": [
+      {
+        "request_index": 0,
+        "batch_index": 0,
+        "ttft_ms": 0,
+        "e2e_ms": 0,
+        "tpot_ms": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "stages": "{}"
+      }
+    ]
+  }
+}
+```
+
+`requests_detail` contains one row per wave request. Use `summary` for a quick
+read, and `requests_detail` for p50/p90/p99, per-batch behavior, token counts,
+or router stage diagnostics. With `VLLM_ROUTER_STAGES=1`, `stages` may include
+`frontend_ms`, `xfer_ms`, and `engine_ms`; these are diagnostic
+boundary/residual clocks, not direct EngineCore or network telemetry.
+
+For 0% hit-rate waves, the client generates a unique leading tag for every
+wave request. This avoids accidentally measuring a warmed exact-prefix body.
+
+## `e2e_chat_correctness.py` live observation
+
+Client only: validates one short streaming chat request against one or more
+already-running routers. It checks HTTP/SSE completion, usage fields, non-empty
+text, and a configurable expected substring. When both `rust_grpc` and
+`rust_http` labels are present, their generated text must match exactly.
+
+```bash
+python scripts/backend/e2e_chat_correctness.py \
+  --case rust_grpc=http://127.0.0.1:13002 \
+  --case rust_http=http://127.0.0.1:13001 \
+  --case python_http=http://127.0.0.1:13003 \
+  --model /path/or/hf-id \
+  --max-tokens 20
+```
+
+Example result from a live Qwen run: all three paths produced the same text and
+the same SHA-256 hash:
+
+```text
+rust_grpc   93062e9c6fa82775bb048b9b00fb2f8d1e16949a2e9fecefa83ff877f83e55ea
+rust_http   93062e9c6fa82775bb048b9b00fb2f8d1e16949a2e9fecefa83ff877f83e55ea
+python_http 93062e9c6fa82775bb048b9b00fb2f8d1e16949a2e9fecefa83ff877f83e55ea
+```
 
 ## If the wheel has no `vllm-rs`
 
