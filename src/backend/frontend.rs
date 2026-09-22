@@ -5,7 +5,7 @@
 //! + detok). Policy stays outside this type.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::response::Response;
 
@@ -16,7 +16,7 @@ use crate::protocols::spec::ChatCompletionRequest;
 /// Tokenized chat ready for policy + `dispatch`.
 #[derive(Clone)]
 pub struct PreparedChat {
-    pub request: ChatCompletionRequest,
+    pub request: Arc<ChatCompletionRequest>,
     pub tokenized: TokenizeOut,
     pub handle: FrontendHandle,
     pub resolve_ms: f64,
@@ -51,6 +51,13 @@ impl EngineFrontend {
         }
     }
 
+    pub fn with_request_timeout(request_timeout: Duration) -> Self {
+        Self {
+            tokenizer: Arc::new(TokenizerCache::new()),
+            grpc: GrpcEngineBackend::with_timeouts(Duration::from_secs(10), request_timeout),
+        }
+    }
+
     /// Tests only: bypass model loading by returning these fake prompt ids.
     pub fn pin_test_token_ids(&self, token_ids: Vec<u32>) {
         self.tokenizer.pin_test_token_ids(token_ids);
@@ -79,7 +86,7 @@ impl EngineFrontend {
         let tokenized = tokenize_chat_request_timed(&request, &handle)
             .map_err(|e| format!("preprocess: {e}"))?;
         Ok(PreparedChat {
-            request,
+            request: Arc::new(request),
             tokenized,
             handle,
             resolve_ms,
@@ -92,7 +99,7 @@ impl EngineFrontend {
         self.grpc
             .dispatch_prepared(
                 worker_url,
-                &prepared.request,
+                prepared.request.as_ref(),
                 prepared.tokenized,
                 prepared.handle,
                 prepared.resolve_ms,

@@ -3,8 +3,9 @@
 //! `grpc://host:port` is rewritten to h2c `http://host:port` for tonic.
 //! That is still gRPC, not the worker's OpenAI `--port`. Optional
 //! `@dp_rank` suffix (`grpc://host:port@2`) is stripped before connect.
+//! `grpcs://` is rejected until tonic TLS is configured.
 //!
-//! A worker pool is all-`http(s)://` or all-`grpc(s)://`. Mixed schemes
+//! A worker pool is all-`http(s)://` or all-`grpc://`. Mixed schemes
 //! fail at init / `add_worker` (gRPC is `token_ids` only; HTTP proxies text).
 
 use crate::core::ConnectionMode;
@@ -18,13 +19,18 @@ pub enum WorkerPoolKind {
 
 /// True when the operator marked this worker as a vLLM rust gRPC endpoint.
 pub fn is_grpc_url(url: &str) -> bool {
-    url.starts_with("grpc://") || url.starts_with("grpcs://")
+    url.starts_with("grpc://")
 }
 
 /// Classify a worker URL list. Empty → `Ok(None)`. Mixed schemes → `Err`.
 pub fn classify_worker_urls(urls: &[String]) -> Result<Option<WorkerPoolKind>, String> {
     let mut kind: Option<WorkerPoolKind> = None;
     for url in urls {
+        if url.starts_with("grpcs://") {
+            return Err(format!(
+                "grpcs:// workers require tonic TLS support, which is not enabled yet: {url}"
+            ));
+        }
         let next = if is_grpc_url(url) {
             WorkerPoolKind::Grpc
         } else {
@@ -67,13 +73,15 @@ pub fn parse_dp_rank(url: &str) -> Option<u32> {
         .and_then(|(_, rank)| rank.parse::<u32>().ok())
 }
 
-/// Tonic connect URI (`http://host:port` or `https://host:port`).
+/// Tonic connect URI (`http://host:port` h2c).
 pub fn grpc_connect_uri(url: &str) -> Result<String, String> {
     let base = strip_dp_suffix(url);
     if let Some(rest) = base.strip_prefix("grpc://") {
         Ok(format!("http://{rest}"))
     } else if let Some(rest) = base.strip_prefix("grpcs://") {
-        Ok(format!("https://{rest}"))
+        Err(format!(
+            "grpcs:// workers require tonic TLS support, which is not enabled yet: {rest}"
+        ))
     } else {
         Err(format!("not a grpc worker URL: {url}"))
     }
@@ -95,7 +103,7 @@ mod tests {
     #[test]
     fn detects_explicit_grpc_scheme() {
         assert!(is_grpc_url("grpc://127.0.0.1:50051"));
-        assert!(is_grpc_url("grpcs://worker:50051"));
+        assert!(!is_grpc_url("grpcs://worker:50051"));
         assert!(!is_grpc_url("http://127.0.0.1:8000"));
         assert!(!is_grpc_url("https://127.0.0.1:8000"));
     }
@@ -124,6 +132,7 @@ mod tests {
             grpc_socket_addr("grpc://127.0.0.1:50051").unwrap(),
             "127.0.0.1:50051"
         );
+        assert!(grpc_connect_uri("grpcs://127.0.0.1:50051").is_err());
     }
 
     #[test]
@@ -149,5 +158,11 @@ mod tests {
             classify_worker_urls(&["http://a:8000".into(), "grpc://a:50051".into()]).unwrap_err();
         assert!(err.contains("mixed"));
         assert!(err.contains("grpc://a:50051"));
+    }
+
+    #[test]
+    fn rejects_grpcs_until_tls_is_enabled() {
+        let err = classify_worker_urls(&["grpcs://a:50051".into()]).unwrap_err();
+        assert!(err.contains("grpcs:// workers require tonic TLS"));
     }
 }

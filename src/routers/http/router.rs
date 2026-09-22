@@ -288,7 +288,9 @@ impl Router {
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
             health_config,
-            frontend: crate::backend::EngineFrontend::from_env(),
+            frontend: crate::backend::EngineFrontend::with_request_timeout(Duration::from_secs(
+                ctx.router_config.request_timeout_secs,
+            )),
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
         })

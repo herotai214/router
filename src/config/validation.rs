@@ -501,14 +501,14 @@ impl ConfigValidator {
 
             let scheme_ok = url.starts_with("http://")
                 || url.starts_with("https://")
-                || url.starts_with("grpc://")
-                || url.starts_with("grpcs://");
+                || url.starts_with("grpc://");
             if !scheme_ok {
                 return Err(ConfigError::InvalidValue {
                     field: "worker_url".to_string(),
                     value: url.clone(),
-                    reason: "URL must start with http://, https://, grpc://, or grpcs://"
-                        .to_string(),
+                    reason:
+                        "URL must start with http://, https://, or grpc://; grpcs:// requires tonic TLS support and is not enabled yet"
+                            .to_string(),
                 });
             }
 
@@ -604,6 +604,19 @@ mod tests {
         );
 
         assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_grpcs_until_tls_is_enabled() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["grpcs://worker:50051".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+
+        let err = ConfigValidator::validate(&config).unwrap_err();
+        assert!(err.to_string().contains("grpcs:// requires tonic TLS"));
     }
 
     #[test]

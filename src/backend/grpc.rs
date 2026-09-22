@@ -63,6 +63,7 @@ fn grpc_status_code(status: &tonic::Status) -> StatusCode {
 pub struct GrpcEngineBackend {
     clients: Arc<DashMap<String, InferenceClient<Channel>>>,
     connect_timeout: Duration,
+    request_timeout: Duration,
 }
 
 impl std::fmt::Debug for GrpcEngineBackend {
@@ -81,13 +82,18 @@ impl Default for GrpcEngineBackend {
 
 impl GrpcEngineBackend {
     pub fn new() -> Self {
-        Self::with_connect_timeout(Duration::from_secs(10))
+        Self::with_timeouts(Duration::from_secs(10), Duration::from_secs(1800))
     }
 
     pub fn with_connect_timeout(connect_timeout: Duration) -> Self {
+        Self::with_timeouts(connect_timeout, Duration::from_secs(1800))
+    }
+
+    pub fn with_timeouts(connect_timeout: Duration, request_timeout: Duration) -> Self {
         Self {
             clients: Arc::new(DashMap::new()),
             connect_timeout,
+            request_timeout,
         }
     }
 
@@ -129,12 +135,12 @@ impl GrpcEngineBackend {
         let skip_special = request.skip_special_tokens;
         let detok_tokenizer = handle.tokenizer();
         let detok_prompt_ids = tokenized.token_ids.clone();
-        let proto = match chat_to_generate_request(request, tokenized.token_ids, request_id.clone())
-        {
+        let proto = match chat_to_generate_request(
+            request,
+            tokenized.token_ids.as_ref().to_vec(),
+            request_id.clone(),
+        ) {
             Ok(proto) => proto,
-            Err(error) if error.contains("not supported by the vLLM gRPC protocol") => {
-                return (StatusCode::NOT_IMPLEMENTED, error).into_response();
-            }
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         };
 
@@ -149,6 +155,7 @@ impl GrpcEngineBackend {
         let grpc_connect_ms = t_connect.elapsed().as_secs_f64() * 1000.0;
 
         let mut tonic_req = tonic::Request::new(proto);
+        tonic_req.set_timeout(self.request_timeout);
         if let Some(rank) = parse_dp_rank(worker_url) {
             tonic_req
                 .metadata_mut()
@@ -156,17 +163,27 @@ impl GrpcEngineBackend {
         }
 
         let t_invoke = Instant::now();
-        let stream = match client.generate_stream(tonic_req).await {
-            Ok(s) => s.into_inner(),
-            Err(status) => {
-                warn!(code = ?status.code(), msg = %status.message(), "GenerateStream failed");
-                return (
-                    grpc_status_code(&status),
-                    format!("grpc GenerateStream: {}", status.message()),
-                )
-                    .into_response();
-            }
-        };
+        let stream =
+            match tokio::time::timeout(self.request_timeout, client.generate_stream(tonic_req))
+                .await
+            {
+                Ok(Ok(s)) => s.into_inner(),
+                Ok(Err(status)) => {
+                    warn!(code = ?status.code(), msg = %status.message(), "GenerateStream failed");
+                    return (
+                        grpc_status_code(&status),
+                        format!("grpc GenerateStream: {}", status.message()),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "grpc GenerateStream exceeded request timeout",
+                    )
+                        .into_response();
+                }
+            };
         let grpc_invoke_ms = t_invoke.elapsed().as_secs_f64() * 1000.0;
 
         let xfer_ms = grpc_connect_ms + grpc_invoke_ms;
@@ -217,7 +234,7 @@ struct ChatReply {
     model: String,
     created: u64,
     tok: Option<DynTokenizer>,
-    prompt_ids: Vec<u32>,
+    prompt_ids: Arc<[u32]>,
     skip_special: bool,
     prefer_worker_text: bool,
     include_usage: bool,
@@ -269,7 +286,7 @@ async fn stream_openai(
     let producer = tokio::spawn(async move {
         let mut detok = tok
             .as_ref()
-            .map(|t| decode_stream(&**t, &prompt_ids, skip_special));
+            .map(|t| decode_stream(&**t, prompt_ids.as_ref(), skip_special));
         let mut first = true;
         let mut first_token_logged = false;
         let mut prompt_tokens = n_prompt_tokens as u32;
@@ -388,7 +405,7 @@ async fn collect_openai(
     } = reply;
     let mut detok = tok
         .as_ref()
-        .map(|t| decode_stream(&**t, &prompt_ids, skip_special));
+        .map(|t| decode_stream(&**t, prompt_ids.as_ref(), skip_special));
     let mut text = String::new();
     let mut finish = None;
     let mut prompt_tokens = prompt_ids.len() as u32;

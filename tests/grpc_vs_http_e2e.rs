@@ -175,6 +175,51 @@ async fn system_grpc_chat_sends_token_ids_not_messages() {
 }
 
 #[tokio::test]
+async fn grpc_top_k_minus_one_is_client_error_without_worker_call() {
+    let grpc = MockVllmRsServer::spawn().await;
+    let config = test_config(vec![grpc.grpc_url.clone()]);
+    let ctx = create_test_context(config.clone());
+    let router = Router::new(vec![grpc.grpc_url.clone()], &ctx)
+        .await
+        .expect("grpc worker should pass grpc.health.v1");
+    router.pin_test_token_ids(vec![1, 2, 3]);
+
+    let app = create_test_app(Arc::new(router), reqwest::Client::new(), &config);
+    let body = json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello world"}],
+        "max_tokens": 8,
+        "top_k": -1,
+        "stream": false
+    });
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    let body = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("top_k=-1"), "{body}");
+    assert!(
+        grpc.captured().is_empty(),
+        "conversion failure must not call the worker"
+    );
+}
+
+#[tokio::test]
 async fn e2e_http_forwards_messages_grpc_forwards_token_ids() {
     let (http_url, http_bodies) = capturing_http_worker().await;
     let grpc = MockVllmRsServer::spawn().await;

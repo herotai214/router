@@ -156,7 +156,7 @@ impl FrontendHandle {
 
 #[derive(Debug, Clone)]
 pub struct TokenizeOut {
-    pub token_ids: Vec<u32>,
+    pub token_ids: Arc<[u32]>,
     pub adapt_ms: f64,
     pub template_ms: f64,
     pub encode_ms: f64,
@@ -179,7 +179,7 @@ pub fn tokenize_chat_request_timed(
                 return Err(anyhow!("pinned test token_ids are empty"));
             }
             Ok(TokenizeOut {
-                token_ids: ids.clone(),
+                token_ids: Arc::from(ids.clone()),
                 adapt_ms: 0.0,
                 template_ms: 0.0,
                 encode_ms: 0.0,
@@ -282,7 +282,7 @@ fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Re
         return Err(anyhow!("vllm-chat produced empty token_ids"));
     }
     Ok(TokenizeOut {
-        token_ids,
+        token_ids: Arc::from(token_ids),
         adapt_ms,
         template_ms,
         encode_ms,
@@ -489,12 +489,18 @@ mod tests {
                 out.status
             ));
         }
-        serde_json::from_slice(&out.stdout).map(Some).map_err(|e| {
-            format!(
-                "python stdout not a json id list: {e}; stdout={}",
-                String::from_utf8_lossy(&out.stdout)
-            )
-        })
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let ids = serde_json::from_slice(&out.stdout).or_else(|first_error| {
+            stdout
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| line.starts_with('['))
+                .ok_or(first_error)
+                .and_then(|line| serde_json::from_str(line))
+        });
+        ids.map(Some)
+            .map_err(|e| format!("python stdout not a json id list: {e}; stdout={}", stdout))
     }
 
     async fn rust_vllm_chat_ids(model: &str, messages: serde_json::Value) -> Vec<u32> {
@@ -511,6 +517,7 @@ mod tests {
         tokenize_vllm(&req, &frontend)
             .expect("vllm-chat tokenize")
             .token_ids
+            .to_vec()
     }
 
     #[test]
