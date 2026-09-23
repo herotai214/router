@@ -44,13 +44,6 @@ impl EngineFrontend {
         }
     }
 
-    pub fn from_env() -> Self {
-        Self {
-            tokenizer: Arc::new(TokenizerCache::new()),
-            grpc: GrpcEngineBackend::new(),
-        }
-    }
-
     pub fn with_request_timeout(request_timeout: Duration) -> Self {
         Self {
             tokenizer: Arc::new(TokenizerCache::new()),
@@ -106,5 +99,9 @@ impl EngineFrontend {
                 prepared.t_req,
             )
             .await
+    }
+
+    pub fn remove_worker(&self, worker_url: &str) {
+        self.grpc.remove_client(worker_url);
     }
 }

@@ -497,7 +497,7 @@ mod tests {
                 .map(str::trim)
                 .find(|line| line.starts_with('['))
                 .ok_or(first_error)
-                .and_then(|line| serde_json::from_str(line))
+                .and_then(serde_json::from_str)
         });
         ids.map(Some)
             .map_err(|e| format!("python stdout not a json id list: {e}; stdout={}", stdout))

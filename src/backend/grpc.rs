@@ -113,6 +113,12 @@ impl GrpcEngineBackend {
         Ok(client)
     }
 
+    pub fn remove_client(&self, worker_url: &str) {
+        if let Ok(uri) = grpc_connect_uri(worker_url) {
+            self.clients.remove(&uri);
+        }
+    }
+
     pub async fn dispatch_prepared(
         &self,
         worker_url: &str,
@@ -214,6 +220,7 @@ impl GrpcEngineBackend {
                 .as_ref()
                 .and_then(|options| options.include_usage)
                 .unwrap_or(false),
+            request_timeout: self.request_timeout,
             stages,
             t_req,
         };
@@ -238,6 +245,7 @@ struct ChatReply {
     skip_special: bool,
     prefer_worker_text: bool,
     include_usage: bool,
+    request_timeout: Duration,
     stages: serde_json::Value,
     t_req: Instant,
 }
@@ -277,6 +285,7 @@ async fn stream_openai(
         skip_special,
         prefer_worker_text,
         include_usage,
+        request_timeout,
         mut stages,
         t_req,
     } = reply;
@@ -291,7 +300,18 @@ async fn stream_openai(
         let mut first_token_logged = false;
         let mut prompt_tokens = n_prompt_tokens as u32;
         let mut completion_tokens = 0u32;
-        while let Some(item) = stream.next().await {
+        loop {
+            let item = match tokio::time::timeout(request_timeout, stream.next()).await {
+                Ok(Some(item)) => item,
+                Ok(None) => break,
+                Err(_) => {
+                    let _ = tx.send(Ok(
+                        "data: {\"error\":\"gRPC stream exceeded request timeout\"}\n\n"
+                            .to_string(),
+                    ));
+                    return;
+                }
+            };
             match item {
                 Ok(msg) => {
                     if stages.get("first_grpc_msg_ms").is_none() {
@@ -400,6 +420,7 @@ async fn collect_openai(
         skip_special,
         prefer_worker_text,
         include_usage: _,
+        request_timeout,
         mut stages,
         t_req,
     } = reply;
@@ -410,7 +431,18 @@ async fn collect_openai(
     let mut finish = None;
     let mut prompt_tokens = prompt_ids.len() as u32;
     let mut completion_tokens = 0u32;
-    while let Some(item) = stream.next().await {
+    loop {
+        let item = match tokio::time::timeout(request_timeout, stream.next()).await {
+            Ok(Some(item)) => item,
+            Ok(None) => break,
+            Err(_) => {
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "gRPC stream exceeded request timeout",
+                )
+                    .into_response();
+            }
+        };
         match item {
             Ok(msg) => {
                 if stages.get("first_grpc_msg_ms").is_none() {

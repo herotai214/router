@@ -102,11 +102,16 @@ pub fn chat_to_generate_request(
     };
     decoding.structured_output = structured_output(request)?;
 
-    if request.top_k == Some(-1) {
-        return Err(
-            "top_k=-1 is not supported by the vLLM gRPC protocol; omit top_k or use a positive value"
-                .to_string(),
-        );
+    if let Some(top_k) = request.top_k {
+        if top_k == -1 {
+            return Err(
+                "top_k=-1 is not supported by the vLLM gRPC protocol; omit top_k or use a positive value"
+                    .to_string(),
+            );
+        }
+        if top_k < 0 {
+            return Err("top_k must be positive for the vLLM gRPC protocol".to_string());
+        }
     }
 
     Ok(pb::GenerateRequest {
@@ -344,12 +349,10 @@ mod tests {
 
     #[test]
     fn missing_model_stays_empty_on_grpc_wire() {
-        std::env::set_var("VLLM_ROUTER_MODEL", "/tmp/local-tokenizer-assets");
         let req = chat(serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}]
         }));
         let proto = chat_to_generate_request(&req, vec![1], "r".into()).unwrap();
-        std::env::remove_var("VLLM_ROUTER_MODEL");
         assert_eq!(proto.model, "");
     }
 
@@ -361,6 +364,13 @@ mod tests {
         }));
         let err = chat_to_generate_request(&req, vec![1], "r".into()).unwrap_err();
         assert!(err.contains("top_k=-1"));
+
+        let req = chat(serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_k": -2
+        }));
+        let err = chat_to_generate_request(&req, vec![1], "r".into()).unwrap_err();
+        assert!(err.contains("top_k must be positive"));
     }
 
     #[test]

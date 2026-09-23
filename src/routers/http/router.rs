@@ -718,7 +718,13 @@ impl Router {
             match self.frontend.prepare(chat).await {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    return (StatusCode::BAD_REQUEST, e).into_response();
+                    let status =
+                        if e.starts_with("tokenizer:") || e.starts_with("sampling defaults:") {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        };
+                    return (status, e).into_response();
                 }
             }
         } else {
@@ -960,11 +966,12 @@ impl Router {
             prepared,
         } = dispatch;
         if crate::backend::is_grpc_url(worker_url) {
-            // This-version router 501: gRPC path is chat-only. Not a missing
-            // upstream RPC; http:// workers still proxy other routes.
+            // gRPC workers are chat-only in this milestone. Reject unsupported
+            // client routes as request errors so healthy workers are not
+            // penalized by circuit-breaker accounting.
             if route != "/v1/chat/completions" {
                 return (
-                    StatusCode::NOT_IMPLEMENTED,
+                    StatusCode::BAD_REQUEST,
                     format!("gRPC backend currently supports /v1/chat/completions, not {route}"),
                 )
                     .into_response();
@@ -1418,12 +1425,14 @@ impl Router {
             let all_workers = self.worker_registry.get_all();
             for w in all_workers.iter() {
                 if w.url().starts_with(&worker_url_prefix) {
+                    let removed_url = w.url().to_string();
                     // Get model_id before removing
                     let model_id = w.model_id().to_string();
 
-                    if self.worker_registry.remove_by_url(w.url()).is_some() {
-                        info!("Removed worker: {}", w.url());
-                        removed_workers.push(w.url().to_string());
+                    if self.worker_registry.remove_by_url(&removed_url).is_some() {
+                        self.frontend.remove_worker(&removed_url);
+                        info!("Removed worker: {}", removed_url);
+                        removed_workers.push(removed_url);
 
                         // Notify PolicyRegistry about the removed worker
                         self.policy_registry.on_worker_removed(&model_id);
@@ -1461,6 +1470,7 @@ impl Router {
             };
 
             if self.worker_registry.remove_by_url(worker_url).is_some() {
+                self.frontend.remove_worker(worker_url);
                 info!("Removed worker: {}", worker_url);
 
                 // Notify PolicyRegistry about the removed worker
