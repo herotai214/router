@@ -2,7 +2,8 @@
 
 vLLM 0.29 worker + this rust router. These scripts do not set Slurm,
 Docker, or device IDs. Engine knobs (`--max-num-seqs`, …) are **worker
-CLI flags**, not router flags. `bench_prefix_kvhit.py` does not start engines.
+CLI flags**, not router flags. `benches/backend/bench_prefix_kvhit.py`
+does not start engines.
 
 Optional env: `HOST`, `WORKER_PORT`, `GRPC_PORT`, `ROUTER_PORT`,
 `ROUTER_BIN`, `VLLM_RS`, `VLLM_ROUTER_MODEL`, `VLLM_ROUTER_TOKENIZER`.
@@ -67,8 +68,8 @@ Worker flags we actually tune in tests (forwarded to EngineCore):
 | `--gpu-memory-utilization` | KV / weight budget |
 | `--enable-prefix-caching` | Second request can KV-hit |
 
-These are **not** in `bench_prefix_kvhit.py`. HTTP launchers take them as extra
-args; gRPC needs `--` first (see below).
+These are **not** in `benches/backend/bench_prefix_kvhit.py`. HTTP launchers
+take them as extra args; gRPC needs `--` first (see below).
 
 ## Wrapper scripts
 
@@ -100,7 +101,7 @@ export MODEL=/path/or/hf-id
   --enable-prefix-caching
 ```
 
-## `bench_prefix_kvhit.py` benchmark client
+## `benches/backend/bench_prefix_kvhit.py` benchmark client
 
 Client only: posts to `/v1/chat/completions` on an already-running router.
 By default it runs one concurrent wave. Pass `--warmup` to first send a serial
@@ -124,7 +125,7 @@ does not test live prefix-cache behavior.
 | HTTP timeout | `--timeout` | | seconds (raise for long ISL) |
 
 ```bash
-python scripts/backend/bench_prefix_kvhit.py \
+python benches/backend/bench_prefix_kvhit.py \
   --router-url http://127.0.0.1:30000 \
   --model /path/or/hf-id \
   --hit-rate 0.99 \
@@ -136,7 +137,7 @@ python scripts/backend/bench_prefix_kvhit.py \
   --requests 16 \
   --timeout 1800
 
-python scripts/backend/bench_prefix_kvhit.py \
+python benches/backend/bench_prefix_kvhit.py \
   --router-url http://127.0.0.1:30000 \
   --model /path/or/hf-id \
   --hit-rate 0.00 \

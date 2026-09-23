@@ -1,6 +1,6 @@
 //! Switchable worker backends.
 //!
-//! Worker pool is all-`http(s)://` or all-`grpc(s)://`. Mixed schemes fail
+//! Worker pool is all-`http(s)://` or all-`grpc://`. Mixed schemes fail
 //! at init / `add_worker` (gRPC is `token_ids` only).
 //!
 //! - All-HTTP: policy selects, then `router.rs` reverse-proxies OpenAI JSON

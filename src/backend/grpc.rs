@@ -1,7 +1,7 @@
 //! tonic client for vLLM rust `Inference.GenerateStream`.
 //!
 //! Tokenize on the router, send `token_ids`, detok the returned ids.
-//! Does not talk ZMQ. Channel cache is per connect URI.
+//! Channel cache is per connect URI.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

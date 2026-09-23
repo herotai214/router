@@ -3,12 +3,12 @@
 
 Does not start engines or talk to Slurm/Docker. Point
 ``ROUTER_URL`` at a live OpenAI ``/v1/chat/completions`` endpoint (the
-router, or a worker). Pair with one of the serve_*.sh scripts in this
-directory.
+router, or a worker). Pair with one of the serve_*.sh scripts under
+scripts/backend.
 
   export ROUTER_URL=http://127.0.0.1:30000
   export MODEL=my-served-model
-  python scripts/backend/bench_prefix_kvhit.py
+  python benches/backend/bench_prefix_kvhit.py
 
 By default the script writes a short synthetic chat body into a temp
 file (repeated paragraph; no tokenizer required). Pass ``--tokens N``

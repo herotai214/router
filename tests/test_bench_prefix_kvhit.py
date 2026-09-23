@@ -1,7 +1,7 @@
 """Unit tests for the prefix-KV-hit benchmark client.
 
 This file does not validate vLLM prefix-cache behavior and does not start a
-router or worker. It tests `scripts/backend/bench_prefix_kvhit.py` itself: SSE
+router or worker. It tests `benches/backend/bench_prefix_kvhit.py` itself: SSE
 parsing, error handling, completion validation, and TPOT timing boundaries. The
 live prefix-cache check is the benchmark client script against a running router.
 """
@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).parents[1] / "scripts" / "backend" / "bench_prefix_kvhit.py"
+SCRIPT = Path(__file__).parents[1] / "benches" / "backend" / "bench_prefix_kvhit.py"
 SPEC = importlib.util.spec_from_file_location("bench_prefix_kvhit", SCRIPT)
 assert SPEC and SPEC.loader
 BENCH_PREFIX_KVHIT = importlib.util.module_from_spec(SPEC)

@@ -112,7 +112,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 30000)]
     port: u16,
 
-    /// List of worker URLs (`http(s)://` reverse-proxy, or `grpc(s)://` Inference)
+    /// List of worker URLs (`http(s)://` reverse-proxy, or `grpc://` Inference)
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 

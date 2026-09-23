@@ -140,7 +140,7 @@ pub enum ConnectionMode {
 pub enum RoutingMode {
     #[serde(rename = "regular")]
     Regular {
-        /// Worker URLs: `http(s)://` or `grpc(s)://`
+        /// Worker URLs: `http(s)://` or `grpc://`
         worker_urls: Vec<String>,
     },
     #[serde(rename = "openai")]
