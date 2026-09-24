@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::backend::pb;
 use crate::protocols::spec::{
     ChatChoice, ChatCompletionResponse, ChatCompletionStreamResponse, ChatMessage,
-    ChatMessageDelta, ChatStreamChoice, Usage,
+    ChatMessageDelta, ChatStreamChoice, Usage, UserMessageContent,
 };
 
 pub fn now_secs() -> u64 {
@@ -102,7 +102,7 @@ pub fn final_response(
             index: 0,
             message: ChatMessage::Assistant {
                 role: "assistant".to_string(),
-                content: Some(text),
+                content: Some(UserMessageContent::Text(text)),
                 name: None,
                 tool_calls: None,
                 function_call: None,

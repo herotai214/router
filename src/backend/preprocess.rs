@@ -297,7 +297,7 @@ fn spec_messages_to_upstream(
         .iter()
         .map(|message| {
             Ok(match message {
-                SpecChatMessage::System { content, .. } => system_text(content),
+                SpecChatMessage::System { content, .. } => system_text(user_content_text(content)?),
                 SpecChatMessage::User { content, .. } => user_text(user_content_text(content)?),
                 SpecChatMessage::Assistant {
                     content,
@@ -313,7 +313,7 @@ fn spec_messages_to_upstream(
                     }
                     if let Some(content) = content {
                         blocks.push(AssistantContentBlock::Text {
-                            text: content.clone(),
+                            text: user_content_text(content)?,
                         });
                     }
                     if let Some(tool_calls) = tool_calls {
