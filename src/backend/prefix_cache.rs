@@ -15,16 +15,19 @@
 //! remaining text after the matched boundary is encoded, one segment per
 //! boundary, and the new boundaries are inserted back into the tree.
 //!
-//! An added token is a boundary only when no added-token match can start
-//! before it and reach into it, and it has no strip/word/normalized flags.
-//! A load-time probe compares split and unsplit encodes for each candidate
-//! in synthetic contexts and drops any candidate that disagrees.
+//! Cut positions come from an automaton over all added tokens that matches
+//! like the tokenizer's added-token split. A token is a boundary only when
+//! no longer added token can contain it (see [`boundary_rejections`]) and it
+//! has no strip/word flags. A load-time probe compares split and unsplit
+//! encodes for each candidate in synthetic contexts and drops any candidate
+//! that disagrees.
 //!
 //! Not covered yet: multimodal placeholders (the gRPC path is text-only),
 //! tiktoken/tekken tokenizers, boundaries inside messages, and HTTP workers.
 
+use std::cmp::Reverse;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -108,9 +111,23 @@ pub(crate) struct AddedTokenSpec {
     pub normalized: bool,
 }
 
-/// Finds boundary positions (byte offsets right after a boundary token).
+/// A model's added tokens and whether its normalizer leaves text unchanged.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AddedTokenSet {
+    pub tokens: Vec<AddedTokenSpec>,
+    pub identity_normalizer: bool,
+}
+
+/// Finds cut positions: byte offsets right after a boundary token.
+///
+/// The automaton holds every added token and matches leftmost-longest like
+/// the tokenizer's added-token split, so a boundary only counts where the
+/// tokenizer itself splits it out.
 pub(crate) struct BoundaryMatcher {
     automaton: AhoCorasick,
+    patterns: Vec<String>,
+    /// Per pattern: whether a cut follows it.
+    cut: Vec<bool>,
     tokens: Vec<String>,
 }
 
@@ -123,40 +140,59 @@ impl std::fmt::Debug for BoundaryMatcher {
 }
 
 impl BoundaryMatcher {
-    pub(crate) fn new(added: &[AddedTokenSpec]) -> Result<Self> {
-        let all: Vec<&str> = added
+    pub(crate) fn new(added: &AddedTokenSet) -> Result<Self> {
+        let mut tokens = Vec::new();
+        for (token, rejection) in added.tokens.iter().zip(boundary_rejections(added)) {
+            match rejection {
+                None => tokens.push(token.content.clone()),
+                Some(reason) => {
+                    tracing::debug!(token = %token.content, reason, "not an L1 boundary")
+                }
+            }
+        }
+        let patterns = added
+            .tokens
             .iter()
-            .map(|token| token.content.as_str())
-            .filter(|content| !content.is_empty())
-            .collect();
-        let tokens = added
-            .iter()
-            .filter(|token| is_boundary_token(token, &all))
+            .filter(|token| !token.content.is_empty())
             .map(|token| token.content.clone())
             .collect();
-        Self::from_tokens(tokens)
+        Self::build(patterns, tokens)
     }
 
-    fn from_tokens(mut tokens: Vec<String>) -> Result<Self> {
+    fn build(mut patterns: Vec<String>, mut tokens: Vec<String>) -> Result<Self> {
         tokens.sort();
         tokens.dedup();
         if tokens.is_empty() {
             bail!("no added token is a safe encoding boundary");
         }
-        // Boundary tokens never overlap, so the match kind only matters for
-        // speed; it mirrors the tokenizer's added-token matcher anyway.
+        patterns.sort();
+        patterns.dedup();
+        let cut = patterns
+            .iter()
+            .map(|pattern| tokens.binary_search(pattern).is_ok())
+            .collect();
         let automaton = AhoCorasick::builder()
             .match_kind(MatchKind::LeftmostLongest)
-            .build(&tokens)?;
-        Ok(Self { automaton, tokens })
+            .build(&patterns)?;
+        Ok(Self {
+            automaton,
+            patterns,
+            cut,
+            tokens,
+        })
     }
 
     pub(crate) fn tokens(&self) -> &[String] {
         &self.tokens
     }
 
+    /// Cut positions in `text`, which must itself start at a cut position.
     pub(crate) fn boundaries(&self, text: &str) -> Vec<usize> {
-        self.automaton.find_iter(text).map(|m| m.end()).collect()
+        self.automaton
+            .find_iter(text)
+            .filter(|m| self.cut[m.pattern().as_usize()])
+            .map(|m| m.end())
+            .collect()
     }
 
     /// Keep only boundaries for which splitting gives the same IDs as a full
@@ -192,24 +228,95 @@ impl BoundaryMatcher {
             }
             kept.push(token.clone());
         }
-        Self::from_tokens(kept)
+        Self::build(self.patterns, kept)
     }
 }
 
-fn is_boundary_token(token: &AddedTokenSpec, all: &[&str]) -> bool {
-    let t = token.content.as_str();
-    if t.is_empty() || token.lstrip || token.rstrip || token.single_word || token.normalized {
-        return false;
+/// Why each added token cannot be a boundary (`None` if it can).
+///
+/// fastokens matches all added tokens in one leftmost-longest pass; Hugging
+/// Face matches non-normalized tokens first and normalized ones after
+/// normalization. When no token of one group can overlap a token of the
+/// other, both split exactly like [`BoundaryMatcher`]. Then a cut after `t`
+/// only fails if a longer added token contains `t` before its end: it can
+/// win in `P + S` but does not fit in `P`. Otherwise no added token may
+/// overlap `t` at all.
+pub(crate) fn boundary_rejections(added: &AddedTokenSet) -> Vec<Option<&'static str>> {
+    let contents: Vec<&str> = added
+        .tokens
+        .iter()
+        .map(|token| token.content.as_str())
+        .filter(|content| !content.is_empty())
+        .collect();
+    let (normalized, raw): (Vec<&AddedTokenSpec>, Vec<&AddedTokenSpec>) =
+        added.tokens.iter().partition(|token| token.normalized);
+    let separate = normalized
+        .iter()
+        .all(|y| raw.iter().all(|x| !overlaps(&x.content, &y.content)));
+    let covered = covered_tokens(&contents);
+    let any_single_word = added.tokens.iter().any(|token| token.single_word);
+    let rejection = |token: &AddedTokenSpec| {
+        let t = token.content.as_str();
+        if t.is_empty() {
+            return Some("empty");
+        }
+        if token.rstrip {
+            return Some("rstrip absorbs whitespace after the cut");
+        }
+        if token.single_word {
+            return Some("single_word depends on the next character");
+        }
+        if token.lstrip {
+            return Some("lstrip (excluded conservatively)");
+        }
+        if token.normalized && !added.identity_normalizer {
+            return Some("normalized and the normalizer changes text");
+        }
+        if token.normalized && !separate {
+            return Some("normalized tokens overlap non-normalized ones");
+        }
+        // Strip flags on neighbouring tokens absorb adjacent whitespace.
+        if t.starts_with(char::is_whitespace) || t.ends_with(char::is_whitespace) {
+            return Some("starts or ends with whitespace");
+        }
+        // A single_word token right after the cut sees `t`'s last character
+        // in `P + S` but the start of input in `S`.
+        if any_single_word && t.ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+            return Some("a single_word token could follow");
+        }
+        if covered.contains(t) {
+            return Some("a longer added token contains it");
+        }
+        if !separate
+            && (char_offsets(t).any(|k| t.starts_with(&t[k..]))
+                || contents.iter().any(|&x| x != t && reaches_into(x, t)))
+        {
+            return Some("another added token can overlap it");
+        }
+        None
+    };
+    added.tokens.iter().map(rejection).collect()
+}
+
+/// Tokens that occur inside another added token, ending before its end.
+fn covered_tokens<'a>(contents: &[&'a str]) -> HashSet<&'a str> {
+    let Ok(automaton) = AhoCorasick::new(contents) else {
+        return contents.iter().copied().collect();
+    };
+    let mut covered = HashSet::new();
+    for x in contents {
+        for m in automaton.find_overlapping_iter(x) {
+            if m.end() < x.len() {
+                covered.insert(contents[m.pattern().as_usize()]);
+            }
+        }
     }
-    // Strip flags on neighbouring tokens absorb adjacent whitespace.
-    if t.starts_with(char::is_whitespace) || t.ends_with(char::is_whitespace) {
-        return false;
-    }
-    // A self-overlapping token ("aa") can match at a shifted position.
-    if char_offsets(t).any(|k| t.starts_with(&t[k..])) {
-        return false;
-    }
-    all.iter().all(|&x| x == t || !reaches_into(x, t))
+    covered
+}
+
+/// Whether occurrences of `a` and `b` can overlap in some text.
+fn overlaps(a: &str, b: &str) -> bool {
+    a == b || reaches_into(a, b) || reaches_into(b, a)
 }
 
 /// Whether a match of `x` can start before an occurrence of `t` and reach
@@ -231,6 +338,11 @@ fn char_offsets(s: &str) -> impl Iterator<Item = usize> + '_ {
 /// Build a boundary matcher from the model's tokenizer files, or explain why
 /// L1 cannot be used for it.
 pub(crate) async fn load_boundary_matcher(model: &str) -> Result<BoundaryMatcher> {
+    BoundaryMatcher::new(&load_added_tokens(model).await?)
+}
+
+/// Added tokens as vllm-tokenizer sees them, after config checks.
+pub(crate) async fn load_added_tokens(model: &str) -> Result<AddedTokenSet> {
     let files = ResolvedModelFiles::new(model).await?;
     let TokenizerSource::HuggingFace(path) = files.tokenizer else {
         bail!("L1 supports tokenizer.json models only");
@@ -255,7 +367,20 @@ pub(crate) async fn load_boundary_matcher(model: &str) -> Result<BoundaryMatcher
             added.extend(added_tokens(&config["added_tokens_decoder"], Some(&known)));
         }
     }
-    BoundaryMatcher::new(&added)
+    Ok(AddedTokenSet {
+        tokens: added,
+        identity_normalizer: is_identity_normalizer(&json["normalizer"]),
+    })
+}
+
+fn is_identity_normalizer(normalizer: &Value) -> bool {
+    match normalizer["type"].as_str() {
+        None => normalizer.is_null(),
+        Some("Sequence") => normalizer["normalizers"]
+            .as_array()
+            .is_some_and(|steps| steps.iter().all(is_identity_normalizer)),
+        _ => false,
+    }
 }
 
 fn check_tokenizer_json(json: &Value) -> Result<()> {
@@ -475,6 +600,12 @@ impl Tree {
             };
             let edge = self.node(child);
             let rest = &text.as_bytes()[offset..];
+            if rest.starts_with(edge.text.as_bytes()) {
+                steps.push(Step::Full(child));
+                offset += edge.text.len();
+                node = child;
+                continue;
+            }
             let common = edge
                 .text
                 .as_bytes()
@@ -482,12 +613,6 @@ impl Tree {
                 .zip(rest)
                 .take_while(|(a, b)| a == b)
                 .count();
-            if common == edge.text.len() {
-                steps.push(Step::Full(child));
-                offset += common;
-                node = child;
-                continue;
-            }
             // The first segment matched, so a partial match has a mark.
             let mark = edge
                 .marks
@@ -587,72 +712,17 @@ impl Tree {
         upper
     }
 
-    /// Append an edge to a leaf in place.
-    fn extend(&mut self, id: usize, text: &str, ids: &[u32], marks: &[(u32, u32)], tick: u64) {
-        let old_bytes = self.node(id).bytes();
-        let node = self.node_mut(id);
-        let (byte, token) = (node.text.len() as u32, node.ids.len() as u32);
-        let mut all_marks = Vec::with_capacity(node.marks.len() + 1 + marks.len());
-        all_marks.extend_from_slice(&node.marks);
-        all_marks.push((byte, token));
-        all_marks.extend(marks.iter().map(|&(b, t)| (b + byte, t + token)));
-        node.text = [&*node.text, text].concat().into_boxed_str();
-        node.ids = node.ids.iter().chain(ids).copied().collect();
-        node.marks = all_marks.into_boxed_slice();
-        node.last_used.store(tick, Ordering::Relaxed);
-        let new_bytes = node.bytes();
-        self.bytes = self.bytes - old_bytes + new_bytes;
-    }
-
-    /// Merge a non-root node with its only child.
-    fn merge_with_child(&mut self, id: usize) {
-        let child_id = *self
-            .node(id)
-            .children
-            .values()
-            .next()
-            .and_then(|ids| ids.first())
-            .expect("single child");
-        let child = self.release(child_id);
-        let old_bytes = self.node(id).bytes();
-        let node = self.node_mut(id);
-        let (byte, token) = (node.text.len() as u32, node.ids.len() as u32);
-        let mut marks = Vec::with_capacity(node.marks.len() + 1 + child.marks.len());
-        marks.extend_from_slice(&node.marks);
-        marks.push((byte, token));
-        marks.extend(child.marks.iter().map(|&(b, t)| (b + byte, t + token)));
-        node.text = [&*node.text, &*child.text].concat().into_boxed_str();
-        node.ids = node.ids.iter().chain(child.ids.iter()).copied().collect();
-        node.marks = marks.into_boxed_slice();
-        node.last_used
-            .fetch_max(child.last_used.load(Ordering::Relaxed), Ordering::Relaxed);
-        node.children = child.children;
-        node.child_count = child.child_count;
-        let new_bytes = node.bytes();
-        self.bytes = self.bytes - old_bytes + new_bytes;
-        let grandchildren: Vec<usize> =
-            self.node(id).children.values().flatten().copied().collect();
-        for grandchild in grandchildren {
-            self.node_mut(grandchild).parent = id;
-        }
-    }
-
+    /// Remove a leaf. Single-child chains are kept: merging them would copy
+    /// whole edges under the write lock.
     fn remove_leaf(&mut self, id: usize) {
         let key = segment_key(self.node(id).first_segment());
-        let node = self.release(id);
-        let parent = node.parent;
+        let parent = self.release(id).parent;
         self.remove_child(parent, id, key);
-        let (count, is_root) = {
-            let parent = self.node(parent);
-            (parent.child_count, parent.namespace.is_some())
-        };
-        if is_root && count == 0 {
-            let root = self.release(parent);
-            if let Some(namespace) = root.namespace {
+        let parent_node = self.node(parent);
+        if parent_node.namespace.is_some() && parent_node.child_count == 0 {
+            if let Some(namespace) = self.release(parent).namespace {
                 self.roots.remove(&namespace);
             }
-        } else if !is_root && count == 1 {
-            self.merge_with_child(parent);
         }
     }
 
@@ -663,36 +733,30 @@ impl Tree {
         }
         let target_bytes = config.max_bytes - config.max_bytes / 10;
         let target_nodes = config.max_nodes - config.max_nodes / 10;
+        let is_leaf = |node: &Node| node.namespace.is_none() && node.child_count == 0;
+        let mut heap: BinaryHeap<Reverse<(u64, usize)>> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(id, node)| {
+                let node = node.as_ref()?;
+                is_leaf(node).then(|| Reverse((node.last_used.load(Ordering::Relaxed), id)))
+            })
+            .collect();
         let mut evicted = 0;
-        loop {
-            let mut leaves: Vec<(u64, usize)> = self
-                .nodes
-                .iter()
-                .enumerate()
-                .filter_map(|(id, node)| {
-                    let node = node.as_ref()?;
-                    (node.namespace.is_none() && node.child_count == 0)
-                        .then(|| (node.last_used.load(Ordering::Relaxed), id))
-                })
-                .collect();
-            if leaves.is_empty() {
-                return evicted;
+        while let Some(Reverse((_, id))) = heap.pop() {
+            if self.bytes <= target_bytes && self.live <= target_nodes {
+                break;
             }
-            leaves.sort_unstable();
-            for (_, id) in leaves {
-                if self.bytes <= target_bytes && self.live <= target_nodes {
-                    return evicted;
-                }
-                // A merge may have folded this leaf into its parent.
-                if self.nodes[id]
-                    .as_ref()
-                    .is_some_and(|node| node.namespace.is_none() && node.child_count == 0)
-                {
-                    self.remove_leaf(id);
-                    evicted += 1;
-                }
+            let parent = self.node(id).parent;
+            self.remove_leaf(id);
+            evicted += 1;
+            // Chains shrink from the end: a parent that became a leaf is next.
+            if let Some(node) = self.nodes[parent].as_ref().filter(|node| is_leaf(node)) {
+                heap.push(Reverse((node.last_used.load(Ordering::Relaxed), parent)));
             }
         }
+        evicted
     }
 }
 
@@ -813,24 +877,18 @@ impl PrefixCache {
                 .iter()
                 .map(|&(b, t)| ((b - offset) as u32, (t - start_token) as u32))
                 .collect();
-            let edge_text = &text[offset..end_byte];
-            let edge_ids = &ids[start_token..end_token];
-            let parent_node = tree.node(parent);
-            if parent_node.namespace.is_none() && parent_node.child_count == 0 {
-                tree.extend(parent, edge_text, edge_ids, &marks, tick);
-            } else {
-                let leaf = tree.alloc(Node {
-                    parent,
-                    text: Box::from(edge_text),
-                    ids: Arc::from(edge_ids),
-                    marks: marks.into_boxed_slice(),
-                    children: HashMap::new(),
-                    child_count: 0,
-                    last_used: AtomicU64::new(tick),
-                    namespace: None,
-                });
-                tree.add_child(parent, leaf);
-            }
+            // Growth appends a child; existing edges are never copied.
+            let leaf = tree.alloc(Node {
+                parent,
+                text: Box::from(&text[offset..end_byte]),
+                ids: Arc::from(&ids[start_token..end_token]),
+                marks: marks.into_boxed_slice(),
+                children: HashMap::new(),
+                child_count: 0,
+                last_used: AtomicU64::new(tick),
+                namespace: None,
+            });
+            tree.add_child(parent, leaf);
         }
         if tree.node(root).child_count == 0 {
             if let Some(namespace) = tree.release(root).namespace {
@@ -1012,11 +1070,28 @@ mod tests {
         }
     }
 
-    fn eligible(tokens: &[&str]) -> Vec<String> {
-        let specs: Vec<_> = tokens.iter().map(|t| spec(t)).collect();
-        BoundaryMatcher::new(&specs)
+    fn token_set(tokens: Vec<AddedTokenSpec>, identity_normalizer: bool) -> AddedTokenSet {
+        AddedTokenSet {
+            tokens,
+            identity_normalizer,
+        }
+    }
+
+    fn eligible_in(set: &AddedTokenSet) -> Vec<String> {
+        BoundaryMatcher::new(set)
             .map(|m| m.tokens().to_vec())
             .unwrap_or_default()
+    }
+
+    fn eligible(tokens: &[&str]) -> Vec<String> {
+        eligible_in(&token_set(tokens.iter().map(|t| spec(t)).collect(), true))
+    }
+
+    fn normalized(content: &str) -> AddedTokenSpec {
+        AddedTokenSpec {
+            normalized: true,
+            ..spec(content)
+        }
     }
 
     #[test]
@@ -1032,24 +1107,62 @@ mod tests {
             "<tts_text_bos_single>",
         ];
         assert_eq!(eligible(&qwen).len(), qwen.len());
-        // A proper prefix of another token can be extended.
+        // A longer token containing `t` before its end can win in `P + S`.
         assert_eq!(eligible(&["<a>", "<a>b"]), ["<a>b"]);
-        // A longer token may start before `>x` and cover it.
-        assert_eq!(eligible(&[">x", "a>x"]), ["a>x"]);
-        assert_eq!(eligible(&["xy", "ax"]), ["ax"]);
-        // Self overlap and whitespace edges.
-        assert!(eligible(&["aa", " <x>", "<x> "]).is_empty());
-        assert_eq!(eligible(&["<|a|>", "aa"]), ["<|a|>"]);
-        for flag in 0..4 {
+        assert_eq!(eligible(&["b", "abc"]), ["abc"]);
+        // Ending inside or at the end of another token is decided by the
+        // matcher, which sees every added token.
+        assert_eq!(eligible(&[">x", "a>x"]), [">x", "a>x"]);
+        assert_eq!(eligible(&["xy", "ax"]), ["ax", "xy"]);
+        assert_eq!(eligible(&["aa", " <x>", "<x> "]), ["aa"]);
+        for flag in 0..3 {
             let mut token = spec("<x>");
             match flag {
                 0 => token.lstrip = true,
                 1 => token.rstrip = true,
-                2 => token.single_word = true,
-                _ => token.normalized = true,
+                _ => token.single_word = true,
             }
-            assert!(BoundaryMatcher::new(&[token]).is_err());
+            assert!(BoundaryMatcher::new(&token_set(vec![token], true)).is_err());
         }
+        // A single_word token after a word character depends on the cut.
+        let word = AddedTokenSpec {
+            single_word: true,
+            ..spec("w")
+        };
+        assert_eq!(
+            eligible_in(&token_set(vec![spec("<x>"), spec("<x1"), word], true)),
+            ["<x>"]
+        );
+    }
+
+    #[test]
+    fn normalized_tokens_need_identity_normalizer_and_separate_groups() {
+        let separate = vec![spec("aa"), normalized("<n>")];
+        assert_eq!(
+            eligible_in(&token_set(separate.clone(), true)),
+            ["<n>", "aa"]
+        );
+        assert_eq!(eligible_in(&token_set(separate, false)), ["aa"]);
+        // `s>` overlaps `<s>`: backends may split differently, so normalized
+        // tokens are out and the strict rules apply (no self overlap).
+        let mixed = vec![spec("<s>"), spec("aa"), normalized("s>")];
+        assert_eq!(eligible_in(&token_set(mixed, true)), ["<s>"]);
+        assert!(is_identity_normalizer(&Value::Null));
+        assert!(is_identity_normalizer(
+            &json!({"type": "Sequence", "normalizers": []})
+        ));
+        assert!(!is_identity_normalizer(&json!({"type": "NFC"})));
+    }
+
+    #[test]
+    fn matcher_cuts_only_where_the_tokenizer_splits() {
+        let matcher =
+            BoundaryMatcher::new(&token_set(vec![spec(">x"), spec("a>x")], true)).unwrap();
+        assert_eq!(matcher.boundaries("a>x b>x"), [3, 7]);
+        // A non-boundary `a<s` hides the first `<s>` from the tokenizer.
+        let matcher =
+            BoundaryMatcher::build(vec!["<s>".into(), "a<s".into()], vec!["<s>".into()]).unwrap();
+        assert_eq!(matcher.boundaries("a<s> <s>"), [8]);
     }
 
     #[test]
@@ -1101,7 +1214,8 @@ mod tests {
 
     fn encoder(config: PrefixCacheConfig) -> (PrefixEncoder, Arc<PrefixCache>) {
         let cache = Arc::new(PrefixCache::new(config).unwrap());
-        let matcher = BoundaryMatcher::new(&[spec("<s>"), spec("</s>")]).unwrap();
+        let matcher =
+            BoundaryMatcher::new(&token_set(vec![spec("<s>"), spec("</s>")], true)).unwrap();
         (
             PrefixEncoder::new("test-model", cache.clone(), matcher),
             cache,
@@ -1150,6 +1264,33 @@ mod tests {
         check(&encoder, &tokenizer, "<s>");
         let stats = cache.stats();
         assert!(stats.hits >= 5 && stats.nodes > 0 && stats.bytes > 0);
+    }
+
+    #[test]
+    fn growth_appends_a_child_without_copying() {
+        let tokenizer = fixture_tokenizer();
+        let (encoder, cache) = encoder(Default::default());
+        let edges = || -> Vec<(usize, Arc<[u32]>)> {
+            let tree = cache.tree.read();
+            (0..tree.nodes.len())
+                .filter_map(|id| tree.nodes[id].as_ref().map(|node| (id, node.ids.clone())))
+                .collect()
+        };
+        let mut text = String::from("<s>system hi</s>");
+        check(&encoder, &tokenizer, &format!("{text}<s>"));
+        for turn in 0..5 {
+            let before = edges();
+            text.push_str(&format!("<s>user {turn}</s><s>assistant {turn}</s>"));
+            let cached = check(&encoder, &tokenizer, &format!("{text}<s>"));
+            assert!(cached > 0);
+            let after = edges();
+            assert_eq!(after.len(), before.len() + 1, "one new edge per turn");
+            for (id, ids) in &before {
+                let (_, now) = after.iter().find(|(other, _)| other == id).unwrap();
+                assert!(Arc::ptr_eq(ids, now), "existing edges are untouched");
+            }
+            check_invariants(&cache);
+        }
     }
 
     #[test]
@@ -1267,8 +1408,6 @@ mod tests {
                 continue;
             }
             assert!(!node.text.is_empty());
-            // Merges keep non-root nodes from having exactly one child.
-            assert_ne!(node.child_count, 1, "unmerged chain");
             let mut prev = (0, 0);
             for &(byte, token) in node.marks.iter() {
                 assert!(byte > prev.0 && token > prev.1);
@@ -1331,9 +1470,50 @@ mod tests {
         }
     }
 
-    /// Real tokenizers: `VLLM_ROUTER_L1_TOKENIZERS=/dir/a,/dir/b` (dirs with
-    /// tokenizer.json). Random prompts mix boundary tokens, all other added
-    /// tokens and adversarial text.
+    /// Prints every added token with its L1 verdict for the models in
+    /// `VLLM_ROUTER_L1_TOKENIZERS` (local dirs or hub IDs).
+    #[tokio::test]
+    async fn report_boundary_verdicts() {
+        let Ok(models) = std::env::var("VLLM_ROUTER_L1_TOKENIZERS") else {
+            eprintln!("skip: set VLLM_ROUTER_L1_TOKENIZERS");
+            return;
+        };
+        for model in models.split(',').filter(|m| !m.is_empty()) {
+            let added = match load_added_tokens(model).await {
+                Ok(added) => added,
+                Err(error) => {
+                    eprintln!("== {model}: L1 unavailable: {error:#}");
+                    continue;
+                }
+            };
+            let files = ResolvedModelFiles::new(model).await.unwrap();
+            let TokenizerSource::HuggingFace(path) = files.tokenizer else {
+                unreachable!()
+            };
+            let tokenizer = HuggingFaceTokenizer::new(&path).unwrap();
+            let probed = BoundaryMatcher::new(&added)
+                .and_then(|matcher| matcher.probed(&tokenizer))
+                .map(|matcher| matcher.tokens().to_vec())
+                .unwrap_or_default();
+            eprintln!(
+                "== {model}: {} added tokens, {} boundaries",
+                added.tokens.len(),
+                probed.len()
+            );
+            for (token, rejection) in added.tokens.iter().zip(boundary_rejections(&added)) {
+                let verdict = match rejection {
+                    Some(reason) => format!("no   {reason}"),
+                    None if probed.contains(&token.content) => "YES".into(),
+                    None => "no   failed load-time probe".into(),
+                };
+                eprintln!("  {verdict:<55} {:?}", token.content);
+            }
+        }
+    }
+
+    /// Real tokenizers: `VLLM_ROUTER_L1_TOKENIZERS=a,b` (local dirs or hub
+    /// IDs). Random prompts mix boundary tokens, all other added tokens,
+    /// fragments of added tokens and adversarial text.
     #[tokio::test]
     async fn randomized_prompts_match_real_tokenizers() {
         let Ok(dirs) = std::env::var("VLLM_ROUTER_L1_TOKENIZERS") else {
@@ -1341,24 +1521,31 @@ mod tests {
             return;
         };
         for dir in dirs.split(',').filter(|d| !d.is_empty()) {
-            let tokenizer =
-                HuggingFaceTokenizer::new(&Path::new(dir).join("tokenizer.json")).unwrap();
-            let matcher = match load_boundary_matcher(dir).await {
+            let added = match load_added_tokens(dir).await {
+                Ok(added) => added,
+                Err(error) => {
+                    eprintln!("{dir}: L1 unavailable: {error}");
+                    continue;
+                }
+            };
+            let files = ResolvedModelFiles::new(dir).await.unwrap();
+            let TokenizerSource::HuggingFace(path) = files.tokenizer else {
+                unreachable!()
+            };
+            let tokenizer = HuggingFaceTokenizer::new(&path).unwrap();
+            let matcher = match BoundaryMatcher::new(&added) {
                 Ok(matcher) => matcher.probed(&tokenizer).unwrap(),
                 Err(error) => {
                     eprintln!("{dir}: L1 unavailable: {error}");
                     continue;
                 }
             };
-            let json: Value = serde_json::from_slice(
-                &std::fs::read(Path::new(dir).join("tokenizer.json")).unwrap(),
-            )
-            .unwrap();
-            let mut added: Vec<String> = added_tokens(&json["added_tokens"], None)
+            let added: Vec<String> = added
+                .tokens
                 .into_iter()
                 .map(|token| token.content)
+                .filter(|content| !content.is_empty())
                 .collect();
-            added.truncate(400);
             let boundaries = matcher.tokens().to_vec();
             let cache = Arc::new(
                 PrefixCache::new(PrefixCacheConfig {
@@ -1383,15 +1570,27 @@ mod tests {
                 (state % n as u64) as usize
             };
             let mut history: Vec<String> = Vec::new();
-            for _ in 0..1500 {
+            for _ in 0..3000 {
                 let mut text = match next(3) {
                     0 if !history.is_empty() => history[next(history.len())].clone(),
                     _ => String::new(),
                 };
                 for _ in 0..1 + next(12) {
-                    match next(4) {
+                    match next(5) {
                         0 => text.push_str(&boundaries[next(boundaries.len())]),
-                        1 if !added.is_empty() => text.push_str(&added[next(added.len())]),
+                        1 => text.push_str(&added[next(added.len())]),
+                        2 => {
+                            // A prefix or suffix of an added token, so that
+                            // longer tokens can form across neighbours.
+                            let token = &added[next(added.len())];
+                            let cuts: Vec<usize> = token.char_indices().map(|(i, _)| i).collect();
+                            let at = cuts[next(cuts.len())];
+                            text.push_str(if next(2) == 0 {
+                                &token[..at]
+                            } else {
+                                &token[at..]
+                            });
+                        }
                         _ => text.push_str(words[next(words.len())]),
                     }
                 }
@@ -1428,10 +1627,13 @@ mod tests {
                 self.0.id_to_token(id)
             }
         }
-        let matcher = BoundaryMatcher::new(&[spec("<s>"), spec("</s>")]).unwrap();
-        let probed = matcher.probed(&Merging(fixture_tokenizer())).unwrap();
+        let set = token_set(vec![spec("<s>"), spec("</s>")], true);
+        let probed = BoundaryMatcher::new(&set)
+            .unwrap()
+            .probed(&Merging(fixture_tokenizer()))
+            .unwrap();
         assert_eq!(probed.tokens(), ["</s>"]);
-        let all = BoundaryMatcher::new(&[spec("<s>"), spec("</s>")]).unwrap();
+        let all = BoundaryMatcher::new(&set).unwrap();
         assert_eq!(all.probed(&fixture_tokenizer()).unwrap().tokens().len(), 2);
     }
 

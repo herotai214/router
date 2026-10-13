@@ -93,12 +93,17 @@ How it works:
 
 - **Boundaries.** Tokenizers split input on added tokens before normalizing
   and pre-tokenizing. A prefix that ends right after a *boundary* added token
-  therefore encodes the same alone as inside the full prompt. Boundary tokens
-  have no `lstrip`/`rstrip`/`single_word`/`normalized` flags, no edge
-  whitespace, no self-overlap, and no other added token can start before them
-  and reach into them. For Qwen these are `<|im_start|>`, `<|im_end|>`,
-  `<tool_call>`, `<think>` and the other added tokens. At load, each candidate
-  is probed by comparing split and full encodes; failures are dropped.
+  therefore encodes the same alone as inside the full prompt. Cut positions
+  come from an automaton over all added tokens that matches like the
+  tokenizer (leftmost-longest). Boundary tokens have no `lstrip`/`rstrip`/
+  `single_word` flags and no edge whitespace, and no longer added token
+  contains them before its end. `normalized` tokens qualify only when the
+  normalizer is a no-op and they cannot overlap non-normalized tokens
+  (otherwise fastokens and Hugging Face split differently, and stricter rules
+  apply). For Qwen these are `<|im_start|>`, `<|im_end|>`, `<tool_call>`,
+  `<think>` and the other added tokens. At load, each candidate is probed by
+  comparing split and full encodes; failures are dropped. Rejected tokens are
+  logged with their reason at debug level.
 - **Tree.** A radix tree over rendered text, one namespace per model instance
   and `cache_salt`. Edges end at boundaries and store their token IDs and the
   offsets of inner boundaries, so a lookup can stop inside an edge: editing
