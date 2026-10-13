@@ -70,6 +70,59 @@ L0 shares the existing LRU and `vllm_tokenizer_cache_*` metrics. Rust callers
 can use `EngineFrontend::with_tokenizer_cache(timeout, config)`. See the
 [benchmark guide](../benchmarks/grpc_frontend_l0.md) for measurement details.
 
+## Optional L1 prefix encoding cache
+
+L1 reuses token IDs for the longest previously seen prefix of a rendered
+prompt, so a growing conversation only encodes its new turns. It is off by
+default:
+
+```bash
+VLLM_ROUTER_L1_CACHE=1 vllm-router --worker-urls grpc://127.0.0.1:50051
+```
+
+| Environment variable | Default | Meaning |
+|---|---:|---|
+| `VLLM_ROUTER_L1_CACHE` | `0` | Enable with `1` or `true` |
+| `VLLM_ROUTER_L1_MAX_BYTES` | `268435456` | Estimated byte limit across models |
+| `VLLM_ROUTER_L1_MAX_NODES` | `65536` | Tree node limit across models |
+| `VLLM_ROUTER_L1_MAX_INSERT_BYTES` | `33554432` | Bytes one request may add (at most the total) |
+| `VLLM_ROUTER_L1_MAX_INSERT_SEGMENTS` | `4096` | Boundary segments one request may add |
+| `VLLM_ROUTER_L1_VERIFY` | `0` | Also run a full encode and compare (debugging) |
+
+How it works:
+
+- **Boundaries.** Tokenizers split input on added tokens before normalizing
+  and pre-tokenizing. A prefix that ends right after a *boundary* added token
+  therefore encodes the same alone as inside the full prompt. Boundary tokens
+  have no `lstrip`/`rstrip`/`single_word`/`normalized` flags, no edge
+  whitespace, no self-overlap, and no other added token can start before them
+  and reach into them. For Qwen these are `<|im_start|>`, `<|im_end|>`,
+  `<tool_call>`, `<think>` and the other added tokens. At load, each candidate
+  is probed by comparing split and full encodes; failures are dropped.
+- **Tree.** A radix tree over rendered text, one namespace per model instance
+  and `cache_salt`. Edges end at boundaries and store their token IDs and the
+  offsets of inner boundaries, so a lookup can stop inside an edge: editing
+  message `k` still reuses messages before it. Text after the last boundary
+  (usually the generation prompt) is not cached.
+- **Encode.** IDs for the matched prefix are copied from the tree; the rest is
+  encoded per boundary segment and inserted. Lookups take a read lock;
+  inserts take a write lock and evict least-recently-used leaves down to 90%
+  of the limits when a budget is exceeded.
+
+L1 runs after L0 when both are enabled. It is skipped for
+`add_special_tokens=true`, `Prompt::TokenIds`, tiktoken/tekken tokenizers, and
+`tokenizer.json` files with BPE dropout, truncation, padding or Metaspace
+`prepend_scheme: first`. With `VLLM_ROUTER_L1_VERIFY=1`, a mismatch logs an
+error, returns the full encode and disables L1 for that model.
+
+Metrics: `vllm_tokenizer_prefix_cache_{lookups,hits,cached_tokens,encoded_tokens,evictions,verify_mismatches}_total`
+and the `vllm_tokenizer_prefix_cache_{nodes,bytes}` gauges. With
+`VLLM_ROUTER_STAGES=1`, `x-router-stages` reports `encode_cached_tokens`.
+Rust callers can use `EngineFrontend::with_encoding_caches(timeout, l0, l1)`.
+
+Future work: multimodal placeholders (this path is text-only), tiktoken and
+tekken tokenizers, boundaries inside long messages, and HTTP worker pools.
+
 ## Capability Boundaries
 
 Reasoning/tool history, tool definitions, tool choice, template kwargs,
