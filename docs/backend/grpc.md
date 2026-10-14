@@ -97,7 +97,10 @@ How it works:
   come from an automaton over all added tokens that matches like the
   tokenizer (leftmost-longest). Boundary tokens have no `lstrip`/`rstrip`/
   `single_word` flags and no edge whitespace, and no longer added token
-  contains them before its end. `normalized` tokens qualify only when the
+  contains them before its end. If any added token is `single_word`, a
+  boundary must not end in a Unicode `\w` character (letters, digits,
+  combining marks, `_`), the same test Hugging Face uses to accept a
+  `single_word` match. `normalized` tokens qualify only when the
   normalizer is a no-op and they cannot overlap non-normalized tokens
   (otherwise fastokens and Hugging Face split differently, and stricter rules
   apply). For Qwen these are `<|im_start|>`, `<|im_end|>`, `<tool_call>`,

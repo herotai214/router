@@ -31,11 +31,12 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, LazyLock, Once};
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use anyhow::{bail, Context, Result};
 use parking_lot::RwLock;
+use regex::Regex;
 use serde_json::Value;
 use vllm_text::backend::hf::{ResolvedModelFiles, TokenizerSource};
 use vllm_tokenizer::Tokenizer;
@@ -281,7 +282,7 @@ pub(crate) fn boundary_rejections(added: &AddedTokenSet) -> Vec<Option<&'static 
         }
         // A single_word token right after the cut sees `t`'s last character
         // in `P + S` but the start of input in `S`.
-        if any_single_word && t.ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+        if any_single_word && ends_with_word(t) {
             return Some("a single_word token could follow");
         }
         if covered.contains(t) {
@@ -296,6 +297,13 @@ pub(crate) fn boundary_rejections(added: &AddedTokenSet) -> Vec<Option<&'static 
         None
     };
     added.tokens.iter().map(rejection).collect()
+}
+
+/// Hugging Face's `single_word` test: Unicode `\w`, which also covers
+/// combining marks, connector punctuation and joiners.
+fn ends_with_word(text: &str) -> bool {
+    static ENDS_WITH_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\w$").unwrap());
+    ENDS_WITH_WORD.is_match(text)
 }
 
 /// Tokens that occur inside another added token, ending before its end.
@@ -1133,6 +1141,66 @@ mod tests {
             eligible_in(&token_set(vec![spec("<x>"), spec("<x1"), word], true)),
             ["<x>"]
         );
+    }
+
+    #[test]
+    fn single_word_guard_matches_hugging_face_word_chars() {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
+
+        let vocab = [("[UNK]".to_string(), 0)].into_iter().collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let mut tokenizer = HfTokenizer::new(model);
+        // One candidate boundary per last character, plus a single_word token
+        // that can follow the cut.
+        let boundaries: Vec<String> = (0x21u32..0x3000)
+            .filter_map(char::from_u32)
+            .filter(|c| !c.is_whitespace() && !c.is_control())
+            .map(|c| format!("§{c}"))
+            .collect();
+        let mut added: Vec<AddedToken> = boundaries
+            .iter()
+            .map(|b| AddedToken::from(b.as_str(), false).normalized(false))
+            .collect();
+        added.push(
+            AddedToken::from("rareword", false)
+                .single_word(true)
+                .normalized(false),
+        );
+        tokenizer.add_tokens(&added);
+
+        let json: Value = serde_json::from_str(&tokenizer.to_string(false).unwrap()).unwrap();
+        let set = token_set(added_tokens(&json["added_tokens"], None), true);
+        let verdicts: HashMap<&str, Option<&str>> = set
+            .tokens
+            .iter()
+            .map(|t| t.content.as_str())
+            .zip(boundary_rejections(&set))
+            .collect();
+
+        let encode = |text: &str| tokenizer.encode(text, false).unwrap().get_ids().to_vec();
+        let suffix = encode("rareword");
+        let mut breaking = 0;
+        for boundary in &boundaries {
+            let mut split = encode(boundary);
+            split.extend(&suffix);
+            if encode(&format!("{boundary}rareword")) != split {
+                breaking += 1;
+                assert_eq!(
+                    verdicts[boundary.as_str()],
+                    Some("a single_word token could follow"),
+                    "{boundary:?} changes the IDs but is a boundary"
+                );
+            }
+        }
+        assert!(breaking > 0);
+        // Combining acute accent: `\w` but not alphanumeric.
+        assert!(verdicts["§\u{301}"].is_some());
+        assert_eq!(encode("§\u{301}rareword"), [encode("§\u{301}")[0], 0]);
     }
 
     #[test]
