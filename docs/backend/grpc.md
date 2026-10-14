@@ -127,6 +127,7 @@ Metrics: `vllm_tokenizer_prefix_cache_{lookups,hits,cached_tokens,encoded_tokens
 and the `vllm_tokenizer_prefix_cache_{nodes,bytes}` gauges. With
 `VLLM_ROUTER_STAGES=1`, `x-router-stages` reports `encode_cached_tokens`.
 Rust callers can use `EngineFrontend::with_encoding_caches(timeout, l0, l1)`.
+See the [L1 benchmark guide](../benchmarks/grpc_frontend_l1.md).
 
 Future work: multimodal placeholders (this path is text-only), tiktoken and
 tekken tokenizers, boundaries inside long messages, and HTTP worker pools.
