@@ -189,13 +189,20 @@ async fn check_model(model: &str, on: &EngineFrontend, off: &EngineFrontend) -> 
                 continue;
             }
         };
-        let lookups = on.prefix_cache_stats().unwrap().lookups;
+        let before = on.prefix_cache_stats().unwrap();
         assert_eq!(
             ids(on, base.clone()).await.0,
             expected,
             "{model}: {messages}"
         );
-        if on.prefix_cache_stats().unwrap().lookups == lookups {
+        let after = on.prefix_cache_stats().unwrap();
+        if after.lookups == before.lookups {
+            // A verify mismatch also leaves lookups unchanged: it returns the
+            // full IDs and disables L1. That is not a token-ID bypass.
+            assert_eq!(
+                after.verify_mismatches, before.verify_mismatches,
+                "{model}: verify mismatch returned full IDs without a lookup"
+            );
             // Renderers that emit token IDs (e.g. Harmony) bypass L1.
             eprintln!("{model}: prompt is not text; L1 not used");
             return checked;
@@ -404,11 +411,13 @@ async fn l1_matches_uncached_for_real_models() {
         let checked = check_model(model, &on, &off).await;
         let stats = on.prefix_cache_stats().unwrap();
         eprintln!("{model}: {checked} conversations, {stats:?}");
+        // A first-request verify mismatch returns the full IDs and leaves
+        // lookups at 0. Check it before treating that as "L1 was not used".
+        assert_eq!(stats.verify_mismatches, 0, "{model}");
         if stats.lookups == 0 {
             continue;
         }
         assert!(checked > 0, "{model}: no conversation rendered");
-        assert_eq!(stats.verify_mismatches, 0, "{model}");
         assert!(stats.hits > 0, "{model}: L1 never hit (disabled?)");
     }
 }
