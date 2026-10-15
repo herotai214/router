@@ -12,8 +12,9 @@
 //! `(byte, token)` offsets of the boundaries inside the edge. A lookup
 //! follows the request text through the tree and may stop at any mark, so a
 //! request that edits message `k` still reuses messages `0..k`. Only the
-//! remaining text after the matched boundary is encoded, one segment per
-//! boundary, and the new boundaries are inserted back into the tree.
+//! remaining text after the matched boundary is encoded. New segments are
+//! encoded one at a time up to the insert cap; the rest of the tail is one
+//! encode, and the stored boundaries are inserted back into the tree.
 //!
 //! Cut positions come from an automaton over all added tokens that matches
 //! like the tokenizer's added-token split. A token is a boundary only when
@@ -971,9 +972,25 @@ impl PrefixEncoder {
         let matched_bounds = hit.bounds.len();
         let mut all_bounds = hit.bounds;
         let mut offset = hit.bytes;
-        for &bound in &bounds[bounds.partition_point(|&bound| bound <= offset)..] {
-            ids.extend(tokenizer.encode(&text[offset..bound], false)?);
-            all_bounds.push((bound, ids.len()));
+        // Segment only what insert will keep. A later cut is still a
+        // boundary, so one encode of the remainder has the same IDs.
+        let origin = offset;
+        let start_tokens = ids.len();
+        let fresh = &bounds[bounds.partition_point(|&bound| bound <= offset)..];
+        for (stored, &bound) in fresh.iter().enumerate() {
+            if stored == self.cache.config.max_insert_segments {
+                break;
+            }
+            let piece = tokenizer.encode(&text[offset..bound], false)?;
+            let tokens_after = ids.len() + piece.len();
+            let cost = (bound - origin) + (tokens_after - start_tokens) * 4 + NODE_OVERHEAD_BYTES;
+            if cost > self.cache.config.max_insert_bytes {
+                ids.extend(piece);
+                offset = bound;
+                break;
+            }
+            ids.extend(piece);
+            all_bounds.push((bound, tokens_after));
             offset = bound;
         }
         if offset < text.len() {
@@ -1690,6 +1707,49 @@ mod tests {
             eprintln!("{dir}: {} boundaries, {stats:?}", boundaries.len());
             assert!(stats.hits > 0);
         }
+    }
+
+    #[test]
+    fn tail_beyond_the_insert_cap_is_one_encode() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct Counting {
+            inner: HuggingFaceTokenizer,
+            calls: AtomicUsize,
+        }
+        impl Tokenizer for Counting {
+            fn encode(&self, text: &str, special: bool) -> vllm_tokenizer::Result<Vec<u32>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.inner.encode(text, special)
+            }
+            fn encode_ordinary(&self, text: &str) -> vllm_tokenizer::Result<Vec<u32>> {
+                self.inner.encode_ordinary(text)
+            }
+            fn decode(&self, ids: &[u32], special: bool) -> vllm_tokenizer::Result<String> {
+                self.inner.decode(ids, special)
+            }
+            fn token_to_id(&self, token: &str) -> Option<u32> {
+                self.inner.token_to_id(token)
+            }
+            fn id_to_token(&self, id: u32) -> Option<String> {
+                self.inner.id_to_token(id)
+            }
+        }
+
+        let tokenizer = Counting {
+            inner: fixture_tokenizer(),
+            calls: AtomicUsize::new(0),
+        };
+        let (encoder, _) = encoder(PrefixCacheConfig {
+            max_insert_segments: 2,
+            ..Default::default()
+        });
+        let text = "<s>one</s><s>two</s><s>three</s><s>four</s>tail";
+        let (ids, cached) = encoder.encode(&tokenizer, 0, text, None).unwrap().unwrap();
+        assert_eq!(ids, tokenizer.inner.encode(text, false).unwrap());
+        assert_eq!(cached, 0);
+        // Two stored segments, then one encode of every later cut.
+        assert_eq!(tokenizer.calls.load(Ordering::Relaxed), 3);
     }
 
     #[test]
