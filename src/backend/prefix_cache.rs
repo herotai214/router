@@ -31,12 +31,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Once};
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use anyhow::{bail, Context, Result};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use regex::Regex;
 use serde_json::Value;
 use vllm_text::backend::hf::{ResolvedModelFiles, TokenizerSource};
@@ -55,8 +55,17 @@ pub struct PrefixCacheConfig {
     pub max_insert_bytes: usize,
     /// Boundary segments one request may add. Must be at least 1.
     pub max_insert_segments: usize,
+    /// Child key hashing strategy. The default avoids hashing whole long
+    /// segments; `Full` is useful for collision-heavy diagnostics.
+    pub hash_strategy: PrefixCacheHashStrategy,
     /// Re-encode every prompt in full and compare (debugging only).
     pub verify: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixCacheHashStrategy {
+    FirstLast64,
+    Full,
 }
 
 impl Default for PrefixCacheConfig {
@@ -66,6 +75,7 @@ impl Default for PrefixCacheConfig {
             max_nodes: 65_536,
             max_insert_bytes: 32 * 1024 * 1024,
             max_insert_segments: 4096,
+            hash_strategy: PrefixCacheHashStrategy::FirstLast64,
             verify: false,
         }
     }
@@ -460,14 +470,16 @@ struct SegmentKey {
     fingerprint: u64,
 }
 
-fn segment_key(segment: &str) -> SegmentKey {
+fn segment_key(segment: &str, strategy: PrefixCacheHashStrategy) -> SegmentKey {
     let bytes = segment.as_bytes();
     let mut hasher = DefaultHasher::new();
-    if bytes.len() <= 128 {
-        bytes.hash(&mut hasher);
-    } else {
-        bytes[..64].hash(&mut hasher);
-        bytes[bytes.len() - 64..].hash(&mut hasher);
+    match strategy {
+        PrefixCacheHashStrategy::Full => bytes.hash(&mut hasher),
+        PrefixCacheHashStrategy::FirstLast64 if bytes.len() <= 128 => bytes.hash(&mut hasher),
+        PrefixCacheHashStrategy::FirstLast64 => {
+            bytes[..64].hash(&mut hasher);
+            bytes[bytes.len() - 64..].hash(&mut hasher);
+        }
     }
     SegmentKey {
         len: bytes.len(),
@@ -568,17 +580,22 @@ impl Tree {
         node
     }
 
-    fn child(&self, parent: usize, segment: &str) -> Option<usize> {
+    fn child(
+        &self,
+        parent: usize,
+        segment: &str,
+        strategy: PrefixCacheHashStrategy,
+    ) -> Option<usize> {
         self.node(parent)
             .children
-            .get(&segment_key(segment))?
+            .get(&segment_key(segment, strategy))?
             .iter()
             .copied()
             .find(|&id| self.node(id).first_segment() == segment)
     }
 
-    fn add_child(&mut self, parent: usize, child: usize) {
-        let key = segment_key(self.node(child).first_segment());
+    fn add_child(&mut self, parent: usize, child: usize, strategy: PrefixCacheHashStrategy) {
+        let key = segment_key(self.node(child).first_segment(), strategy);
         let node = self.node_mut(parent);
         node.children.entry(key).or_default().push(child);
         node.child_count += 1;
@@ -596,7 +613,13 @@ impl Tree {
     }
 
     /// Follow `text` from `root`; returns the steps and the matched bytes.
-    fn walk(&self, root: usize, text: &str, bounds: &[usize]) -> (Vec<Step>, usize) {
+    fn walk(
+        &self,
+        root: usize,
+        text: &str,
+        bounds: &[usize],
+        strategy: PrefixCacheHashStrategy,
+    ) -> (Vec<Step>, usize) {
         let mut steps = Vec::new();
         let (mut node, mut offset) = (root, 0);
         loop {
@@ -604,7 +627,7 @@ impl Tree {
             let Some(&end) = bounds.get(next) else {
                 break;
             };
-            let Some(child) = self.child(node, &text[offset..end]) else {
+            let Some(child) = self.child(node, &text[offset..end], strategy) else {
                 break;
             };
             let edge = self.node(child);
@@ -634,9 +657,16 @@ impl Tree {
         (steps, offset)
     }
 
-    fn lookup(&self, root: usize, text: &str, bounds: &[usize], tick: u64) -> Hit {
+    fn lookup(
+        &self,
+        root: usize,
+        text: &str,
+        bounds: &[usize],
+        tick: u64,
+        strategy: PrefixCacheHashStrategy,
+    ) -> Hit {
         let mut hit = Hit::default();
-        for step in self.walk(root, text, bounds).0 {
+        for step in self.walk(root, text, bounds, strategy).0 {
             let (id, bytes, tokens, marks) = match step {
                 Step::Full(id) => {
                     let node = self.node(id);
@@ -681,7 +711,7 @@ impl Tree {
     }
 
     /// Split `id` at `marks[mark]`; returns the new upper node.
-    fn split(&mut self, id: usize, mark: usize) -> usize {
+    fn split(&mut self, id: usize, mark: usize, strategy: PrefixCacheHashStrategy) -> usize {
         let old_bytes = self.node(id).bytes();
         let node = self.node_mut(id);
         let (byte, token) = node.marks[mark];
@@ -710,21 +740,21 @@ impl Tree {
             namespace: None,
         });
         // The upper node keeps the old first segment, hence the same key.
-        let key = segment_key(self.node(upper).first_segment());
+        let key = segment_key(self.node(upper).first_segment(), strategy);
         if let Some(ids) = self.node_mut(parent).children.get_mut(&key) {
             for slot in ids.iter_mut().filter(|slot| **slot == id) {
                 *slot = upper;
             }
         }
         self.node_mut(id).parent = upper;
-        self.add_child(upper, id);
+        self.add_child(upper, id, strategy);
         upper
     }
 
     /// Remove a leaf. Single-child chains are kept: merging them would copy
     /// whole edges under the write lock.
-    fn remove_leaf(&mut self, id: usize) {
-        let key = segment_key(self.node(id).first_segment());
+    fn remove_leaf(&mut self, id: usize, strategy: PrefixCacheHashStrategy) {
+        let key = segment_key(self.node(id).first_segment(), strategy);
         let parent = self.release(id).parent;
         self.remove_child(parent, id, key);
         let parent_node = self.node(parent);
@@ -758,7 +788,7 @@ impl Tree {
                 break;
             }
             let parent = self.node(id).parent;
-            self.remove_leaf(id);
+            self.remove_leaf(id, config.hash_strategy);
             evicted += 1;
             // Chains shrink from the end: a parent that became a leaf is next.
             if let Some(node) = self.nodes[parent].as_ref().filter(|node| is_leaf(node)) {
@@ -769,15 +799,27 @@ impl Tree {
     }
 }
 
-/// Process-wide occupancy across live caches, for the gauges.
-static TOTAL_NODES: AtomicI64 = AtomicI64::new(0);
-static TOTAL_BYTES: AtomicI64 = AtomicI64::new(0);
+/// Occupancy summed over every live L1 cache. The lock orders gauge
+/// publications, so a scrape sees one snapshot of both totals.
+struct Occupancy {
+    nodes: usize,
+    bytes: usize,
+}
 
-fn publish_occupancy(nodes: i64, bytes: i64) {
-    let nodes = TOTAL_NODES.fetch_add(nodes, Ordering::Relaxed) + nodes;
-    let bytes = TOTAL_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
-    TokenizerMetrics::set_prefix_cache_nodes(nodes.max(0) as usize);
-    TokenizerMetrics::set_prefix_cache_bytes(bytes.max(0) as usize);
+static OCCUPANCY: Mutex<Occupancy> = Mutex::new(Occupancy { nodes: 0, bytes: 0 });
+
+/// Apply one cache's change and publish both gauges. Insert calls this while
+/// holding the tree write lock; drop calls it with exclusive access to that
+/// cache. Lock order is the tree, then `OCCUPANCY`.
+fn publish_occupancy(nodes_delta: isize, bytes_delta: isize) {
+    if nodes_delta == 0 && bytes_delta == 0 {
+        return;
+    }
+    let mut total = OCCUPANCY.lock();
+    total.nodes = total.nodes.saturating_add_signed(nodes_delta);
+    total.bytes = total.bytes.saturating_add_signed(bytes_delta);
+    TokenizerMetrics::set_prefix_cache_nodes(total.nodes);
+    TokenizerMetrics::set_prefix_cache_bytes(total.bytes);
 }
 
 /// Shared L1 tree with one namespace per (tokenizer instance, cache_salt).
@@ -837,7 +879,7 @@ impl PrefixCache {
         let tick = self.next_tick();
         let tree = self.tree.read();
         match tree.roots.get(namespace) {
-            Some(&root) => tree.lookup(root, text, bounds, tick),
+            Some(&root) => tree.lookup(root, text, bounds, tick, self.config.hash_strategy),
             None => Hit::default(),
         }
     }
@@ -850,7 +892,7 @@ impl PrefixCache {
         let mut tree = self.tree.write();
         let (before_nodes, before_bytes) = (tree.live, tree.bytes);
         let root = tree.root(namespace, tick);
-        let (steps, offset) = tree.walk(root, text, &bytes);
+        let (steps, offset) = tree.walk(root, text, &bytes, self.config.hash_strategy);
         let start = bounds.partition_point(|&(byte, _)| byte <= offset);
         let start_token = start.checked_sub(1).map_or(0, |i| bounds[i].1);
         let mut end = None;
@@ -878,7 +920,9 @@ impl PrefixCache {
                         tree.node(id).last_used.store(tick, Ordering::Relaxed);
                         parent = id;
                     }
-                    Step::Partial(id, mark) => parent = tree.split(id, mark),
+                    Step::Partial(id, mark) => {
+                        parent = tree.split(id, mark, self.config.hash_strategy)
+                    }
                 }
             }
             let (end_byte, end_token) = bounds[end];
@@ -897,7 +941,7 @@ impl PrefixCache {
                 last_used: AtomicU64::new(tick),
                 namespace: None,
             });
-            tree.add_child(parent, leaf);
+            tree.add_child(parent, leaf, self.config.hash_strategy);
         }
         if tree.node(root).child_count == 0 {
             if let Some(namespace) = tree.release(root).namespace {
@@ -910,8 +954,8 @@ impl PrefixCache {
             TokenizerMetrics::record_prefix_cache_evictions(evicted);
         }
         publish_occupancy(
-            tree.live as i64 - before_nodes as i64,
-            tree.bytes as i64 - before_bytes as i64,
+            tree.live as isize - before_nodes as isize,
+            tree.bytes as isize - before_bytes as isize,
         );
     }
 }
@@ -919,7 +963,7 @@ impl PrefixCache {
 impl Drop for PrefixCache {
     fn drop(&mut self) {
         let tree = self.tree.get_mut();
-        publish_occupancy(-(tree.live as i64), -(tree.bytes as i64));
+        publish_occupancy(-(tree.live as isize), -(tree.bytes as isize));
     }
 }
 
@@ -1045,12 +1089,25 @@ fn parse_flag(name: &str, raw: Option<String>) -> Result<bool> {
     }
 }
 
+fn parse_hash_strategy(raw: Option<String>) -> Result<PrefixCacheHashStrategy> {
+    match raw.as_deref() {
+        None | Some("first_last_64" | "first-last-64" | "first_last" | "first-last") => {
+            Ok(PrefixCacheHashStrategy::FirstLast64)
+        }
+        Some("full") | Some("full_segment") | Some("full-segment") => {
+            Ok(PrefixCacheHashStrategy::Full)
+        }
+        Some(raw) => bail!("VLLM_ROUTER_L1_HASH_STRATEGY must be first_last_64 or full, got {raw}"),
+    }
+}
+
 fn parse_config(read: impl Fn(&str) -> Option<String>) -> Result<Option<PrefixCacheConfig>> {
     if !parse_flag("VLLM_ROUTER_L1_CACHE", read("VLLM_ROUTER_L1_CACHE"))? {
         return Ok(None);
     }
     let mut config = PrefixCacheConfig {
         verify: parse_flag("VLLM_ROUTER_L1_VERIFY", read("VLLM_ROUTER_L1_VERIFY"))?,
+        hash_strategy: parse_hash_strategy(read("VLLM_ROUTER_L1_HASH_STRATEGY"))?,
         ..Default::default()
     };
     let explicit_insert = read("VLLM_ROUTER_L1_MAX_INSERT_BYTES").is_some();
@@ -1082,7 +1139,12 @@ fn parse_config(read: impl Fn(&str) -> Option<String>) -> Result<Option<PrefixCa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics::{
+        Counter, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    };
     use serde_json::json;
+    use std::sync::Arc;
+    use std::thread;
     use vllm_tokenizer::HuggingFaceTokenizer;
 
     fn spec(content: &str) -> AddedTokenSpec {
@@ -1424,7 +1486,7 @@ mod tests {
             max_nodes: 16,
             max_insert_bytes: 1024,
             max_insert_segments: 8,
-            verify: false,
+            ..Default::default()
         };
         let (encoder, cache) = encoder(config);
         for i in 0..200 {
@@ -1485,6 +1547,523 @@ mod tests {
         assert!(stats.hits > 0 && stats.nodes <= 64);
     }
 
+    struct RecordingGauge {
+        name: &'static str,
+        sets: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl GaugeFn for RecordingGauge {
+        fn increment(&self, _: f64) {}
+        fn decrement(&self, _: f64) {}
+        fn set(&self, _: f64) {
+            self.sets.lock().push(self.name);
+        }
+    }
+
+    struct PairRecorder(Arc<Mutex<Vec<&'static str>>>);
+
+    impl Recorder for PairRecorder {
+        fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+        fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> Counter {
+            Counter::noop()
+        }
+
+        fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> Gauge {
+            let name = if key.name() == "vllm_tokenizer_prefix_cache_nodes" {
+                "nodes"
+            } else {
+                "bytes"
+            };
+            Gauge::from_arc(Arc::new(RecordingGauge {
+                name,
+                sets: self.0.clone(),
+            }))
+        }
+
+        fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
+    /// Two caches publish both gauges under one lock, so their `set` calls
+    /// cannot interleave.
+    #[test]
+    fn occupancy_publishes_nodes_and_bytes_together() {
+        let sets = Arc::new(Mutex::new(Vec::new()));
+        let tokenizer = Arc::new(fixture_tokenizer());
+        thread::scope(|scope| {
+            for t in 0..4 {
+                let (sets, tokenizer) = (sets.clone(), tokenizer.clone());
+                scope.spawn(move || {
+                    metrics::with_local_recorder(&PairRecorder(sets), || {
+                        let (encoder, _cache) = encoder(PrefixCacheConfig {
+                            max_bytes: 64 * 1024,
+                            max_nodes: 64,
+                            max_insert_bytes: 8 * 1024,
+                            ..Default::default()
+                        });
+                        check(
+                            &encoder,
+                            tokenizer.as_ref(),
+                            &format!("<s>user {t}</s><s>tail {t}</s>"),
+                        );
+                    });
+                });
+            }
+        });
+        let sets = sets.lock();
+        assert!(sets.len() >= 8, "{sets:?}");
+        for pair in sets.chunks(2) {
+            assert_eq!(pair, ["nodes", "bytes"], "{sets:?}");
+        }
+    }
+
+    fn lookup_report_node(parent: usize, text: String) -> Node {
+        Node {
+            parent,
+            text: Box::from(text),
+            ids: Arc::from([]),
+            marks: Box::from([]),
+            children: HashMap::new(),
+            child_count: 0,
+            last_used: AtomicU64::new(0),
+            namespace: None,
+        }
+    }
+
+    fn timed_lookup(
+        iters: usize,
+        mut lookup: impl FnMut() -> Option<usize>,
+    ) -> std::time::Duration {
+        let start = std::time::Instant::now();
+        let mut hits = 0usize;
+        for _ in 0..iters {
+            if std::hint::black_box(lookup()).is_some() {
+                hits += 1;
+            }
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(hits, iters);
+        elapsed
+    }
+
+    fn timed_encode(
+        iters: usize,
+        encoder: &PrefixEncoder,
+        tokenizer: &dyn Tokenizer,
+        text: &str,
+    ) -> std::time::Duration {
+        let start = std::time::Instant::now();
+        let mut total = 0usize;
+        for _ in 0..iters {
+            let (ids, cached) = encoder
+                .encode(tokenizer, 0, text, None)
+                .unwrap()
+                .expect("text has boundaries");
+            total = total.wrapping_add(ids.len()).wrapping_add(cached);
+        }
+        let elapsed = start.elapsed();
+        std::hint::black_box(total);
+        elapsed
+    }
+
+    fn normal_long_segment(i: usize, len: usize) -> String {
+        let head = "h".repeat(64);
+        let tail = format!("{i:064x}");
+        let middle = format!("normal-{i}-").repeat((len - 128) / 9 + 1);
+        format!("{head}{}{tail}", &middle[..len - 128])
+    }
+
+    fn adversarial_long_segment(i: usize, len: usize) -> String {
+        let head = "h".repeat(64);
+        let tail = "t".repeat(64);
+        let marker = format!("{i:04x}");
+        let middle = format!("{}{}", "m".repeat(len - 128 - marker.len()), marker);
+        format!("{head}{middle}{tail}")
+    }
+
+    fn build_lookup_tree(segments: &[String], strategy: PrefixCacheHashStrategy) -> (Tree, usize) {
+        let mut tree = Tree::default();
+        let root = tree.alloc(Node {
+            parent: NO_PARENT,
+            text: Box::from(""),
+            ids: Arc::from([]),
+            marks: Box::from([]),
+            children: HashMap::new(),
+            child_count: 0,
+            last_used: AtomicU64::new(0),
+            namespace: None,
+        });
+        for segment in segments {
+            let id = tree.alloc(lookup_report_node(root, segment.clone()));
+            tree.add_child(root, id, strategy);
+        }
+        (tree, root)
+    }
+
+    fn hash_report_encoder(strategy: PrefixCacheHashStrategy) -> (PrefixEncoder, Arc<PrefixCache>) {
+        encoder(PrefixCacheConfig {
+            max_bytes: 512 * 1024 * 1024,
+            max_nodes: 1_000_000,
+            max_insert_bytes: 256 * 1024 * 1024,
+            max_insert_segments: 1_000_000,
+            hash_strategy: strategy,
+            ..Default::default()
+        })
+    }
+
+    fn hash_report_prompt(segment: &str) -> String {
+        format!("<s>{segment}</s>")
+    }
+
+    fn warm_hash_report_encoder(
+        encoder: &PrefixEncoder,
+        tokenizer: &dyn Tokenizer,
+        segments: &[String],
+    ) {
+        for segment in segments {
+            check(encoder, tokenizer, &hash_report_prompt(segment));
+        }
+    }
+
+    fn strategy_name(strategy: PrefixCacheHashStrategy) -> &'static str {
+        match strategy {
+            PrefixCacheHashStrategy::FirstLast64 => "first_last_64",
+            PrefixCacheHashStrategy::Full => "full",
+        }
+    }
+
+    fn prompt_tokens(tokenizer: &dyn Tokenizer, segment: &str) -> usize {
+        tokenizer
+            .encode(&hash_report_prompt(segment), false)
+            .unwrap()
+            .len()
+    }
+
+    fn byte_len_for_prompt_tokens(tokenizer: &dyn Tokenizer, target_tokens: usize) -> usize {
+        let mut high = 129usize;
+        while prompt_tokens(tokenizer, &normal_long_segment(0, high)) < target_tokens {
+            high *= 2;
+        }
+        let mut low = 129usize;
+        while low < high {
+            let mid = (low + high) / 2;
+            if prompt_tokens(tokenizer, &normal_long_segment(0, mid)) < target_tokens {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        low
+    }
+
+    /// CPU-only lookup and encode report for the current first/last-64 child
+    /// key versus the full-segment hash strategy.
+    ///
+    /// Run with:
+    /// `cargo test --release --lib hash_strategy_lookup_cost_report -- --ignored --nocapture`
+    #[test]
+    #[ignore = "CPU-only performance report; run in release mode"]
+    fn hash_strategy_lookup_cost_report() {
+        fn report_lookup_row(
+            case: &str,
+            len: usize,
+            siblings: usize,
+            first_last_bucket: usize,
+            iters: usize,
+            first_last: std::time::Duration,
+            full_hash: std::time::Duration,
+        ) {
+            let first_last_ns = first_last.as_nanos() as f64 / iters as f64;
+            let full_hash_ns = full_hash.as_nanos() as f64 / iters as f64;
+            println!(
+                "lookup {case:11} len={len:6} siblings={siblings:2} first_last_bucket={first_last_bucket:2} iters={iters:5} first_last_64={first_last_ns:9.1}ns full={full_hash_ns:9.1}ns ratio={:.2}",
+                first_last_ns / full_hash_ns
+            );
+        }
+
+        fn report_encode_row(
+            case: &str,
+            len: usize,
+            siblings: usize,
+            iters: usize,
+            first_last: std::time::Duration,
+            full_hash: std::time::Duration,
+        ) {
+            let first_last_us = first_last.as_secs_f64() * 1_000_000.0 / iters as f64;
+            let full_hash_us = full_hash.as_secs_f64() * 1_000_000.0 / iters as f64;
+            println!(
+                "encode {case:11} len={len:6} siblings={siblings:2} iters={iters:5} first_last_64={first_last_us:9.2}us full={full_hash_us:9.2}us ratio={:.2}",
+                first_last_us / full_hash_us
+            );
+        }
+
+        println!(
+            "hash strategy matrix; lookup rows include the exact `first_segment() == segment` check"
+        );
+        println!(
+            "normal: siblings share the first 64 bytes but have different last 64 bytes, so current bucket is 1"
+        );
+        println!(
+            "adversarial: siblings share length, first 64 bytes and last 64 bytes, so current bucket equals siblings"
+        );
+
+        let tokenizer = fixture_tokenizer();
+        for len in [16 * 1024, 32 * 1024, 64 * 1024, 128 * 1024] {
+            for siblings in [1, 4, 8, 16, 32] {
+                for (case, segments) in [
+                    (
+                        "normal",
+                        (0..siblings)
+                            .map(|i| normal_long_segment(i, len))
+                            .collect::<Vec<_>>(),
+                    ),
+                    (
+                        "adversarial",
+                        (0..siblings)
+                            .map(|i| adversarial_long_segment(i, len))
+                            .collect::<Vec<_>>(),
+                    ),
+                ] {
+                    let query = &segments[siblings - 1];
+                    assert!(query.len() > 128);
+
+                    let (first_last_tree, first_last_root) =
+                        build_lookup_tree(&segments, PrefixCacheHashStrategy::FirstLast64);
+                    let (full_tree, full_root) =
+                        build_lookup_tree(&segments, PrefixCacheHashStrategy::Full);
+                    let first_last_bucket = first_last_tree
+                        .node(first_last_root)
+                        .children
+                        .get(&segment_key(query, PrefixCacheHashStrategy::FirstLast64))
+                        .map_or(0, Vec::len);
+                    assert_eq!(
+                        first_last_bucket,
+                        if case == "normal" { 1 } else { siblings }
+                    );
+                    let lookup_iters = if case == "normal" {
+                        (64 * 1024 * 1024 / len).max(512)
+                    } else {
+                        (64 * 1024 * 1024 / (len * siblings)).max(32)
+                    };
+                    let first_last_lookup = timed_lookup(lookup_iters, || {
+                        first_last_tree.child(
+                            first_last_root,
+                            query,
+                            PrefixCacheHashStrategy::FirstLast64,
+                        )
+                    });
+                    let full_lookup = timed_lookup(lookup_iters, || {
+                        full_tree.child(full_root, query, PrefixCacheHashStrategy::Full)
+                    });
+                    report_lookup_row(
+                        case,
+                        len,
+                        siblings,
+                        first_last_bucket,
+                        lookup_iters,
+                        first_last_lookup,
+                        full_lookup,
+                    );
+
+                    let (first_last_encoder, _) =
+                        hash_report_encoder(PrefixCacheHashStrategy::FirstLast64);
+                    let (full_encoder, _) = hash_report_encoder(PrefixCacheHashStrategy::Full);
+                    warm_hash_report_encoder(&first_last_encoder, &tokenizer, &segments);
+                    warm_hash_report_encoder(&full_encoder, &tokenizer, &segments);
+                    let query_text = hash_report_prompt(query);
+                    let (ids, cached) = first_last_encoder
+                        .encode(&tokenizer, 0, &query_text, None)
+                        .unwrap()
+                        .expect("query has boundaries");
+                    assert_eq!(ids, tokenizer.encode(&query_text, false).unwrap());
+                    assert_eq!(cached, ids.len());
+                    let (ids, cached) = full_encoder
+                        .encode(&tokenizer, 0, &query_text, None)
+                        .unwrap()
+                        .expect("query has boundaries");
+                    assert_eq!(ids, tokenizer.encode(&query_text, false).unwrap());
+                    assert_eq!(cached, ids.len());
+                    let encode_iters = (8 * 1024 * 1024 / len).max(8);
+                    let first_last_encode =
+                        timed_encode(encode_iters, &first_last_encoder, &tokenizer, &query_text);
+                    let full_encode =
+                        timed_encode(encode_iters, &full_encoder, &tokenizer, &query_text);
+                    report_encode_row(
+                        case,
+                        len,
+                        siblings,
+                        encode_iters,
+                        first_last_encode,
+                        full_encode,
+                    );
+                }
+            }
+        }
+
+        println!(
+            "Set VLLM_ROUTER_L1_HASH_STRATEGY={} or {} to switch the runtime strategy.",
+            strategy_name(PrefixCacheHashStrategy::FirstLast64),
+            strategy_name(PrefixCacheHashStrategy::Full)
+        );
+    }
+
+    /// Same report as `hash_strategy_lookup_cost_report`, but targets prompt
+    /// token counts rather than raw segment byte lengths.
+    ///
+    /// Run with:
+    /// `cargo test --release --lib hash_strategy_token_count_report -- --ignored --nocapture`
+    #[test]
+    #[ignore = "CPU-only performance report; run in release mode"]
+    fn hash_strategy_token_count_report() {
+        #[derive(Clone, Copy)]
+        struct ReportDims {
+            case: &'static str,
+            target_tokens: usize,
+            actual_tokens: usize,
+            bytes: usize,
+            siblings: usize,
+        }
+
+        fn report_lookup_row(
+            dims: ReportDims,
+            first_last_bucket: usize,
+            iters: usize,
+            first_last: std::time::Duration,
+            full_hash: std::time::Duration,
+        ) {
+            let first_last_ns = first_last.as_nanos() as f64 / iters as f64;
+            let full_hash_ns = full_hash.as_nanos() as f64 / iters as f64;
+            let ReportDims {
+                case,
+                target_tokens,
+                actual_tokens,
+                bytes,
+                siblings,
+            } = dims;
+            println!(
+                "lookup {case:11} target_tokens={target_tokens:6} actual_tokens={actual_tokens:6} bytes={bytes:7} siblings={siblings:2} first_last_bucket={first_last_bucket:2} iters={iters:4} first_last_64={first_last_ns:10.1}ns full={full_hash_ns:10.1}ns ratio={:.2}",
+                first_last_ns / full_hash_ns
+            );
+        }
+
+        fn report_encode_row(
+            dims: ReportDims,
+            iters: usize,
+            first_last: std::time::Duration,
+            full_hash: std::time::Duration,
+        ) {
+            let first_last_us = first_last.as_secs_f64() * 1_000_000.0 / iters as f64;
+            let full_hash_us = full_hash.as_secs_f64() * 1_000_000.0 / iters as f64;
+            let ReportDims {
+                case,
+                target_tokens,
+                actual_tokens,
+                bytes,
+                siblings,
+            } = dims;
+            println!(
+                "encode {case:11} target_tokens={target_tokens:6} actual_tokens={actual_tokens:6} bytes={bytes:7} siblings={siblings:2} iters={iters:4} first_last_64={first_last_us:10.2}us full={full_hash_us:10.2}us ratio={:.2}",
+                first_last_us / full_hash_us
+            );
+        }
+
+        println!("hash strategy token-count matrix; target length is prompt token count, not KiB");
+        let tokenizer = fixture_tokenizer();
+        for target_tokens in [16_384, 32_768, 65_536, 131_072] {
+            let bytes = byte_len_for_prompt_tokens(&tokenizer, target_tokens);
+            for siblings in [1, 4, 8, 16, 32] {
+                for (case, segments) in [
+                    (
+                        "normal",
+                        (0..siblings)
+                            .map(|i| normal_long_segment(i, bytes))
+                            .collect::<Vec<_>>(),
+                    ),
+                    (
+                        "adversarial",
+                        (0..siblings)
+                            .map(|i| adversarial_long_segment(i, bytes))
+                            .collect::<Vec<_>>(),
+                    ),
+                ] {
+                    let query = &segments[siblings - 1];
+                    let query_text = hash_report_prompt(query);
+                    let actual_tokens = tokenizer.encode(&query_text, false).unwrap().len();
+                    let dims = ReportDims {
+                        case,
+                        target_tokens,
+                        actual_tokens,
+                        bytes,
+                        siblings,
+                    };
+                    let (first_last_tree, first_last_root) =
+                        build_lookup_tree(&segments, PrefixCacheHashStrategy::FirstLast64);
+                    let (full_tree, full_root) =
+                        build_lookup_tree(&segments, PrefixCacheHashStrategy::Full);
+                    let first_last_bucket = first_last_tree
+                        .node(first_last_root)
+                        .children
+                        .get(&segment_key(query, PrefixCacheHashStrategy::FirstLast64))
+                        .map_or(0, Vec::len);
+                    assert_eq!(
+                        first_last_bucket,
+                        if case == "normal" { 1 } else { siblings }
+                    );
+                    let lookup_iters = if case == "normal" {
+                        (64 * 1024 * 1024 / bytes).max(64)
+                    } else {
+                        (64 * 1024 * 1024 / (bytes * siblings)).max(16)
+                    };
+                    let first_last_lookup = timed_lookup(lookup_iters, || {
+                        first_last_tree.child(
+                            first_last_root,
+                            query,
+                            PrefixCacheHashStrategy::FirstLast64,
+                        )
+                    });
+                    let full_lookup = timed_lookup(lookup_iters, || {
+                        full_tree.child(full_root, query, PrefixCacheHashStrategy::Full)
+                    });
+                    report_lookup_row(
+                        dims,
+                        first_last_bucket,
+                        lookup_iters,
+                        first_last_lookup,
+                        full_lookup,
+                    );
+
+                    let (first_last_encoder, _) =
+                        hash_report_encoder(PrefixCacheHashStrategy::FirstLast64);
+                    let (full_encoder, _) = hash_report_encoder(PrefixCacheHashStrategy::Full);
+                    warm_hash_report_encoder(&first_last_encoder, &tokenizer, &segments);
+                    warm_hash_report_encoder(&full_encoder, &tokenizer, &segments);
+                    let (ids, cached) = first_last_encoder
+                        .encode(&tokenizer, 0, &query_text, None)
+                        .unwrap()
+                        .expect("query has boundaries");
+                    assert_eq!(ids, tokenizer.encode(&query_text, false).unwrap());
+                    assert_eq!(cached, ids.len());
+                    let (ids, cached) = full_encoder
+                        .encode(&tokenizer, 0, &query_text, None)
+                        .unwrap()
+                        .expect("query has boundaries");
+                    assert_eq!(ids, tokenizer.encode(&query_text, false).unwrap());
+                    assert_eq!(cached, ids.len());
+                    let encode_iters = (1_000_000 / target_tokens).max(4);
+                    let first_last_encode =
+                        timed_encode(encode_iters, &first_last_encoder, &tokenizer, &query_text);
+                    let full_encode =
+                        timed_encode(encode_iters, &full_encoder, &tokenizer, &query_text);
+                    report_encode_row(dims, encode_iters, first_last_encode, full_encode);
+                }
+            }
+        }
+    }
+
     fn check_invariants(cache: &PrefixCache) {
         let tree = cache.tree.read();
         let live: Vec<usize> = (0..tree.nodes.len())
@@ -1502,7 +2081,10 @@ mod tests {
             for (key, ids) in &node.children {
                 for &child in ids {
                     assert_eq!(tree.node(child).parent, id);
-                    assert!(segment_key(tree.node(child).first_segment()) == *key);
+                    assert!(
+                        segment_key(tree.node(child).first_segment(), cache.config.hash_strategy)
+                            == *key
+                    );
                 }
             }
             if let Some(namespace) = &node.namespace {
@@ -1539,7 +2121,7 @@ mod tests {
                 max_nodes: 24,
                 max_insert_bytes: budget / 2,
                 max_insert_segments: 6,
-                verify: false,
+                ..Default::default()
             });
             let mut conversations: Vec<Vec<String>> = vec![Vec::new(); 4];
             for _ in 0..400 {
@@ -1851,11 +2433,22 @@ mod tests {
             .unwrap()
             .verify
         );
+        assert_eq!(
+            parse(&[
+                ("VLLM_ROUTER_L1_CACHE", "1"),
+                ("VLLM_ROUTER_L1_HASH_STRATEGY", "full")
+            ])
+            .unwrap()
+            .unwrap()
+            .hash_strategy,
+            PrefixCacheHashStrategy::Full
+        );
         for (name, value) in [
             ("VLLM_ROUTER_L1_CACHE", "maybe"),
             ("VLLM_ROUTER_L1_MAX_NODES", "0"),
             ("VLLM_ROUTER_L1_MAX_INSERT_SEGMENTS", "x"),
             ("VLLM_ROUTER_L1_VERIFY", "yes"),
+            ("VLLM_ROUTER_L1_HASH_STRATEGY", "middle"),
         ] {
             let mut values = vec![("VLLM_ROUTER_L1_CACHE", "1")];
             values.retain(|(k, _)| *k != name);
