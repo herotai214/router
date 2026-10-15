@@ -329,7 +329,7 @@ async fn build_l1_prompt(
 async fn shrink_last_message(
     sizer: &EngineFrontend,
     model: &tempfile::TempDir,
-    messages: &mut Vec<Value>,
+    messages: &mut [Value],
     goal: usize,
 ) {
     if prompt_tokens(sizer, model, messages).await <= goal {
