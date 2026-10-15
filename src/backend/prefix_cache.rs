@@ -420,14 +420,14 @@ fn uses_first_only_metaspace(pre_tokenizer: &Value) -> bool {
 /// skipping IDs in `skip`.
 fn added_tokens(value: &Value, skip: Option<&[u64]>) -> Vec<AddedTokenSpec> {
     let parse = |token: &Value| {
-        let special = token["special"].as_bool().unwrap_or(false);
         Some(AddedTokenSpec {
             content: token["content"].as_str()?.to_string(),
             lstrip: token["lstrip"].as_bool().unwrap_or(false),
             rstrip: token["rstrip"].as_bool().unwrap_or(false),
             single_word: token["single_word"].as_bool().unwrap_or(false),
-            // Hugging Face defaults `normalized` to `!special`.
-            normalized: token["normalized"].as_bool().unwrap_or(!special),
+            // vllm-tokenizer fills a missing field with false before either
+            // backend loads. Hugging Face's own default is `!special`.
+            normalized: token["normalized"].as_bool().unwrap_or(false),
         })
     };
     match value {
@@ -1246,7 +1246,25 @@ mod tests {
         let names: Vec<_> = tokens.iter().map(|t| t.content.as_str()).collect();
         assert_eq!(names, ["<a>", "<b>", "plain"]);
         assert!(!tokens[1].normalized);
-        assert!(tokens[2].normalized);
+        // "plain" omits `normalized`. vllm-tokenizer loads that as false.
+        assert!(!tokens[2].normalized);
+    }
+
+    #[test]
+    fn missing_normalized_does_not_share_a_group_with_an_explicit_token() {
+        // "ab" is normalized and "bc" omits the field. Treating the omission
+        // as normalized puts both in one group, so a one-pass cut after "ab"
+        // disagrees with Hugging Face's two-pass encode of "abc".
+        let tokens = added_tokens(
+            &json!([
+                {"content": "ab", "normalized": true},
+                {"content": "bc"}
+            ]),
+            None,
+        );
+        assert!(tokens[0].normalized);
+        assert!(!tokens[1].normalized);
+        assert!(eligible_in(&token_set(tokens, true)).is_empty());
     }
 
     #[test]
