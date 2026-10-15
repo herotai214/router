@@ -87,7 +87,14 @@ VLLM_ROUTER_L1_CACHE=1 vllm-router --worker-urls grpc://127.0.0.1:50051
 | `VLLM_ROUTER_L1_MAX_NODES` | `65536` | Tree node limit across models |
 | `VLLM_ROUTER_L1_MAX_INSERT_BYTES` | `33554432` | Bytes one request may add (at most the total) |
 | `VLLM_ROUTER_L1_MAX_INSERT_SEGMENTS` | `4096` | Boundary segments one request may add |
+| `VLLM_ROUTER_L1_HASH_STRATEGY` | `first_last_64` | Child-key hashing strategy: `first_last_64` or `full` |
 | `VLLM_ROUTER_L1_VERIFY` | `0` | Also run a full encode and compare (debugging) |
+
+`first_last_64` is the default because it avoids hashing an entire long
+segment on the common path. Use `VLLM_ROUTER_L1_HASH_STRATEGY=full` when a
+workload is likely to create many long sibling segments with the same length,
+same first 64 bytes, and same last 64 bytes, for example fixed-size templated
+inputs whose middle changes but whose head and tail are identical.
 
 How it works:
 
