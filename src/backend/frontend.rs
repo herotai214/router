@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use axum::response::Response;
 
 use super::grpc::{FirstOutputCallback, GrpcEngineBackend};
-use super::prefix_cache::{PrefixCacheConfig, PrefixCacheStats};
+use super::l1_cache::{L1CacheConfig, L1CacheStats};
 use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
 use crate::protocols::spec::ChatCompletionRequest;
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
@@ -65,7 +65,7 @@ impl EngineFrontend {
     pub fn with_encoding_caches(
         request_timeout: Duration,
         l0: Option<TokenizerCacheConfig>,
-        l1: Option<PrefixCacheConfig>,
+        l1: Option<L1CacheConfig>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             tokenizer: Arc::new(TokenizerCache::with_caches(l0, l1)?),
@@ -77,7 +77,7 @@ impl EngineFrontend {
         Self::with_encoding_caches(
             request_timeout,
             super::encode_cache::config_from_env()?,
-            super::prefix_cache::config_from_env()?,
+            super::l1_cache::config_from_env()?,
         )
     }
 
@@ -87,8 +87,8 @@ impl EngineFrontend {
     }
 
     /// L1 stats across models, or None when disabled.
-    pub fn prefix_cache_stats(&self) -> Option<PrefixCacheStats> {
-        self.tokenizer.prefix_cache_stats()
+    pub fn l1_cache_stats(&self) -> Option<L1CacheStats> {
+        self.tokenizer.l1_cache_stats()
     }
 
     /// Tests only: bypass model loading by returning these fake prompt ids.

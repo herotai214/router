@@ -1,4 +1,4 @@
-//! L1 prefix cache integration tests: every prompt encoded through L1 must
+//! L1 cache integration tests: every prompt encoded through L1 must
 //! match the uncached frontend exactly.
 mod common;
 
@@ -9,7 +9,7 @@ use common::mock_vllm_rs::MockVllmRsServer;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use vllm_router_rs::backend::{EngineFrontend, PrefixCacheConfig};
+use vllm_router_rs::backend::{EngineFrontend, L1CacheConfig};
 use vllm_router_rs::protocols::spec::ChatCompletionRequest;
 use vllm_router_rs::tokenizer::TokenizerCacheConfig;
 
@@ -170,7 +170,7 @@ async fn ids(frontend: &EngineFrontend, request: ChatCompletionRequest) -> (Vec<
     )
 }
 
-fn l1_frontend(l0: Option<TokenizerCacheConfig>, config: PrefixCacheConfig) -> EngineFrontend {
+fn l1_frontend(l0: Option<TokenizerCacheConfig>, config: L1CacheConfig) -> EngineFrontend {
     EngineFrontend::with_encoding_caches(Duration::from_secs(30), l0, Some(config)).unwrap()
 }
 
@@ -189,13 +189,13 @@ async fn check_model(model: &str, on: &EngineFrontend, off: &EngineFrontend) -> 
                 continue;
             }
         };
-        let before = on.prefix_cache_stats().unwrap();
+        let before = on.l1_cache_stats().unwrap();
         assert_eq!(
             ids(on, base.clone()).await.0,
             expected,
             "{model}: {messages}"
         );
-        let after = on.prefix_cache_stats().unwrap();
+        let after = on.l1_cache_stats().unwrap();
         if after.lookups == before.lookups {
             // A verify mismatch also leaves lookups unchanged: it returns the
             // full IDs and disables L1. That is not a token-ID bypass.
@@ -258,21 +258,21 @@ async fn l1_matches_uncached_for_qwen_template_with_tools_and_special_text() {
     let off = EngineFrontend::new();
     let on = l1_frontend(
         None,
-        PrefixCacheConfig {
+        L1CacheConfig {
             verify: true,
             ..Default::default()
         },
     );
     assert_eq!(check_model(model, &on, &off).await, conversations().len());
-    let stats = on.prefix_cache_stats().unwrap();
+    let stats = on.l1_cache_stats().unwrap();
     assert_eq!(stats.verify_mismatches, 0);
     assert!(stats.hits > 0 && stats.cached_tokens > 0 && stats.nodes > 0);
     assert_eq!(
-        metric(&metrics, "vllm_tokenizer_prefix_cache_hits_total"),
+        metric(&metrics, "vllm_tokenizer_l1_hits_total"),
         stats.hits as f64
     );
     assert_eq!(
-        metric(&metrics, "vllm_tokenizer_prefix_cache_bytes"),
+        metric(&metrics, "vllm_tokenizer_l1_bytes"),
         stats.bytes as f64
     );
 
@@ -336,14 +336,14 @@ async fn l1_matches_uncached_for_qwen_template_with_tools_and_special_text() {
         assert_eq!(ids(&fresh, salted.clone()).await.1, 0);
         assert!(ids(&fresh, salted).await.1 > 0);
     }
-    let before = fresh.prefix_cache_stats().unwrap();
+    let before = fresh.l1_cache_stats().unwrap();
     let mut special = base.clone();
     special
         .other
         .insert("add_special_tokens".into(), json!(true));
     let (got, cached) = ids(&fresh, special.clone()).await;
     assert_eq!((got, cached), (ids(&off, special).await.0, 0));
-    assert_eq!(fresh.prefix_cache_stats().unwrap().lookups, before.lookups);
+    assert_eq!(fresh.l1_cache_stats().unwrap().lookups, before.lookups);
 
     // L0 answers exact repeats before L1 is consulted.
     let both = l1_frontend(Some(Default::default()), Default::default());
@@ -351,7 +351,7 @@ async fn l1_matches_uncached_for_qwen_template_with_tools_and_special_text() {
     assert_eq!(cached, 0);
     let (second, cached) = ids(&both, base.clone()).await;
     assert_eq!((second.clone(), cached), (first.clone(), first.len()));
-    assert_eq!(both.prefix_cache_stats().unwrap().lookups, 1);
+    assert_eq!(both.l1_cache_stats().unwrap().lookups, 1);
     assert_eq!(both.tokenizer_cache_stats().unwrap().hits, 1);
 
     // Workers receive the L1 IDs; usage counts them.
@@ -384,11 +384,11 @@ async fn l1_matches_uncached_for_qwen_template_with_tools_and_special_text() {
             0
         );
     }
-    assert_eq!(disabled.prefix_cache_stats().unwrap().lookups, 0);
+    assert_eq!(disabled.l1_cache_stats().unwrap().lookups, 0);
 
     drop((on, growth, fresh, both, disabled));
-    assert_eq!(metric(&metrics, "vllm_tokenizer_prefix_cache_bytes"), 0.0);
-    assert_eq!(metric(&metrics, "vllm_tokenizer_prefix_cache_nodes"), 0.0);
+    assert_eq!(metric(&metrics, "vllm_tokenizer_l1_bytes"), 0.0);
+    assert_eq!(metric(&metrics, "vllm_tokenizer_l1_nodes"), 0.0);
 }
 
 /// Real models: `VLLM_ROUTER_L1_MODELS=a,b cargo test --test grpc_frontend_l1`
@@ -403,13 +403,13 @@ async fn l1_matches_uncached_for_real_models() {
         let off = EngineFrontend::new();
         let on = l1_frontend(
             None,
-            PrefixCacheConfig {
+            L1CacheConfig {
                 verify: true,
                 ..Default::default()
             },
         );
         let checked = check_model(model, &on, &off).await;
-        let stats = on.prefix_cache_stats().unwrap();
+        let stats = on.l1_cache_stats().unwrap();
         eprintln!("{model}: {checked} conversations, {stats:?}");
         // A first-request verify mismatch returns the full IDs and leaves
         // lookups at 0. Check it before treating that as "L1 was not used".

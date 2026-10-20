@@ -10,7 +10,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 
 use super::encode_cache::FrontendCache;
-use super::prefix_cache::{PrefixCache, PrefixCacheConfig, PrefixCacheStats};
+use super::l1_cache::{L1Cache, L1CacheConfig, L1CacheStats};
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
 
 use super::vllm_frontend::{
@@ -39,7 +39,7 @@ pub struct TokenizerCache {
     by_model: Arc<DashMap<String, Arc<VllmFrontend>>>,
     load_lock: Arc<tokio::sync::Mutex<()>>,
     encoding_cache: Option<Arc<FrontendCache>>,
-    prefix_cache: Option<Arc<PrefixCache>>,
+    l1_cache: Option<Arc<L1Cache>>,
 }
 
 impl std::fmt::Debug for TokenizerCache {
@@ -61,7 +61,7 @@ impl TokenizerCache {
             by_model: Arc::new(DashMap::new()),
             load_lock: Arc::new(tokio::sync::Mutex::new(())),
             encoding_cache: None,
-            prefix_cache: None,
+            l1_cache: None,
         }
     }
 
@@ -73,11 +73,11 @@ impl TokenizerCache {
     /// Enable L0 and/or L1, each with one budget shared across models.
     pub fn with_caches(
         l0: Option<TokenizerCacheConfig>,
-        l1: Option<PrefixCacheConfig>,
+        l1: Option<L1CacheConfig>,
     ) -> Result<Self> {
         Ok(Self {
             encoding_cache: l0.map(FrontendCache::new).transpose()?.map(Arc::new),
-            prefix_cache: l1.map(PrefixCache::new).transpose()?.map(Arc::new),
+            l1_cache: l1.map(L1Cache::new).transpose()?.map(Arc::new),
             ..Self::new()
         })
     }
@@ -88,8 +88,8 @@ impl TokenizerCache {
     }
 
     /// L1 stats across models, or None when disabled.
-    pub fn prefix_cache_stats(&self) -> Option<PrefixCacheStats> {
-        self.prefix_cache.as_ref().map(|cache| cache.stats())
+    pub fn l1_cache_stats(&self) -> Option<L1CacheStats> {
+        self.l1_cache.as_ref().map(|cache| cache.stats())
     }
 
     /// Tests only: bypass model loading by returning these fake prompt ids.
@@ -116,7 +116,7 @@ impl TokenizerCache {
                 &source,
                 Default::default(),
                 self.encoding_cache.clone(),
-                self.prefix_cache.clone(),
+                self.l1_cache.clone(),
             )
             .await
             .map_err(|e| anyhow!("vllm-chat load {source} for key {key}: {e}"))?,

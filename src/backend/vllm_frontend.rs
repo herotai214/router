@@ -14,7 +14,7 @@ use vllm_chat::{
 use vllm_text::TextDecodeOptions;
 
 use super::encode_cache::{deterministic_model, FrontendCache, PromptEncoder};
-use super::prefix_cache::{load_boundary_matcher, PrefixCache, PrefixEncoder};
+use super::l1_cache::{load_boundary_matcher, L1Cache, L1Encoder};
 use vllm_tokenizer::{IncrementalDecoder, Tokenizer};
 
 pub use vllm_chat::ChatMessage as UpstreamChatMessage;
@@ -32,7 +32,7 @@ impl VllmFrontend {
         model_id: &str,
         default_chat_template_kwargs: HashMap<String, Value>,
         cache: Option<Arc<FrontendCache>>,
-        prefix_cache: Option<Arc<PrefixCache>>,
+        l1_cache: Option<Arc<L1Cache>>,
     ) -> vllm_chat::Result<Self> {
         let backends = load_model_backends(
             model_id,
@@ -59,15 +59,15 @@ impl VllmFrontend {
             None
         };
         let tokenizer = backends.text_backend.tokenizer();
-        let prefix = match prefix_cache {
-            Some(prefix_cache) => {
+        let l1 = match l1_cache {
+            Some(l1_cache) => {
                 let matcher = load_boundary_matcher(model_id)
                     .await
                     .and_then(|matcher| matcher.probed(tokenizer.as_ref()));
                 match matcher {
                     Ok(matcher) => {
                         tracing::info!(model_id, boundaries = ?matcher.tokens(), "L1 enabled");
-                        Some(PrefixEncoder::new(model_id, prefix_cache, matcher))
+                        Some(L1Encoder::new(model_id, l1_cache, matcher))
                     }
                     Err(error) => {
                         tracing::warn!(model_id, %error, "L1 disabled for this model");
@@ -77,7 +77,7 @@ impl VllmFrontend {
             }
             None => None,
         };
-        let encoder = PromptEncoder::new(model_id, tokenizer, cache).with_prefix_cache(prefix);
+        let encoder = PromptEncoder::new(model_id, tokenizer, cache).with_l1_cache(l1);
         Ok(Self {
             backends: Arc::new(backends),
             encoder,

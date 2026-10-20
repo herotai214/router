@@ -18,7 +18,7 @@ use fixture::{chat_request, model_fixture, qwen_model_fixture};
 use mock::{MockVllmRs, MockVllmRsServer};
 use serde_json::{json, Value};
 use tokio::sync::Barrier;
-use vllm_router_rs::backend::{EngineFrontend, PrefixCacheConfig};
+use vllm_router_rs::backend::{EngineFrontend, L1CacheConfig};
 
 fn settings(name: &str, default: &str) -> Vec<usize> {
     std::env::var(name)
@@ -395,8 +395,8 @@ impl L1Prompt {
     }
 }
 
-fn l1_config() -> PrefixCacheConfig {
-    PrefixCacheConfig {
+fn l1_config() -> L1CacheConfig {
+    L1CacheConfig {
         max_insert_bytes: 256 * 1024 * 1024,
         max_insert_segments: 1_000_000,
         ..Default::default()
@@ -485,7 +485,7 @@ async fn grpc_frontend_l1_overhead() {
                     axum::body::to_bytes(response.into_body(), usize::MAX)
                         .await
                         .unwrap();
-                    let before = frontend.prefix_cache_stats();
+                    let before = frontend.l1_cache_stats();
                     let barrier = Arc::new(Barrier::new(concurrency + 1));
                     let mut tasks = tokio::task::JoinSet::new();
                     for t in 0..concurrency {
@@ -541,7 +541,7 @@ async fn grpc_frontend_l1_overhead() {
                     let requests = latency.len();
                     assert!(requests > 0);
                     let reuse_pct = reuse_samples.iter().sum::<f64>() / requests as f64;
-                    let stats = frontend.prefix_cache_stats();
+                    let stats = frontend.l1_cache_stats();
                     let (hits, lookups, cache_bytes, cache_nodes) = match (enabled, stats, before) {
                         (true, Some(stats), Some(before)) => (
                             stats.hits - before.hits,

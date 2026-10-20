@@ -9,7 +9,7 @@ use vllm_text::backend::hf::{ResolvedModelFiles, TokenizerSource};
 use vllm_text::Prompt;
 use vllm_tokenizer::DynTokenizer;
 
-use super::prefix_cache::PrefixEncoder;
+use super::l1_cache::L1Encoder;
 use crate::tokenizer::cache::{entry_overhead_bytes, EncodeCache};
 use crate::tokenizer::TokenizerCacheConfig;
 
@@ -27,7 +27,7 @@ pub(crate) type FrontendCache = EncodeCache<EncodingKey, Vec<u32>>;
 pub(crate) struct PromptEncoder {
     tokenizer: DynTokenizer,
     cache: Option<Arc<FrontendCache>>,
-    prefix: Option<PrefixEncoder>,
+    l1: Option<L1Encoder>,
     instance: u64,
     model_id: Arc<str>,
     oversized_warning: Arc<Once>,
@@ -51,7 +51,7 @@ impl PromptEncoder {
         Self {
             tokenizer,
             cache,
-            prefix: None,
+            l1: None,
             // Clones share an ID; new instances get distinct IDs.
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             model_id: Arc::from(model_id),
@@ -59,8 +59,8 @@ impl PromptEncoder {
         }
     }
 
-    pub(crate) fn with_prefix_cache(mut self, prefix: Option<PrefixEncoder>) -> Self {
-        self.prefix = prefix;
+    pub(crate) fn with_l1_cache(mut self, l1: Option<L1Encoder>) -> Self {
+        self.l1 = l1;
         self
     }
 
@@ -139,9 +139,9 @@ impl PromptEncoder {
         cache_salt: Option<&str>,
     ) -> vllm_tokenizer::Result<Encoded> {
         // BOS/EOS post-processing is not prefix-stable, so L1 skips it.
-        if let Some(prefix) = self.prefix.as_ref().filter(|_| !add_special_tokens) {
+        if let Some(l1) = self.l1.as_ref().filter(|_| !add_special_tokens) {
             if let Some((ids, cached_tokens)) =
-                prefix.encode(self.tokenizer.as_ref(), self.instance, text, cache_salt)?
+                l1.encode(self.tokenizer.as_ref(), self.instance, text, cache_salt)?
             {
                 return Ok(Encoded { ids, cached_tokens });
             }

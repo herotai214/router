@@ -1,4 +1,5 @@
-//! L1 prefix encoding cache.
+//! L1 prefix encoding cache: router-side token IDs, not the worker's KV
+//! prefix cache.
 //!
 //! Hugging Face tokenizers (and fastokens) split the input on added tokens
 //! before normalizing, pre-tokenizing and running the model, and each text
@@ -46,7 +47,7 @@ use crate::metrics::TokenizerMetrics;
 
 /// L1 budgets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PrefixCacheConfig {
+pub struct L1CacheConfig {
     /// Estimated bytes retained across models. Must be at least 1.
     pub max_bytes: usize,
     /// Tree nodes retained across models. Must be at least 1.
@@ -57,31 +58,31 @@ pub struct PrefixCacheConfig {
     pub max_insert_segments: usize,
     /// Child key hashing strategy. The default avoids hashing whole long
     /// segments; `Full` is useful for collision-heavy diagnostics.
-    pub hash_strategy: PrefixCacheHashStrategy,
+    pub hash_strategy: L1HashStrategy,
     /// Re-encode every prompt in full and compare (debugging only).
     pub verify: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrefixCacheHashStrategy {
+pub enum L1HashStrategy {
     FirstLast64,
     Full,
 }
 
-impl Default for PrefixCacheConfig {
+impl Default for L1CacheConfig {
     fn default() -> Self {
         Self {
             max_bytes: 256 * 1024 * 1024,
             max_nodes: 65_536,
             max_insert_bytes: 32 * 1024 * 1024,
             max_insert_segments: 4096,
-            hash_strategy: PrefixCacheHashStrategy::FirstLast64,
+            hash_strategy: L1HashStrategy::FirstLast64,
             verify: false,
         }
     }
 }
 
-impl PrefixCacheConfig {
+impl L1CacheConfig {
     pub fn validate(&self) -> Result<()> {
         if self.max_bytes == 0 || self.max_nodes == 0 || self.max_insert_segments == 0 {
             bail!("L1 limits must be positive");
@@ -95,7 +96,7 @@ impl PrefixCacheConfig {
 
 /// L1 counters and occupancy across models.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PrefixCacheStats {
+pub struct L1CacheStats {
     /// Prompts that had at least one boundary and went through the tree.
     pub lookups: u64,
     /// Lookups that reused at least one cached token.
@@ -470,13 +471,13 @@ struct SegmentKey {
     fingerprint: u64,
 }
 
-fn segment_key(segment: &str, strategy: PrefixCacheHashStrategy) -> SegmentKey {
+fn segment_key(segment: &str, strategy: L1HashStrategy) -> SegmentKey {
     let bytes = segment.as_bytes();
     let mut hasher = DefaultHasher::new();
     match strategy {
-        PrefixCacheHashStrategy::Full => bytes.hash(&mut hasher),
-        PrefixCacheHashStrategy::FirstLast64 if bytes.len() <= 128 => bytes.hash(&mut hasher),
-        PrefixCacheHashStrategy::FirstLast64 => {
+        L1HashStrategy::Full => bytes.hash(&mut hasher),
+        L1HashStrategy::FirstLast64 if bytes.len() <= 128 => bytes.hash(&mut hasher),
+        L1HashStrategy::FirstLast64 => {
             bytes[..64].hash(&mut hasher);
             bytes[bytes.len() - 64..].hash(&mut hasher);
         }
@@ -580,12 +581,7 @@ impl Tree {
         node
     }
 
-    fn child(
-        &self,
-        parent: usize,
-        segment: &str,
-        strategy: PrefixCacheHashStrategy,
-    ) -> Option<usize> {
+    fn child(&self, parent: usize, segment: &str, strategy: L1HashStrategy) -> Option<usize> {
         self.node(parent)
             .children
             .get(&segment_key(segment, strategy))?
@@ -594,7 +590,7 @@ impl Tree {
             .find(|&id| self.node(id).first_segment() == segment)
     }
 
-    fn add_child(&mut self, parent: usize, child: usize, strategy: PrefixCacheHashStrategy) {
+    fn add_child(&mut self, parent: usize, child: usize, strategy: L1HashStrategy) {
         let key = segment_key(self.node(child).first_segment(), strategy);
         let node = self.node_mut(parent);
         node.children.entry(key).or_default().push(child);
@@ -618,7 +614,7 @@ impl Tree {
         root: usize,
         text: &str,
         bounds: &[usize],
-        strategy: PrefixCacheHashStrategy,
+        strategy: L1HashStrategy,
     ) -> (Vec<Step>, usize) {
         let mut steps = Vec::new();
         let (mut node, mut offset) = (root, 0);
@@ -663,7 +659,7 @@ impl Tree {
         text: &str,
         bounds: &[usize],
         tick: u64,
-        strategy: PrefixCacheHashStrategy,
+        strategy: L1HashStrategy,
     ) -> Hit {
         let mut hit = Hit::default();
         for step in self.walk(root, text, bounds, strategy).0 {
@@ -711,7 +707,7 @@ impl Tree {
     }
 
     /// Split `id` at `marks[mark]`; returns the new upper node.
-    fn split(&mut self, id: usize, mark: usize, strategy: PrefixCacheHashStrategy) -> usize {
+    fn split(&mut self, id: usize, mark: usize, strategy: L1HashStrategy) -> usize {
         let old_bytes = self.node(id).bytes();
         let node = self.node_mut(id);
         let (byte, token) = node.marks[mark];
@@ -753,7 +749,7 @@ impl Tree {
 
     /// Remove a leaf. Single-child chains are kept: merging them would copy
     /// whole edges under the write lock.
-    fn remove_leaf(&mut self, id: usize, strategy: PrefixCacheHashStrategy) {
+    fn remove_leaf(&mut self, id: usize, strategy: L1HashStrategy) {
         let key = segment_key(self.node(id).first_segment(), strategy);
         let parent = self.release(id).parent;
         self.remove_child(parent, id, key);
@@ -766,7 +762,7 @@ impl Tree {
     }
 
     /// Evict least-recently-used leaves down to 90% of the limits.
-    fn evict(&mut self, config: &PrefixCacheConfig) -> u64 {
+    fn evict(&mut self, config: &L1CacheConfig) -> u64 {
         if self.bytes <= config.max_bytes && self.live <= config.max_nodes {
             return 0;
         }
@@ -818,13 +814,13 @@ fn publish_occupancy(nodes_delta: isize, bytes_delta: isize) {
     let mut total = OCCUPANCY.lock();
     total.nodes = total.nodes.saturating_add_signed(nodes_delta);
     total.bytes = total.bytes.saturating_add_signed(bytes_delta);
-    TokenizerMetrics::set_prefix_cache_nodes(total.nodes);
-    TokenizerMetrics::set_prefix_cache_bytes(total.bytes);
+    TokenizerMetrics::set_l1_nodes(total.nodes);
+    TokenizerMetrics::set_l1_bytes(total.bytes);
 }
 
 /// Shared L1 tree with one namespace per (tokenizer instance, cache_salt).
-pub(crate) struct PrefixCache {
-    config: PrefixCacheConfig,
+pub(crate) struct L1Cache {
+    config: L1CacheConfig,
     tree: RwLock<Tree>,
     tick: AtomicU64,
     lookups: AtomicU64,
@@ -836,8 +832,8 @@ pub(crate) struct PrefixCache {
     verify_mismatches: AtomicU64,
 }
 
-impl PrefixCache {
-    pub(crate) fn new(config: PrefixCacheConfig) -> Result<Self> {
+impl L1Cache {
+    pub(crate) fn new(config: L1CacheConfig) -> Result<Self> {
         config.validate()?;
         Ok(Self {
             config,
@@ -853,12 +849,12 @@ impl PrefixCache {
         })
     }
 
-    pub(crate) fn stats(&self) -> PrefixCacheStats {
+    pub(crate) fn stats(&self) -> L1CacheStats {
         let (nodes, bytes) = {
             let tree = self.tree.read();
             (tree.live, tree.bytes)
         };
-        PrefixCacheStats {
+        L1CacheStats {
             lookups: self.lookups.load(Ordering::Relaxed),
             hits: self.hits.load(Ordering::Relaxed),
             cached_tokens: self.cached_tokens.load(Ordering::Relaxed),
@@ -951,7 +947,7 @@ impl PrefixCache {
         let evicted = tree.evict(&self.config);
         if evicted > 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
-            TokenizerMetrics::record_prefix_cache_evictions(evicted);
+            TokenizerMetrics::record_l1_evictions(evicted);
         }
         publish_occupancy(
             tree.live as isize - before_nodes as isize,
@@ -960,7 +956,7 @@ impl PrefixCache {
     }
 }
 
-impl Drop for PrefixCache {
+impl Drop for L1Cache {
     fn drop(&mut self) {
         let tree = self.tree.get_mut();
         publish_occupancy(-(tree.live as isize), -(tree.bytes as isize));
@@ -969,16 +965,16 @@ impl Drop for PrefixCache {
 
 /// Per-model L1 handle used by `PromptEncoder`.
 #[derive(Clone)]
-pub(crate) struct PrefixEncoder {
-    cache: Arc<PrefixCache>,
+pub(crate) struct L1Encoder {
+    cache: Arc<L1Cache>,
     matcher: Arc<BoundaryMatcher>,
     model_id: Arc<str>,
     disabled: Arc<AtomicBool>,
     mismatch_warning: Arc<Once>,
 }
 
-impl PrefixEncoder {
-    pub(crate) fn new(model_id: &str, cache: Arc<PrefixCache>, matcher: BoundaryMatcher) -> Self {
+impl L1Encoder {
+    pub(crate) fn new(model_id: &str, cache: Arc<L1Cache>, matcher: BoundaryMatcher) -> Self {
         Self {
             cache,
             matcher: Arc::new(matcher),
@@ -1029,6 +1025,10 @@ impl PrefixEncoder {
             let tokens_after = ids.len() + piece.len();
             let cost = (bound - origin) + (tokens_after - start_tokens) * 4 + NODE_OVERHEAD_BYTES;
             if cost > self.cache.config.max_insert_bytes {
+                // No bound is stored, so `insert` will not run to count it.
+                if stored == 0 {
+                    self.cache.oversized.fetch_add(1, Ordering::Relaxed);
+                }
                 ids.extend(piece);
                 offset = bound;
                 break;
@@ -1045,7 +1045,7 @@ impl PrefixEncoder {
             if full != ids {
                 self.disabled.store(true, Ordering::Relaxed);
                 self.cache.verify_mismatches.fetch_add(1, Ordering::Relaxed);
-                TokenizerMetrics::record_prefix_cache_verify_mismatch();
+                TokenizerMetrics::record_l1_verify_mismatch();
                 let first = full.iter().zip(&ids).take_while(|(a, b)| a == b).count();
                 self.mismatch_warning.call_once(|| {
                     tracing::error!(
@@ -1066,7 +1066,7 @@ impl PrefixEncoder {
         self.cache
             .encoded_tokens
             .fetch_add((ids.len() - hit.tokens) as u64, Ordering::Relaxed);
-        TokenizerMetrics::record_prefix_cache_lookup(hit.tokens, ids.len() - hit.tokens);
+        TokenizerMetrics::record_l1_lookup(hit.tokens, ids.len() - hit.tokens);
         if hit.tokens > 0 {
             self.cache.hits.fetch_add(1, Ordering::Relaxed);
         }
@@ -1077,7 +1077,7 @@ impl PrefixEncoder {
     }
 }
 
-pub(crate) fn config_from_env() -> Result<Option<PrefixCacheConfig>> {
+pub(crate) fn config_from_env() -> Result<Option<L1CacheConfig>> {
     parse_config(|name| std::env::var(name).ok())
 }
 
@@ -1089,23 +1089,21 @@ fn parse_flag(name: &str, raw: Option<String>) -> Result<bool> {
     }
 }
 
-fn parse_hash_strategy(raw: Option<String>) -> Result<PrefixCacheHashStrategy> {
+fn parse_hash_strategy(raw: Option<String>) -> Result<L1HashStrategy> {
     match raw.as_deref() {
         None | Some("first_last_64" | "first-last-64" | "first_last" | "first-last") => {
-            Ok(PrefixCacheHashStrategy::FirstLast64)
+            Ok(L1HashStrategy::FirstLast64)
         }
-        Some("full") | Some("full_segment") | Some("full-segment") => {
-            Ok(PrefixCacheHashStrategy::Full)
-        }
+        Some("full") | Some("full_segment") | Some("full-segment") => Ok(L1HashStrategy::Full),
         Some(raw) => bail!("VLLM_ROUTER_L1_HASH_STRATEGY must be first_last_64 or full, got {raw}"),
     }
 }
 
-fn parse_config(read: impl Fn(&str) -> Option<String>) -> Result<Option<PrefixCacheConfig>> {
+fn parse_config(read: impl Fn(&str) -> Option<String>) -> Result<Option<L1CacheConfig>> {
     if !parse_flag("VLLM_ROUTER_L1_CACHE", read("VLLM_ROUTER_L1_CACHE"))? {
         return Ok(None);
     }
-    let mut config = PrefixCacheConfig {
+    let mut config = L1CacheConfig {
         verify: parse_flag("VLLM_ROUTER_L1_VERIFY", read("VLLM_ROUTER_L1_VERIFY"))?,
         hash_strategy: parse_hash_strategy(read("VLLM_ROUTER_L1_HASH_STRATEGY"))?,
         ..Default::default()
@@ -1377,17 +1375,14 @@ mod tests {
         .unwrap()
     }
 
-    fn encoder(config: PrefixCacheConfig) -> (PrefixEncoder, Arc<PrefixCache>) {
-        let cache = Arc::new(PrefixCache::new(config).unwrap());
+    fn encoder(config: L1CacheConfig) -> (L1Encoder, Arc<L1Cache>) {
+        let cache = Arc::new(L1Cache::new(config).unwrap());
         let matcher =
             BoundaryMatcher::new(&token_set(vec![spec("<s>"), spec("</s>")], true)).unwrap();
-        (
-            PrefixEncoder::new("test-model", cache.clone(), matcher),
-            cache,
-        )
+        (L1Encoder::new("test-model", cache.clone(), matcher), cache)
     }
 
-    fn check(encoder: &PrefixEncoder, tokenizer: &dyn Tokenizer, text: &str) -> usize {
+    fn check(encoder: &L1Encoder, tokenizer: &dyn Tokenizer, text: &str) -> usize {
         let (ids, cached) = encoder
             .encode(tokenizer, 0, text, None)
             .unwrap()
@@ -1481,7 +1476,7 @@ mod tests {
     #[test]
     fn eviction_keeps_budget_and_recent_paths() {
         let tokenizer = fixture_tokenizer();
-        let config = PrefixCacheConfig {
+        let config = L1CacheConfig {
             max_bytes: 4096,
             max_nodes: 16,
             max_insert_bytes: 1024,
@@ -1519,7 +1514,7 @@ mod tests {
     #[test]
     fn concurrent_encodes_match_uncached() {
         let tokenizer = Arc::new(fixture_tokenizer());
-        let (encoder, cache) = encoder(PrefixCacheConfig {
+        let (encoder, cache) = encoder(L1CacheConfig {
             max_bytes: 64 * 1024,
             max_nodes: 64,
             max_insert_bytes: 8 * 1024,
@@ -1572,7 +1567,7 @@ mod tests {
         }
 
         fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> Gauge {
-            let name = if key.name() == "vllm_tokenizer_prefix_cache_nodes" {
+            let name = if key.name() == "vllm_tokenizer_l1_nodes" {
                 "nodes"
             } else {
                 "bytes"
@@ -1599,7 +1594,7 @@ mod tests {
                 let (sets, tokenizer) = (sets.clone(), tokenizer.clone());
                 scope.spawn(move || {
                     metrics::with_local_recorder(&PairRecorder(sets), || {
-                        let (encoder, _cache) = encoder(PrefixCacheConfig {
+                        let (encoder, _cache) = encoder(L1CacheConfig {
                             max_bytes: 64 * 1024,
                             max_nodes: 64,
                             max_insert_bytes: 8 * 1024,
@@ -1652,7 +1647,7 @@ mod tests {
 
     fn timed_encode(
         iters: usize,
-        encoder: &PrefixEncoder,
+        encoder: &L1Encoder,
         tokenizer: &dyn Tokenizer,
         text: &str,
     ) -> std::time::Duration {
@@ -1685,7 +1680,7 @@ mod tests {
         format!("{head}{middle}{tail}")
     }
 
-    fn build_lookup_tree(segments: &[String], strategy: PrefixCacheHashStrategy) -> (Tree, usize) {
+    fn build_lookup_tree(segments: &[String], strategy: L1HashStrategy) -> (Tree, usize) {
         let mut tree = Tree::default();
         let root = tree.alloc(Node {
             parent: NO_PARENT,
@@ -1704,8 +1699,8 @@ mod tests {
         (tree, root)
     }
 
-    fn hash_report_encoder(strategy: PrefixCacheHashStrategy) -> (PrefixEncoder, Arc<PrefixCache>) {
-        encoder(PrefixCacheConfig {
+    fn hash_report_encoder(strategy: L1HashStrategy) -> (L1Encoder, Arc<L1Cache>) {
+        encoder(L1CacheConfig {
             max_bytes: 512 * 1024 * 1024,
             max_nodes: 1_000_000,
             max_insert_bytes: 256 * 1024 * 1024,
@@ -1720,7 +1715,7 @@ mod tests {
     }
 
     fn warm_hash_report_encoder(
-        encoder: &PrefixEncoder,
+        encoder: &L1Encoder,
         tokenizer: &dyn Tokenizer,
         segments: &[String],
     ) {
@@ -1729,10 +1724,10 @@ mod tests {
         }
     }
 
-    fn strategy_name(strategy: PrefixCacheHashStrategy) -> &'static str {
+    fn strategy_name(strategy: L1HashStrategy) -> &'static str {
         match strategy {
-            PrefixCacheHashStrategy::FirstLast64 => "first_last_64",
-            PrefixCacheHashStrategy::Full => "full",
+            L1HashStrategy::FirstLast64 => "first_last_64",
+            L1HashStrategy::Full => "full",
         }
     }
 
@@ -1832,13 +1827,12 @@ mod tests {
                     assert!(query.len() > 128);
 
                     let (first_last_tree, first_last_root) =
-                        build_lookup_tree(&segments, PrefixCacheHashStrategy::FirstLast64);
-                    let (full_tree, full_root) =
-                        build_lookup_tree(&segments, PrefixCacheHashStrategy::Full);
+                        build_lookup_tree(&segments, L1HashStrategy::FirstLast64);
+                    let (full_tree, full_root) = build_lookup_tree(&segments, L1HashStrategy::Full);
                     let first_last_bucket = first_last_tree
                         .node(first_last_root)
                         .children
-                        .get(&segment_key(query, PrefixCacheHashStrategy::FirstLast64))
+                        .get(&segment_key(query, L1HashStrategy::FirstLast64))
                         .map_or(0, Vec::len);
                     assert_eq!(
                         first_last_bucket,
@@ -1850,14 +1844,10 @@ mod tests {
                         (64 * 1024 * 1024 / (len * siblings)).max(32)
                     };
                     let first_last_lookup = timed_lookup(lookup_iters, || {
-                        first_last_tree.child(
-                            first_last_root,
-                            query,
-                            PrefixCacheHashStrategy::FirstLast64,
-                        )
+                        first_last_tree.child(first_last_root, query, L1HashStrategy::FirstLast64)
                     });
                     let full_lookup = timed_lookup(lookup_iters, || {
-                        full_tree.child(full_root, query, PrefixCacheHashStrategy::Full)
+                        full_tree.child(full_root, query, L1HashStrategy::Full)
                     });
                     report_lookup_row(
                         case,
@@ -1869,9 +1859,8 @@ mod tests {
                         full_lookup,
                     );
 
-                    let (first_last_encoder, _) =
-                        hash_report_encoder(PrefixCacheHashStrategy::FirstLast64);
-                    let (full_encoder, _) = hash_report_encoder(PrefixCacheHashStrategy::Full);
+                    let (first_last_encoder, _) = hash_report_encoder(L1HashStrategy::FirstLast64);
+                    let (full_encoder, _) = hash_report_encoder(L1HashStrategy::Full);
                     warm_hash_report_encoder(&first_last_encoder, &tokenizer, &segments);
                     warm_hash_report_encoder(&full_encoder, &tokenizer, &segments);
                     let query_text = hash_report_prompt(query);
@@ -1906,8 +1895,8 @@ mod tests {
 
         println!(
             "Set VLLM_ROUTER_L1_HASH_STRATEGY={} or {} to switch the runtime strategy.",
-            strategy_name(PrefixCacheHashStrategy::FirstLast64),
-            strategy_name(PrefixCacheHashStrategy::Full)
+            strategy_name(L1HashStrategy::FirstLast64),
+            strategy_name(L1HashStrategy::Full)
         );
     }
 
@@ -2001,13 +1990,12 @@ mod tests {
                         siblings,
                     };
                     let (first_last_tree, first_last_root) =
-                        build_lookup_tree(&segments, PrefixCacheHashStrategy::FirstLast64);
-                    let (full_tree, full_root) =
-                        build_lookup_tree(&segments, PrefixCacheHashStrategy::Full);
+                        build_lookup_tree(&segments, L1HashStrategy::FirstLast64);
+                    let (full_tree, full_root) = build_lookup_tree(&segments, L1HashStrategy::Full);
                     let first_last_bucket = first_last_tree
                         .node(first_last_root)
                         .children
-                        .get(&segment_key(query, PrefixCacheHashStrategy::FirstLast64))
+                        .get(&segment_key(query, L1HashStrategy::FirstLast64))
                         .map_or(0, Vec::len);
                     assert_eq!(
                         first_last_bucket,
@@ -2019,14 +2007,10 @@ mod tests {
                         (64 * 1024 * 1024 / (bytes * siblings)).max(16)
                     };
                     let first_last_lookup = timed_lookup(lookup_iters, || {
-                        first_last_tree.child(
-                            first_last_root,
-                            query,
-                            PrefixCacheHashStrategy::FirstLast64,
-                        )
+                        first_last_tree.child(first_last_root, query, L1HashStrategy::FirstLast64)
                     });
                     let full_lookup = timed_lookup(lookup_iters, || {
-                        full_tree.child(full_root, query, PrefixCacheHashStrategy::Full)
+                        full_tree.child(full_root, query, L1HashStrategy::Full)
                     });
                     report_lookup_row(
                         dims,
@@ -2036,9 +2020,8 @@ mod tests {
                         full_lookup,
                     );
 
-                    let (first_last_encoder, _) =
-                        hash_report_encoder(PrefixCacheHashStrategy::FirstLast64);
-                    let (full_encoder, _) = hash_report_encoder(PrefixCacheHashStrategy::Full);
+                    let (first_last_encoder, _) = hash_report_encoder(L1HashStrategy::FirstLast64);
+                    let (full_encoder, _) = hash_report_encoder(L1HashStrategy::Full);
                     warm_hash_report_encoder(&first_last_encoder, &tokenizer, &segments);
                     warm_hash_report_encoder(&full_encoder, &tokenizer, &segments);
                     let (ids, cached) = first_last_encoder
@@ -2064,7 +2047,7 @@ mod tests {
         }
     }
 
-    fn check_invariants(cache: &PrefixCache) {
+    fn check_invariants(cache: &L1Cache) {
         let tree = cache.tree.read();
         let live: Vec<usize> = (0..tree.nodes.len())
             .filter(|&id| tree.nodes[id].is_some())
@@ -2116,7 +2099,7 @@ mod tests {
             "hi", " there", "\n", "数", "😀", "<s", "s>", "</", " \t", "1", "é",
         ];
         for budget in [512, 4096, 1 << 20] {
-            let (encoder, cache) = encoder(PrefixCacheConfig {
+            let (encoder, cache) = encoder(L1CacheConfig {
                 max_bytes: budget,
                 max_nodes: 24,
                 max_insert_bytes: budget / 2,
@@ -2233,7 +2216,7 @@ mod tests {
                 .collect();
             let boundaries = matcher.tokens().to_vec();
             let cache = Arc::new(
-                PrefixCache::new(PrefixCacheConfig {
+                L1Cache::new(L1CacheConfig {
                     max_bytes: 1 << 20,
                     max_nodes: 512,
                     max_insert_bytes: 1 << 18,
@@ -2241,7 +2224,7 @@ mod tests {
                 })
                 .unwrap(),
             );
-            let encoder = PrefixEncoder::new(dir, cache.clone(), matcher);
+            let encoder = L1Encoder::new(dir, cache.clone(), matcher);
             let words = [
                 "hello", " world", "  ", "\n", "\n\n", "\t", "数据", "😀", "é", "\u{301}",
                 "\u{338}", ">", "<", "|", "▁", "Ġ", "'s", "123", " 4", "<|", "|>", "</", "\u{a0}",
@@ -2322,7 +2305,7 @@ mod tests {
             inner: fixture_tokenizer(),
             calls: AtomicUsize::new(0),
         };
-        let (encoder, _) = encoder(PrefixCacheConfig {
+        let (encoder, _) = encoder(L1CacheConfig {
             max_insert_segments: 2,
             ..Default::default()
         });
@@ -2390,7 +2373,7 @@ mod tests {
             }
         }
         let tokenizer = Drifting(fixture_tokenizer());
-        let (encoder, cache) = encoder(PrefixCacheConfig {
+        let (encoder, cache) = encoder(L1CacheConfig {
             verify: true,
             ..Default::default()
         });
@@ -2441,7 +2424,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .hash_strategy,
-            PrefixCacheHashStrategy::Full
+            L1HashStrategy::Full
         );
         for (name, value) in [
             ("VLLM_ROUTER_L1_CACHE", "maybe"),

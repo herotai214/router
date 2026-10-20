@@ -73,8 +73,9 @@ can use `EngineFrontend::with_tokenizer_cache(timeout, config)`. See the
 ## Optional L1 prefix encoding cache
 
 L1 reuses token IDs for the longest previously seen prefix of a rendered
-prompt, so a growing conversation only encodes its new turns. It is off by
-default:
+prompt, so a growing conversation only encodes its new turns. It caches
+router-side tokenizer output and is unrelated to the worker's KV prefix cache
+(`enable_prefix_caching`). It is off by default:
 
 ```bash
 VLLM_ROUTER_L1_CACHE=1 vllm-router --worker-urls grpc://127.0.0.1:50051
@@ -130,8 +131,8 @@ L1 runs after L0 when both are enabled. It is skipped for
 `prepend_scheme: first`. With `VLLM_ROUTER_L1_VERIFY=1`, a mismatch logs an
 error, returns the full encode and disables L1 for that model.
 
-Metrics: `vllm_tokenizer_prefix_cache_{lookups,hits,cached_tokens,encoded_tokens,evictions,verify_mismatches}_total`
-and the `vllm_tokenizer_prefix_cache_{nodes,bytes}` gauges. With
+Metrics: `vllm_tokenizer_l1_{lookups,hits,cached_tokens,encoded_tokens,evictions,verify_mismatches}_total`
+and the `vllm_tokenizer_l1_{nodes,bytes}` gauges. With
 `VLLM_ROUTER_STAGES=1`, `x-router-stages` reports `encode_cached_tokens`.
 Rust callers can use `EngineFrontend::with_encoding_caches(timeout, l0, l1)`.
 See the [L1 benchmark guide](../benchmarks/grpc_frontend_l1.md).
