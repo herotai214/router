@@ -343,7 +343,16 @@ async fn l1_matches_uncached_for_qwen_template_with_tools_and_special_text() {
         .insert("add_special_tokens".into(), json!(true));
     let (got, cached) = ids(&fresh, special.clone()).await;
     assert_eq!((got, cached), (ids(&off, special).await.0, 0));
-    assert_eq!(fresh.l1_cache_stats().unwrap().lookups, before.lookups);
+    let after = fresh.l1_cache_stats().unwrap();
+    assert_eq!(after.lookups, before.lookups);
+    assert_eq!(after.bypasses, before.bypasses + 1);
+    assert_eq!(
+        metric(
+            &metrics,
+            r#"vllm_tokenizer_l1_bypasses_total{reason="add_special_tokens"}"#
+        ),
+        1.0
+    );
 
     // L0 answers exact repeats before L1 is consulted.
     let both = l1_frontend(Some(Default::default()), Default::default());

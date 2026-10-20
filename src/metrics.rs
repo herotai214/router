@@ -404,6 +404,10 @@ pub fn init_metrics() {
         "vllm_tokenizer_l1_verify_mismatches_total",
         "Total L1 verify-mode mismatches"
     );
+    describe_counter!(
+        "vllm_tokenizer_l1_bypasses_total",
+        "Total prompts on an L1-enabled model that skipped L1, by reason"
+    );
     describe_gauge!(
         "vllm_tokenizer_l1_nodes",
         "Current number of L1 prefix tree nodes"
@@ -1100,6 +1104,10 @@ impl TokenizerMetrics {
 
     pub fn record_l1_verify_mismatch() {
         counter!("vllm_tokenizer_l1_verify_mismatches_total").increment(1);
+    }
+
+    pub fn record_l1_bypass(reason: &'static str) {
+        counter!("vllm_tokenizer_l1_bypasses_total", "reason" => reason).increment(1);
     }
 
     pub fn set_l1_nodes(nodes: usize) {

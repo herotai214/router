@@ -111,8 +111,35 @@ pub struct L1CacheStats {
     pub oversized: u64,
     /// Verify-mode mismatches (each disables L1 for that model).
     pub verify_mismatches: u64,
+    /// Prompts on an L1-enabled model that skipped the tree (any reason).
+    pub bypasses: u64,
     pub nodes: usize,
     pub bytes: usize,
+}
+
+/// Why a prompt on an L1-enabled model did not go through the tree. An L0
+/// hit is not a bypass: L1 is not consulted at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum L1Bypass {
+    /// The renderer produced token IDs (e.g. Harmony), not text.
+    TokenIds,
+    /// BOS/EOS post-processing is not prefix-stable.
+    AddSpecialTokens,
+    /// The prompt contains no boundary token.
+    NoBoundary,
+    /// L1 was turned off for this model after a verify mismatch.
+    Disabled,
+}
+
+impl L1Bypass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TokenIds => "token_ids",
+            Self::AddSpecialTokens => "add_special_tokens",
+            Self::NoBoundary => "no_boundary",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -830,6 +857,7 @@ pub(crate) struct L1Cache {
     evictions: AtomicU64,
     oversized: AtomicU64,
     verify_mismatches: AtomicU64,
+    bypasses: AtomicU64,
 }
 
 impl L1Cache {
@@ -846,6 +874,7 @@ impl L1Cache {
             evictions: AtomicU64::new(0),
             oversized: AtomicU64::new(0),
             verify_mismatches: AtomicU64::new(0),
+            bypasses: AtomicU64::new(0),
         })
     }
 
@@ -862,6 +891,7 @@ impl L1Cache {
             evictions: self.evictions.load(Ordering::Relaxed),
             oversized: self.oversized.load(Ordering::Relaxed),
             verify_mismatches: self.verify_mismatches.load(Ordering::Relaxed),
+            bypasses: self.bypasses.load(Ordering::Relaxed),
             nodes,
             bytes,
         }
@@ -994,10 +1024,12 @@ impl L1Encoder {
         cache_salt: Option<&str>,
     ) -> vllm_tokenizer::Result<Option<(Vec<u32>, usize)>> {
         if self.disabled.load(Ordering::Relaxed) {
+            self.record_bypass(L1Bypass::Disabled);
             return Ok(None);
         }
         let bounds = self.matcher.boundaries(text);
         if bounds.is_empty() {
+            self.record_bypass(L1Bypass::NoBoundary);
             return Ok(None);
         }
         let namespace = Namespace {
@@ -1074,6 +1106,11 @@ impl L1Encoder {
             self.cache.insert(&namespace, text, &ids, &all_bounds);
         }
         Ok(Some((ids, hit.tokens)))
+    }
+
+    pub(crate) fn record_bypass(&self, reason: L1Bypass) {
+        self.cache.bypasses.fetch_add(1, Ordering::Relaxed);
+        TokenizerMetrics::record_l1_bypass(reason.as_str());
     }
 }
 
@@ -2382,6 +2419,26 @@ mod tests {
         assert_eq!((ids, cached), (tokenizer.encode(text, false).unwrap(), 0));
         assert_eq!(cache.stats().verify_mismatches, 1);
         assert!(encoder.encode(&tokenizer, 0, text, None).unwrap().is_none());
+        assert_eq!(cache.stats().bypasses, 1);
+    }
+
+    #[test]
+    fn bypasses_are_counted_only_when_l1_is_skipped() {
+        use super::super::encode_cache::PromptEncoder;
+        use vllm_text::Prompt;
+
+        let (l1, cache) = encoder(Default::default());
+        let prompts = PromptEncoder::new("fixture", Arc::new(fixture_tokenizer()), None)
+            .with_l1_cache(Some(l1));
+        let encode = |prompt, add_special_tokens| {
+            prompts.encode(prompt, add_special_tokens, None).unwrap();
+        };
+        encode(Prompt::TokenIds(vec![1, 2]), false);
+        encode(Prompt::Text("<s>hi</s>".into()), true);
+        encode(Prompt::Text("no boundary here".into()), false);
+        assert_eq!((cache.stats().bypasses, cache.stats().lookups), (3, 0));
+        encode(Prompt::Text("<s>hi</s>".into()), false);
+        assert_eq!((cache.stats().bypasses, cache.stats().lookups), (3, 1));
     }
 
     #[test]

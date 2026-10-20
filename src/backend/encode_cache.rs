@@ -9,7 +9,7 @@ use vllm_text::backend::hf::{ResolvedModelFiles, TokenizerSource};
 use vllm_text::Prompt;
 use vllm_tokenizer::DynTokenizer;
 
-use super::l1_cache::L1Encoder;
+use super::l1_cache::{L1Bypass, L1Encoder};
 use crate::tokenizer::cache::{entry_overhead_bytes, EncodeCache};
 use crate::tokenizer::TokenizerCacheConfig;
 
@@ -84,10 +84,13 @@ impl PromptEncoder {
     ) -> vllm_tokenizer::Result<Encoded> {
         let text = match prompt {
             Prompt::TokenIds(ids) => {
+                if let Some(l1) = &self.l1 {
+                    l1.record_bypass(L1Bypass::TokenIds);
+                }
                 return Ok(Encoded {
                     ids,
                     cached_tokens: 0,
-                })
+                });
             }
             Prompt::Text(text) => text,
         };
@@ -138,9 +141,11 @@ impl PromptEncoder {
         add_special_tokens: bool,
         cache_salt: Option<&str>,
     ) -> vllm_tokenizer::Result<Encoded> {
-        // BOS/EOS post-processing is not prefix-stable, so L1 skips it.
-        if let Some(l1) = self.l1.as_ref().filter(|_| !add_special_tokens) {
-            if let Some((ids, cached_tokens)) =
+        if let Some(l1) = &self.l1 {
+            // BOS/EOS post-processing is not prefix-stable, so L1 skips it.
+            if add_special_tokens {
+                l1.record_bypass(L1Bypass::AddSpecialTokens);
+            } else if let Some((ids, cached_tokens)) =
                 l1.encode(self.tokenizer.as_ref(), self.instance, text, cache_salt)?
             {
                 return Ok(Encoded { ids, cached_tokens });

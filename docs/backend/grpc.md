@@ -132,7 +132,13 @@ L1 runs after L0 when both are enabled. It is skipped for
 error, returns the full encode and disables L1 for that model.
 
 Metrics: `vllm_tokenizer_l1_{lookups,hits,cached_tokens,encoded_tokens,evictions,verify_mismatches}_total`
-and the `vllm_tokenizer_l1_{nodes,bytes}` gauges. With
+and the `vllm_tokenizer_l1_{nodes,bytes}` gauges.
+`vllm_tokenizer_l1_bypasses_total{reason}` counts prompts on an L1-enabled
+model that skipped the tree: `token_ids` (e.g. Harmony), `add_special_tokens`,
+`no_boundary`, or `disabled` after a verify mismatch. A model that cannot use
+L1 at all logs `L1 disabled for this model` with the reason at load. With an
+HTTP worker pool the router does not tokenize, so `VLLM_ROUTER_L0_CACHE` and
+`VLLM_ROUTER_L1_CACHE` are ignored with a warning at startup. With
 `VLLM_ROUTER_STAGES=1`, `x-router-stages` reports `encode_cached_tokens`.
 Rust callers can use `EngineFrontend::with_encoding_caches(timeout, l0, l1)`.
 See the [L1 benchmark guide](../benchmarks/grpc_frontend_l1.md).

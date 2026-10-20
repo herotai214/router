@@ -148,3 +148,44 @@ impl EngineFrontend {
         self.grpc.remove_client(worker_url);
     }
 }
+
+/// HTTP pools proxy the request body, so the router never tokenizes and the
+/// L0/L1 switches have no effect. Say so instead of ignoring them silently.
+pub(crate) fn warn_ignored_encoding_caches() {
+    for name in ignored_cache_switches(|name| std::env::var(name).ok()) {
+        tracing::warn!("{name} is ignored: HTTP worker pools do not tokenize in the router");
+    }
+}
+
+fn ignored_cache_switches(read: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    ["VLLM_ROUTER_L0_CACHE", "VLLM_ROUTER_L1_CACHE"]
+        .into_iter()
+        .filter(|name| !matches!(read(name).as_deref(), None | Some("" | "0" | "false")))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ignored_cache_switches;
+
+    #[test]
+    fn http_pools_report_requested_cache_switches() {
+        let read = |values: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                values
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        assert!(ignored_cache_switches(read(&[])).is_empty());
+        assert!(ignored_cache_switches(read(&[("VLLM_ROUTER_L1_CACHE", "0")])).is_empty());
+        assert_eq!(
+            ignored_cache_switches(read(&[
+                ("VLLM_ROUTER_L0_CACHE", "1"),
+                ("VLLM_ROUTER_L1_CACHE", "true"),
+            ])),
+            ["VLLM_ROUTER_L0_CACHE", "VLLM_ROUTER_L1_CACHE"]
+        );
+    }
+}
