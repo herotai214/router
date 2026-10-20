@@ -49,3 +49,36 @@ VLLM_ROUTER_BENCH_REUSE=0,70,99.99 \
 VLLM_ROUTER_BENCH_CONCURRENCY=1 \
 cargo test --release --test grpc_frontend_bench grpc_frontend_l1_overhead -- --ignored --nocapture
 ```
+
+## End to end with a real worker
+
+[`bench_prefix_kvhit.py`](../../benches/backend/bench_prefix_kvhit.py)
+`--shape turns` sends the same shape to a running router: shared earlier
+turns, then a unique last user message. The default `--shape split` cuts
+inside one message, where L1 has no boundary to reuse, so use `turns`.
+
+Start the same gRPC worker once, then run the client against a router started
+with `VLLM_ROUTER_STAGES=1`, first without and then with
+`VLLM_ROUTER_L1_CACHE=1`:
+
+```bash
+VLLM_ROUTER_STAGES=1 VLLM_ROUTER_L1_CACHE=1 \
+  vllm-router --worker-urls grpc://127.0.0.1:50051 --port 30000
+
+python benches/backend/bench_prefix_kvhit.py \
+  --router-url http://127.0.0.1:30000 --model /path/or/hf-id \
+  --shape turns --hit-rate 0.70 \
+  --tokens 131072 --model-dir /path/or/hf-id \
+  --max-tokens 128 --warmup --concurrency 8 --requests 16 --timeout 1800
+```
+
+`wave.summary` reports `ttft_ms` and `e2e_ms` from the client, and from the
+router stages `template_ms`, `encode_ms`, `frontend_ms` and `encode_reuse`
+(cached prompt tokens divided by prompt tokens). Worker KV reuse is the same
+in both runs, so TTFT and e2e should stay level while `encode_ms` and
+`frontend_ms` drop with L1 on, more at higher `--hit-rate` and longer
+prompts. `--tokens` sizes the text for a one-message chat; with `turns` the
+rendered prompt is a little longer, and `prompt_tokens` in each row is the
+exact count. `vllm_tokenizer_l1_*` on the Prometheus port (default
+`127.0.0.1:29000/metrics`) gives run totals, and
+`vllm_tokenizer_l1_bypasses_total{reason}` should stay near zero.
