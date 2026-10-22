@@ -21,7 +21,8 @@ pub(crate) struct EncodingKey {
     text: String,
 }
 
-pub(crate) type FrontendCache = EncodeCache<EncodingKey, Vec<u32>>;
+// Hits share this allocation with `TokenizeOut` instead of copying it.
+pub(crate) type FrontendCache = EncodeCache<EncodingKey, Arc<[u32]>>;
 
 #[derive(Clone)]
 pub(crate) struct PromptEncoder {
@@ -36,7 +37,7 @@ pub(crate) struct PromptEncoder {
 /// Prompt IDs and how many of them came from L0 or L1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Encoded {
-    pub ids: Vec<u32>,
+    pub ids: Arc<[u32]>,
     pub cached_tokens: usize,
 }
 
@@ -70,12 +71,13 @@ impl PromptEncoder {
         prompt: Prompt,
         add_special_tokens: bool,
         cache_salt: Option<&str>,
-    ) -> vllm_tokenizer::Result<Vec<u32>> {
+    ) -> vllm_tokenizer::Result<Arc<[u32]>> {
         self.encode_detailed(prompt, add_special_tokens, cache_salt)
             .map(|encoded| encoded.ids)
     }
 
     /// L0 exact match first, then L1 prefix reuse, then the tokenizer.
+    /// An L0 hit returns the cached `Arc` directly.
     pub(crate) fn encode_detailed(
         &self,
         prompt: Prompt,
@@ -88,7 +90,7 @@ impl PromptEncoder {
                     l1.record_bypass(L1Bypass::TokenIds);
                 }
                 return Ok(Encoded {
-                    ids,
+                    ids: Arc::from(ids),
                     cached_tokens: 0,
                 });
             }
@@ -112,10 +114,12 @@ impl PromptEncoder {
                 Ok(encoded.ids)
             },
             |ids| {
-                let bytes = entry_overhead_bytes::<EncodingKey, Vec<u32>>()
+                let bytes = entry_overhead_bytes::<EncodingKey, Arc<[u32]>>()
                     + key.text.len()
                     + key.cache_salt.as_ref().map_or(0, String::len)
-                    + size_of::<Vec<u32>>()
+                    + size_of::<Arc<[u32]>>()
+                    // Strong and weak counts precede the ids.
+                    + 2 * size_of::<usize>()
                     + ids.len() * size_of::<u32>();
                 if bytes > cache.config().max_entry_bytes {
                     self.oversized_warning.call_once(|| {
@@ -148,11 +152,14 @@ impl PromptEncoder {
             } else if let Some((ids, cached_tokens)) =
                 l1.encode(self.tokenizer.as_ref(), self.instance, text, cache_salt)?
             {
-                return Ok(Encoded { ids, cached_tokens });
+                return Ok(Encoded {
+                    ids: Arc::from(ids),
+                    cached_tokens,
+                });
             }
         }
         Ok(Encoded {
-            ids: self.tokenizer.encode(text, add_special_tokens)?,
+            ids: Arc::from(self.tokenizer.encode(text, add_special_tokens)?),
             cached_tokens: 0,
         })
     }
@@ -259,7 +266,7 @@ mod tests {
         }
     }
 
-    fn encode(encoder: &PromptEncoder, text: &str, special: bool) -> Vec<u32> {
+    fn encode(encoder: &PromptEncoder, text: &str, special: bool) -> Arc<[u32]> {
         encoder
             .encode(Prompt::Text(text.into()), special, None)
             .unwrap()
@@ -356,7 +363,7 @@ mod tests {
                 .encode(Prompt::Text("fail".into()), false, None)
                 .is_err());
             assert_eq!(
-                encoder
+                *encoder
                     .encode(Prompt::TokenIds(vec![5, 4, 3]), true, Some("tenant-a"))
                     .unwrap(),
                 [5, 4, 3]
@@ -430,7 +437,7 @@ mod tests {
                     for i in 0..100 {
                         let text = format!("Hello {}", i % 8);
                         let expected = encoder.tokenizer.encode(&text, false).unwrap();
-                        assert_eq!(encode(&encoder, &text, false), expected);
+                        assert_eq!(encode(&encoder, &text, false)[..], expected);
                     }
                 });
             }
@@ -440,6 +447,42 @@ mod tests {
         assert!(stats.entries <= 8);
         assert!(stats.bytes <= 4096);
         assert!(stats.evictions > 0);
+    }
+
+    #[test]
+    fn hits_share_one_allocation_that_outlives_eviction() {
+        let cache = Arc::new(
+            FrontendCache::new(TokenizerCacheConfig {
+                max_entries: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let encoder =
+            PromptEncoder::new("test-model", CountingTokenizer::new(0), Some(cache.clone()));
+        let uncached = PromptEncoder::new("test-model", CountingTokenizer::new(0), None);
+        let expected = encode(&uncached, "Hello", false);
+
+        let miss = encode(&encoder, "Hello", false);
+        let hit = encode(&encoder, "Hello", false);
+        assert!(Arc::ptr_eq(&miss, &hit));
+        assert_eq!(hit, expected);
+        // Two callers plus the cache entry.
+        assert_eq!(Arc::strong_count(&hit), 3);
+
+        encode(&encoder, "evict", false);
+        assert_eq!(cache.stats().evictions, 1);
+        drop(miss);
+        // The in-flight holder keeps the only reference after eviction.
+        assert_eq!(Arc::strong_count(&hit), 1);
+        assert_eq!(hit, expected);
+
+        let reencoded = encode(&encoder, "Hello", false);
+        assert!(!Arc::ptr_eq(&hit, &reencoded));
+        assert_eq!(reencoded, expected);
+        cache.clear();
+        assert_eq!(Arc::strong_count(&reencoded), 1);
+        assert_eq!(reencoded, expected);
     }
 
     #[test]
