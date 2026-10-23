@@ -52,7 +52,8 @@ pub struct L1CacheConfig {
     pub max_bytes: usize,
     /// Tree nodes retained across models. Must be at least 1.
     pub max_nodes: usize,
-    /// Estimated bytes one request may add. At most `max_bytes`.
+    /// Estimated bytes one request may add, including a new namespace root,
+    /// interior boundary marks, and a split node. At most `max_bytes`.
     pub max_insert_bytes: usize,
     /// Boundary segments one request may add. Must be at least 1.
     pub max_insert_segments: usize,
@@ -474,8 +475,13 @@ fn added_tokens(value: &Value, skip: Option<&[u64]>) -> Vec<AddedTokenSpec> {
         Value::Object(tokens) => tokens
             .iter()
             .filter(|(id, _)| {
-                let id = id.parse::<u64>().ok();
-                id.is_some_and(|id| !skip.unwrap_or_default().contains(&id))
+                // vllm-tokenizer parses decoder keys as `u32` and drops the
+                // entry when that fails. A wider parse would admit a boundary
+                // the tokenizer never installs.
+                let Ok(id) = id.parse::<u32>() else {
+                    return false;
+                };
+                !skip.unwrap_or_default().contains(&(u64::from(id)))
             })
             .filter_map(|(_, token)| parse(token))
             .collect(),
@@ -485,11 +491,37 @@ fn added_tokens(value: &Value, skip: Option<&[u64]>) -> Vec<AddedTokenSpec> {
 
 const NO_PARENT: usize = usize::MAX;
 const NODE_OVERHEAD_BYTES: usize = 192;
+const MARK_BYTES: usize = 8;
+
+/// Bytes an insert retains: the new leaf, one overhead per interior mark, a
+/// new namespace root and its salt, and one split node when the match ends
+/// inside an edge. `encode` and `insert` both use this so a segment that is
+/// encoded is a segment that fits.
+fn retained_insert_bytes(
+    text_bytes: usize,
+    id_bytes: usize,
+    marks: usize,
+    new_root: bool,
+    salt_len: usize,
+    splits: bool,
+) -> usize {
+    text_bytes
+        + id_bytes
+        + NODE_OVERHEAD_BYTES
+        + marks * MARK_BYTES
+        + if new_root {
+            NODE_OVERHEAD_BYTES + salt_len
+        } else {
+            0
+        }
+        + if splits { NODE_OVERHEAD_BYTES } else { 0 }
+}
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct Namespace {
     instance: u64,
-    salt: Option<Box<str>>,
+    /// Shared by the node and the roots map, so the bytes are counted once.
+    salt: Option<Arc<str>>,
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
@@ -565,6 +597,8 @@ struct Hit {
     pieces: Vec<(Arc<[u32]>, usize)>,
     /// Matched boundaries as absolute (byte, token) offsets.
     bounds: Vec<(usize, usize)>,
+    /// The match ended inside an edge, so insert will allocate a split node.
+    splits: bool,
 }
 
 #[derive(Default)]
@@ -696,6 +730,7 @@ impl Tree {
                     (id, node.text.len(), node.ids.len(), &node.marks[..])
                 }
                 Step::Partial(id, mark) => {
+                    hit.splits = true;
                     let node = self.node(id);
                     let (byte, token) = node.marks[mark];
                     (id, byte as usize, token as usize, &node.marks[..mark])
@@ -917,8 +952,11 @@ impl L1Cache {
         let bytes: Vec<usize> = bounds.iter().map(|&(byte, _)| byte).collect();
         let mut tree = self.tree.write();
         let (before_nodes, before_bytes) = (tree.live, tree.bytes);
+        let new_root = !tree.roots.contains_key(namespace);
         let root = tree.root(namespace, tick);
         let (steps, offset) = tree.walk(root, text, &bytes, self.config.hash_strategy);
+        let splits = steps.iter().any(|step| matches!(step, Step::Partial(_, _)));
+        let salt_len = namespace.salt.as_ref().map_or(0, |salt| salt.len());
         let start = bounds.partition_point(|&(byte, _)| byte <= offset);
         let start_token = start.checked_sub(1).map_or(0, |i| bounds[i].1);
         let mut end = None;
@@ -928,9 +966,15 @@ impl L1Cache {
             .skip(start)
             .take(self.config.max_insert_segments)
         {
-            if (byte - offset) + (token - start_token) * 4 + NODE_OVERHEAD_BYTES
-                > self.config.max_insert_bytes
-            {
+            let cost = retained_insert_bytes(
+                byte - offset,
+                (token - start_token) * 4,
+                i - start,
+                new_root,
+                salt_len,
+                splits,
+            );
+            if cost > self.config.max_insert_bytes {
                 break;
             }
             end = Some(i);
@@ -1034,7 +1078,7 @@ impl L1Encoder {
         }
         let namespace = Namespace {
             instance,
-            salt: cache_salt.map(Box::from),
+            salt: cache_salt.map(Arc::<str>::from),
         };
         let hit = self.cache.lookup(&namespace, text, &bounds);
         let mut ids = Vec::with_capacity(hit.tokens + (text.len() - hit.bytes) / 3);
@@ -1048,6 +1092,8 @@ impl L1Encoder {
         // boundary, so one encode of the remainder has the same IDs.
         let origin = offset;
         let start_tokens = ids.len();
+        let new_root = !self.cache.tree.read().roots.contains_key(&namespace);
+        let salt_len = cache_salt.map(str::len).unwrap_or(0);
         let fresh = &bounds[bounds.partition_point(|&bound| bound <= offset)..];
         for (stored, &bound) in fresh.iter().enumerate() {
             if stored == self.cache.config.max_insert_segments {
@@ -1055,7 +1101,14 @@ impl L1Encoder {
             }
             let piece = tokenizer.encode(&text[offset..bound], false)?;
             let tokens_after = ids.len() + piece.len();
-            let cost = (bound - origin) + (tokens_after - start_tokens) * 4 + NODE_OVERHEAD_BYTES;
+            let cost = retained_insert_bytes(
+                bound - origin,
+                (tokens_after - start_tokens) * 4,
+                stored,
+                new_root,
+                salt_len,
+                hit.splits,
+            );
             if cost > self.cache.config.max_insert_bytes {
                 // No bound is stored, so `insert` will not run to count it.
                 if stored == 0 {
@@ -1365,6 +1418,23 @@ mod tests {
     }
 
     #[test]
+    fn decoder_ids_that_do_not_fit_in_u32_are_not_boundaries() {
+        // vllm-tokenizer 0.29 parses the key as u32 and skips a parse failure.
+        // "4294967296" is 2^32. Admitting its content would cut where the
+        // tokenizer still sees ordinary BPE.
+        let tokens = added_tokens(
+            &json!({
+                "4294967296": {"content": "X"},
+                "4294967295": {"content": "<max>"},
+                "nope": {"content": "Y"}
+            }),
+            None,
+        );
+        let names: Vec<_> = tokens.iter().map(|token| token.content.as_str()).collect();
+        assert_eq!(names, ["<max>"]);
+    }
+
+    #[test]
     fn missing_normalized_does_not_share_a_group_with_an_explicit_token() {
         // "ab" is normalized and "bc" omits the field. Treating the omission
         // as normalized puts both in one group, so a one-pass cut after "ab"
@@ -1508,6 +1578,70 @@ mod tests {
             assert!(cached > 0);
         }
         assert_eq!(cache.stats().hits, 4);
+    }
+
+    #[test]
+    fn salt_is_one_allocation_and_the_insert_cap_counts_marks() {
+        let tokenizer = fixture_tokenizer();
+        let text = "<s>system hi</s><s>user</s>";
+        {
+            let (encoder, cache) = encoder(Default::default());
+            check(&encoder, &tokenizer, text);
+            let plain = cache.stats().bytes;
+            let salt = "abcdef";
+            check(&encoder, &tokenizer, &format!("{text}"));
+            // The second call above hits. A new salt is a new root and leaf.
+            let (_, _) = encoder
+                .encode(&tokenizer, 0, text, Some(salt))
+                .unwrap()
+                .unwrap();
+            assert_eq!(cache.stats().bytes, plain * 2 + salt.len());
+            {
+                let tree = cache.tree.read();
+                let root = tree
+                    .nodes
+                    .iter()
+                    .flatten()
+                    .find(|node| {
+                        node.namespace
+                            .as_ref()
+                            .and_then(|ns| ns.salt.as_ref())
+                            .is_some_and(|stored| stored.as_ref() == salt)
+                    })
+                    .unwrap();
+                // The node and the roots map share one string.
+                assert_eq!(
+                    Arc::strong_count(root.namespace.as_ref().unwrap().salt.as_ref().unwrap()),
+                    2
+                );
+            }
+            check_invariants(&cache);
+        }
+
+        // Nine `<s>` tokens: text + ids + one node header fits in 256 bytes,
+        // but the interior marks and the new root do not. The old estimate
+        // would have stored the whole leaf.
+        let nine = "<s>".repeat(9);
+        let ids = tokenizer.encode(&nine, false).unwrap();
+        let old_estimate = nine.len() + ids.len() * 4 + NODE_OVERHEAD_BYTES;
+        let (encoder, cache) = encoder(L1CacheConfig {
+            max_bytes: old_estimate.max(NODE_OVERHEAD_BYTES * 4),
+            max_insert_bytes: old_estimate,
+            max_nodes: 32,
+            ..Default::default()
+        });
+        check(&encoder, &tokenizer, &nine);
+        let tree = cache.tree.read();
+        assert!(
+            tree.nodes
+                .iter()
+                .flatten()
+                .all(|node| node.text.len() != nine.len()),
+            "the full leaf is over the insert cap once marks and the root are counted"
+        );
+        drop(tree);
+        assert!(cache.stats().bytes <= old_estimate);
+        check_invariants(&cache);
     }
 
     #[test]
@@ -2139,7 +2273,9 @@ mod tests {
             let (encoder, cache) = encoder(L1CacheConfig {
                 max_bytes: budget,
                 max_nodes: 24,
-                max_insert_bytes: budget / 2,
+                // A new root is its own node, so half of 512 cannot hold a root
+                // plus one leaf. The cache cap is the insert cap here.
+                max_insert_bytes: budget,
                 max_insert_segments: 6,
                 ..Default::default()
             });

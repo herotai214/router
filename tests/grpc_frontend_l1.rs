@@ -2,6 +2,7 @@
 //! match the uncached frontend exactly.
 mod common;
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use axum::body::to_bytes;
@@ -12,6 +13,13 @@ use tempfile::TempDir;
 use vllm_router_rs::backend::{EngineFrontend, L1CacheConfig};
 use vllm_router_rs::protocols::spec::ChatCompletionRequest;
 use vllm_router_rs::tokenizer::TokenizerCacheConfig;
+
+/// Both tests publish the process-wide L1 gauges. `cargo test` runs them
+/// together when `VLLM_ROUTER_L1_MODELS` is set.
+fn l1_metrics_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 const QWEN_TOKENS: [&str; 7] = [
     "<|endoftext|>",
@@ -251,6 +259,7 @@ async fn check_model(model: &str, on: &EngineFrontend, off: &EngineFrontend) -> 
 
 #[tokio::test]
 async fn l1_matches_uncached_for_qwen_template_with_tools_and_special_text() {
+    let _metrics_guard = l1_metrics_lock().lock().await;
     // Keep one test that installs the recorder: it is process-wide.
     let metrics = PrometheusBuilder::new().install_recorder().unwrap();
     let fixture = qwen_fixture();
@@ -408,6 +417,7 @@ async fn l1_matches_uncached_for_real_models() {
         eprintln!("skip: set VLLM_ROUTER_L1_MODELS to comma-separated model dirs");
         return;
     };
+    let _metrics_guard = l1_metrics_lock().lock().await;
     for model in models.split(',').filter(|m| !m.is_empty()) {
         let off = EngineFrontend::new();
         let on = l1_frontend(
