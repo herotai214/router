@@ -1589,8 +1589,9 @@ mod tests {
             check(&encoder, &tokenizer, text);
             let plain = cache.stats().bytes;
             let salt = "abcdef";
-            check(&encoder, &tokenizer, &format!("{text}"));
-            // The second call above hits. A new salt is a new root and leaf.
+            // Same text again, so this lookup hits.
+            check(&encoder, &tokenizer, text);
+            // A new salt is a new root and leaf.
             let (_, _) = encoder
                 .encode(&tokenizer, 0, text, Some(salt))
                 .unwrap()
