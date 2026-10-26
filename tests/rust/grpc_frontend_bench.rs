@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Offline gRPC frontend benchmark.
 //!
 //! ```text

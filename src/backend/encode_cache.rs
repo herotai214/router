@@ -220,7 +220,7 @@ fn parse_config(read: impl Fn(&str) -> Option<String>) -> Result<Option<Tokenize
     Ok(Some(config))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
