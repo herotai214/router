@@ -119,7 +119,7 @@ VLLM_ROUTER_L1_CACHE=1 vllm-router --worker-urls grpc://127.0.0.1:50051
 | Environment variable | Default | Meaning |
 |---|---:|---|
 | `VLLM_ROUTER_L1_CACHE` | `0` | Enable with `1` or `true` |
-| `VLLM_ROUTER_L1_MAX_BYTES` | `268435456` | Estimated byte limit across models |
+| `VLLM_ROUTER_L1_MAX_BYTES` | `268435456` | Estimated heap byte limit across models (contents and containers) |
 | `VLLM_ROUTER_L1_MAX_NODES` | `65536` | Tree node limit across models |
 | `VLLM_ROUTER_L1_MAX_INSERT_BYTES` | `33554432` | Bytes one request may add (at most the total) |
 | `VLLM_ROUTER_L1_MAX_INSERT_SEGMENTS` | `4096` | Boundary segments one request may add |
@@ -155,10 +155,11 @@ How it works:
   offsets of inner boundaries, so a lookup can stop inside an edge: editing
   message `k` still reuses messages before it. Text after the last boundary
   (usually the generation prompt) is not cached.
-- **Encode.** IDs for the matched prefix are copied from the tree; the rest is
-  encoded per boundary segment and inserted. Lookups take a read lock;
-  inserts take a write lock and evict least-recently-used leaves down to 90%
-  of the limits when a budget is exceeded.
+- **Encode.** IDs for the matched prefix are copied from the tree. The rest
+  is encoded in one call, and its new boundary segments are inserted as one
+  edge. Lookups take a read lock. Inserts take a write lock and evict
+  least-recently-used leaves until both limits hold again. The byte estimate
+  counts node contents plus the tree's container capacity.
 
 L1 runs after L0 when both are enabled. It is skipped for
 `add_special_tokens=true`, `Prompt::TokenIds`, tiktoken/tekken tokenizers, and

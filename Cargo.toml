@@ -63,6 +63,8 @@ parking_lot = "0.12.4"
 thiserror = "2.0.12"
 regex = "1.10"
 aho-corasick = "1.1"
+foldhash = "0.2"
+hashbrown = "0.16"
 url = "2.5.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"

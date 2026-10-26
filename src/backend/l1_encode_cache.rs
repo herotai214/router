@@ -13,9 +13,14 @@
 //! `(byte, token)` offsets of the boundaries inside the edge. A lookup
 //! follows the request text through the tree and may stop at any mark, so a
 //! request that edits message `k` still reuses messages `0..k`. Only the
-//! remaining text after the matched boundary is encoded. New segments are
-//! encoded one at a time up to the insert cap; the rest of the tail is one
-//! encode, and the stored boundaries are inserted back into the tree.
+//! remaining text after the matched boundary is encoded, in one call; the
+//! token offsets of its boundaries come from the boundary token IDs in that
+//! encoding, and the new boundaries up to the insert cap are added to the
+//! tree as one edge.
+//!
+//! Children live in one tree-wide map keyed by (parent, first segment), so
+//! nodes carry no per-node maps. Leaves are evicted in LRU order from a heap,
+//! and `max_bytes` covers node contents plus container capacity.
 //!
 //! Cut positions come from an automaton over all added tokens that matches
 //! like the tokenizer's added-token split. A token is a boundary only when
@@ -28,14 +33,14 @@
 //! tiktoken/tekken tokenizers, boundaries inside messages, and HTTP workers.
 
 use std::cmp::Reverse;
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::collections::{BinaryHeap, HashSet};
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::mem::size_of;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Once};
 
-use aho_corasick::{AhoCorasick, MatchKind};
+use aho_corasick::{AhoCorasick, Input, MatchKind};
 use anyhow::{bail, Context, Result};
 use parking_lot::{Mutex, RwLock};
 use regex::Regex;
@@ -48,7 +53,9 @@ use crate::metrics::TokenizerMetrics;
 /// L1 budgets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct L1CacheConfig {
-    /// Estimated bytes retained across models. Must be at least 1.
+    /// Estimated heap bytes retained across models: node contents plus the
+    /// tree's containers. Evictions run after each insert until it holds.
+    /// Must be at least 1.
     pub max_bytes: usize,
     /// Tree nodes retained across models. Must be at least 1.
     pub max_nodes: usize,
@@ -115,6 +122,7 @@ pub struct L1CacheStats {
     /// Prompts on an L1-enabled model that skipped the tree (any reason).
     pub bypasses: u64,
     pub nodes: usize,
+    /// Same estimate `max_bytes` bounds.
     pub bytes: usize,
 }
 
@@ -170,6 +178,10 @@ pub(crate) struct BoundaryMatcher {
     /// Per pattern: whether a cut follows it.
     cut: Vec<bool>,
     tokens: Vec<String>,
+    /// Per pattern: the token ID of a boundary, once resolved.
+    cut_ids: Vec<Option<u32>>,
+    /// Bitset of every resolved boundary token ID.
+    cut_id_bits: Vec<u64>,
 }
 
 impl std::fmt::Debug for BoundaryMatcher {
@@ -220,6 +232,8 @@ impl BoundaryMatcher {
             patterns,
             cut,
             tokens,
+            cut_ids: Vec::new(),
+            cut_id_bits: Vec::new(),
         })
     }
 
@@ -227,13 +241,73 @@ impl BoundaryMatcher {
         &self.tokens
     }
 
+    /// Record each boundary's token ID so cut offsets can be read from one
+    /// encode (see [`Self::token_offsets`]).
+    pub(crate) fn with_token_ids(mut self, tokenizer: &dyn Tokenizer) -> Self {
+        self.cut_ids = self
+            .patterns
+            .iter()
+            .zip(&self.cut)
+            .map(|(pattern, &cut)| cut.then(|| tokenizer.token_to_id(pattern)).flatten())
+            .collect();
+        let mut bits = Vec::new();
+        for id in self.cut_ids.iter().flatten().map(|&id| id as usize) {
+            if bits.len() <= id / 64 {
+                bits.resize(id / 64 + 1, 0u64);
+            }
+            bits[id / 64] |= 1 << (id % 64);
+        }
+        self.cut_id_bits = bits;
+        self
+    }
+
     /// Cut positions in `text`, which must itself start at a cut position.
+    #[cfg(test)]
     pub(crate) fn boundaries(&self, text: &str) -> Vec<usize> {
+        self.cuts(text, 0).into_iter().map(|(end, _)| end).collect()
+    }
+
+    /// Cuts in `text[from..]` as (end, pattern). `from` must be a cut
+    /// position: the tokenizer's leftmost-longest split restarts there, so
+    /// the matches after it do not depend on the text before it.
+    fn cuts(&self, text: &str, from: usize) -> Vec<(usize, usize)> {
         self.automaton
-            .find_iter(text)
+            .find_iter(Input::new(text).range(from..))
             .filter(|m| self.cut[m.pattern().as_usize()])
-            .map(|m| m.end())
+            .map(|m| (m.end(), m.pattern().as_usize()))
             .collect()
+    }
+
+    /// The first cut after `from`, which must be a cut position.
+    fn first_cut(&self, text: &str, from: usize) -> Option<usize> {
+        self.automaton
+            .find_iter(Input::new(text).range(from..))
+            .find(|m| self.cut[m.pattern().as_usize()])
+            .map(|m| m.end())
+    }
+
+    /// Token offsets right after each of `cuts` in `ids`, the encoding of
+    /// text that starts at a cut. The tokenizer splits boundary tokens out
+    /// before its model runs, so each cut ends with that token's ID. `None`
+    /// if the IDs do not line up one to one with `cuts`, e.g. when the model
+    /// can also produce a boundary ID from plain text.
+    fn token_offsets(&self, cuts: &[(usize, usize)], ids: &[u32]) -> Option<Vec<usize>> {
+        if self.cut_id_bits.is_empty() {
+            return None;
+        }
+        let mut offsets = Vec::with_capacity(cuts.len());
+        for (i, &id) in ids.iter().enumerate() {
+            let id_bit = self.cut_id_bits.get(id as usize / 64).copied().unwrap_or(0);
+            if id_bit >> (id % 64) & 1 == 0 {
+                continue;
+            }
+            let &(_, pattern) = cuts.get(offsets.len())?;
+            if self.cut_ids[pattern] != Some(id) {
+                return None;
+            }
+            offsets.push(i + 1);
+        }
+        (offsets.len() == cuts.len()).then_some(offsets)
     }
 
     /// Keep only boundaries for which splitting gives the same IDs as a full
@@ -269,7 +343,7 @@ impl BoundaryMatcher {
             }
             kept.push(token.clone());
         }
-        Self::build(self.patterns, kept)
+        Ok(Self::build(self.patterns, kept)?.with_token_ids(tokenizer))
     }
 }
 
@@ -489,34 +563,45 @@ fn added_tokens(value: &Value, skip: Option<&[u64]>) -> Vec<AddedTokenSpec> {
     }
 }
 
-const NO_PARENT: usize = usize::MAX;
-/// Covers the fixed per-node storage checked by
-/// `node_overhead_covers_fixed_per_node_storage`.
-const NODE_OVERHEAD_BYTES: usize = 256;
-const MARK_BYTES: usize = 8;
+const NO_NODE: usize = usize::MAX;
 
-/// Bytes an insert retains: the new leaf, one overhead per interior mark, a
-/// new namespace root and its salt, and one split node when the match ends
-/// inside an edge. `encode` and `insert` both use this so a segment that is
-/// encoded is a segment that fits.
-fn retained_insert_bytes(
-    text_bytes: usize,
-    id_bytes: usize,
-    marks: usize,
-    new_root: bool,
-    salt_len: usize,
-    splits: bool,
-) -> usize {
-    text_bytes
-        + id_bytes
-        + NODE_OVERHEAD_BYTES
-        + marks * MARK_BYTES
-        + if new_root {
-            NODE_OVERHEAD_BYTES + salt_len
-        } else {
-            0
-        }
-        + if splits { NODE_OVERHEAD_BYTES } else { 0 }
+/// Bytes the allocator hands out for an `n`-byte request: 16-byte chunks
+/// with an 8-byte header and a 32-byte minimum, as in glibc malloc.
+const fn heap_bytes(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let chunk = (n + 8 + 15) & !15;
+    if chunk < 32 {
+        32
+    } else {
+        chunk
+    }
+}
+
+/// Heap bytes a node owns: the boxed node, its edge text, its ID slice with
+/// the `Arc` counts, its marks, and a namespace salt.
+fn node_bytes(text: usize, tokens: usize, marks: usize, salt: Option<usize>) -> usize {
+    heap_bytes(size_of::<Node>())
+        + heap_bytes(text)
+        + heap_bytes(2 * size_of::<usize>() + tokens * size_of::<u32>())
+        + heap_bytes(marks * size_of::<(u32, u32)>())
+        + salt.map_or(0, |len| heap_bytes(2 * size_of::<usize>() + len))
+}
+
+/// Length of the common prefix of `a` and `b`.
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    const CHUNK: usize = 64;
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + CHUNK <= n && a[i..i + CHUNK] == b[i..i + CHUNK] {
+        i += CHUNK;
+    }
+    i + a[i..n]
+        .iter()
+        .zip(&b[i..n])
+        .take_while(|(x, y)| x == y)
+        .count()
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -532,9 +617,12 @@ struct SegmentKey {
     fingerprint: u64,
 }
 
+/// Seeded per process, so prompts cannot be crafted to collide.
+static SEGMENT_HASH: LazyLock<foldhash::quality::RandomState> = LazyLock::new(Default::default);
+
 fn segment_key(segment: &str, strategy: L1HashStrategy) -> SegmentKey {
     let bytes = segment.as_bytes();
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = SEGMENT_HASH.build_hasher();
     match strategy {
         L1HashStrategy::Full => bytes.hash(&mut hasher),
         L1HashStrategy::FirstLast64 if bytes.len() <= 128 => bytes.hash(&mut hasher),
@@ -549,22 +637,50 @@ fn segment_key(segment: &str, strategy: L1HashStrategy) -> SegmentKey {
     }
 }
 
+/// A parent and the key of a child's first segment.
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+struct EdgeKey {
+    parent: usize,
+    segment: SegmentKey,
+}
+
 struct Node {
     parent: usize,
+    /// Next child of `parent` whose first segment has the same key.
+    next_same_key: usize,
+    child_count: usize,
     /// Edge text; it ends at a boundary (empty for namespace roots).
     text: Box<str>,
     ids: Arc<[u32]>,
     /// Boundaries strictly inside the edge as (byte, token) offsets.
     marks: Box<[(u32, u32)]>,
-    /// Children keyed by their first segment.
-    children: HashMap<SegmentKey, Vec<usize>>,
-    child_count: usize,
+    /// Tick of the last insert before this node was last used.
     last_used: AtomicU64,
     /// Set on namespace roots.
     namespace: Option<Namespace>,
 }
 
 impl Node {
+    fn new(
+        parent: usize,
+        text: Box<str>,
+        ids: Arc<[u32]>,
+        marks: Box<[(u32, u32)]>,
+        tick: u64,
+        namespace: Option<Namespace>,
+    ) -> Self {
+        Self {
+            parent,
+            next_same_key: NO_NODE,
+            child_count: 0,
+            text,
+            ids,
+            marks,
+            last_used: AtomicU64::new(tick),
+            namespace,
+        }
+    }
+
     fn first_segment(&self) -> &str {
         match self.marks.first() {
             Some(&(byte, _)) => &self.text[..byte as usize],
@@ -572,19 +688,30 @@ impl Node {
         }
     }
 
+    fn is_leaf(&self) -> bool {
+        self.namespace.is_none() && self.child_count == 0
+    }
+
     fn bytes(&self) -> usize {
-        NODE_OVERHEAD_BYTES
-            + self.text.len()
-            + self.ids.len() * 4
-            + self.marks.len() * 8
-            + self
-                .namespace
-                .as_ref()
-                .and_then(|ns| ns.salt.as_ref())
-                .map_or(0, |salt| salt.len())
+        let salt = self.namespace.as_ref().and_then(|ns| ns.salt.as_ref());
+        node_bytes(
+            self.text.len(),
+            self.ids.len(),
+            self.marks.len(),
+            salt.map(|salt| salt.len()),
+        )
+    }
+
+    /// Skips the write when the node is already current, so hot prefixes
+    /// are not written by every lookup.
+    fn touch(&self, tick: u64) {
+        if self.last_used.load(Ordering::Relaxed) < tick {
+            self.last_used.fetch_max(tick, Ordering::Relaxed);
+        }
     }
 }
 
+#[derive(Clone, Copy)]
 enum Step {
     /// The whole edge matched.
     Full(usize),
@@ -594,21 +721,31 @@ enum Step {
 
 #[derive(Default)]
 struct Hit {
+    /// The namespace root, if it existed.
+    root: Option<usize>,
+    /// Tree version the steps are valid for.
+    version: u64,
+    steps: Vec<Step>,
     bytes: usize,
     tokens: usize,
     pieces: Vec<(Arc<[u32]>, usize)>,
-    /// Matched boundaries as absolute (byte, token) offsets.
-    bounds: Vec<(usize, usize)>,
-    /// The match ended inside an edge, so insert will allocate a split node.
-    splits: bool,
 }
 
 struct Tree {
-    nodes: Vec<Option<Node>>,
+    nodes: Vec<Option<Box<Node>>>,
     free: Vec<usize>,
-    roots: HashMap<Namespace, usize>,
+    roots: hashbrown::HashMap<Namespace, usize>,
+    /// First child per (parent, first-segment key); collisions chain
+    /// through `Node::next_same_key`.
+    edges: hashbrown::HashMap<EdgeKey, usize>,
+    /// Leaves by last use. Lazy: an entry may name a node that is gone, is
+    /// no longer a leaf, or was used since; every leaf has an entry.
+    leaves: BinaryHeap<Reverse<(u64, usize)>>,
     live: usize,
-    bytes: usize,
+    /// Heap bytes owned by live nodes.
+    content_bytes: usize,
+    /// Bumped by every structural change, so a lookup's steps can be reused.
+    version: u64,
     strategy: L1HashStrategy,
 }
 
@@ -617,11 +754,25 @@ impl Tree {
         Self {
             nodes: Vec::new(),
             free: Vec::new(),
-            roots: HashMap::new(),
+            roots: hashbrown::HashMap::new(),
+            edges: hashbrown::HashMap::new(),
+            leaves: BinaryHeap::new(),
             live: 0,
-            bytes: 0,
+            content_bytes: 0,
+            version: 0,
             strategy,
         }
+    }
+
+    /// Estimated heap bytes: node contents plus the capacity of every
+    /// container, so slack left behind by evictions is charged too.
+    fn bytes(&self) -> usize {
+        self.content_bytes
+            + self.nodes.capacity() * size_of::<Option<Box<Node>>>()
+            + self.free.capacity() * size_of::<usize>()
+            + self.leaves.capacity() * size_of::<Reverse<(u64, usize)>>()
+            + self.edges.allocation_size()
+            + self.roots.allocation_size()
     }
 
     fn key(&self, segment: &str) -> SegmentKey {
@@ -629,78 +780,102 @@ impl Tree {
     }
 
     fn node(&self, id: usize) -> &Node {
-        self.nodes[id].as_ref().expect("live L1 node")
+        self.nodes[id].as_deref().expect("live L1 node")
     }
 
     fn node_mut(&mut self, id: usize) -> &mut Node {
-        self.nodes[id].as_mut().expect("live L1 node")
+        self.nodes[id].as_deref_mut().expect("live L1 node")
     }
 
     fn alloc(&mut self, node: Node) -> usize {
+        self.version += 1;
         self.live += 1;
-        self.bytes += node.bytes();
+        self.content_bytes += node.bytes();
+        let node = Some(Box::new(node));
         match self.free.pop() {
             Some(id) => {
-                self.nodes[id] = Some(node);
+                self.nodes[id] = node;
                 id
             }
             None => {
-                self.nodes.push(Some(node));
+                self.nodes.push(node);
                 self.nodes.len() - 1
             }
         }
     }
 
-    fn release(&mut self, id: usize) -> Node {
+    fn release(&mut self, id: usize) -> Box<Node> {
+        self.version += 1;
         let node = self.nodes[id].take().expect("live L1 node");
         self.free.push(id);
         self.live -= 1;
-        self.bytes -= node.bytes();
+        self.content_bytes -= node.bytes();
         node
     }
 
+    fn edge(&self, parent: usize, child: usize) -> EdgeKey {
+        EdgeKey {
+            parent,
+            segment: self.key(self.node(child).first_segment()),
+        }
+    }
+
     fn child(&self, parent: usize, segment: &str) -> Option<usize> {
-        self.node(parent)
-            .children
-            .get(&self.key(segment))?
-            .iter()
-            .copied()
-            .find(|&id| self.node(id).first_segment() == segment)
+        let key = EdgeKey {
+            parent,
+            segment: self.key(segment),
+        };
+        let mut id = *self.edges.get(&key)?;
+        while self.node(id).first_segment() != segment {
+            id = self.node(id).next_same_key;
+            if id == NO_NODE {
+                return None;
+            }
+        }
+        Some(id)
     }
 
     fn add_child(&mut self, parent: usize, child: usize) {
-        let key = self.key(self.node(child).first_segment());
-        let node = self.node_mut(parent);
-        node.children.entry(key).or_default().push(child);
-        node.child_count += 1;
+        let key = self.edge(parent, child);
+        let next = self.edges.insert(key, child).unwrap_or(NO_NODE);
+        self.node_mut(child).next_same_key = next;
+        self.node_mut(parent).child_count += 1;
     }
 
-    fn remove_child(&mut self, parent: usize, child: usize, key: SegmentKey) {
-        let node = self.node_mut(parent);
-        if let Some(ids) = node.children.get_mut(&key) {
-            ids.retain(|&id| id != child);
-            if ids.is_empty() {
-                node.children.remove(&key);
+    fn unlink(&mut self, parent: usize, child: usize) {
+        let key = self.edge(parent, child);
+        let next = self.node(child).next_same_key;
+        if self.edges[&key] == child {
+            if next == NO_NODE {
+                self.edges.remove(&key);
+            } else {
+                self.edges.insert(key, next);
             }
+        } else {
+            let mut prev = self.edges[&key];
+            while self.node(prev).next_same_key != child {
+                prev = self.node(prev).next_same_key;
+            }
+            self.node_mut(prev).next_same_key = next;
         }
-        node.child_count -= 1;
-        // `Node::bytes` charges no spare capacity, so release it once the map
-        // is mostly empty. Shrinking only below a quarter keeps this amortized
-        // O(1).
-        if node.children.len() * 4 < node.children.capacity() {
-            node.children.shrink_to_fit();
-        }
+        self.node_mut(child).next_same_key = NO_NODE;
+        self.node_mut(parent).child_count -= 1;
     }
 
-    /// Follow `text` from `root`; returns the steps and the matched bytes.
-    fn walk(&self, root: usize, text: &str, bounds: &[usize]) -> (Vec<Step>, usize) {
+    /// Follow `text` from `root`, comparing edge text directly.
+    /// `first_cut(offset)` returns the end of the first segment of
+    /// `text[offset..]` and is only asked at cut positions; it is used to
+    /// pick the child. Returns the steps and the matched bytes, which end at
+    /// a cut.
+    fn walk(
+        &self,
+        root: usize,
+        text: &str,
+        mut first_cut: impl FnMut(usize) -> Option<usize>,
+    ) -> (Vec<Step>, usize) {
         let mut steps = Vec::new();
         let (mut node, mut offset) = (root, 0);
-        loop {
-            let next = bounds.partition_point(|&bound| bound <= offset);
-            let Some(&end) = bounds.get(next) else {
-                break;
-            };
+        while let Some(end) = first_cut(offset) {
             let Some(child) = self.child(node, &text[offset..end]) else {
                 break;
             };
@@ -712,13 +887,7 @@ impl Tree {
                 node = child;
                 continue;
             }
-            let common = edge
-                .text
-                .as_bytes()
-                .iter()
-                .zip(rest)
-                .take_while(|(a, b)| a == b)
-                .count();
+            let common = common_prefix(edge.text.as_bytes(), rest);
             // The first segment matched, so a partial match has a mark.
             let mark = edge
                 .marks
@@ -731,139 +900,217 @@ impl Tree {
         (steps, offset)
     }
 
-    fn lookup(&self, root: usize, text: &str, bounds: &[usize], tick: u64) -> Hit {
-        let mut hit = Hit::default();
-        for step in self.walk(root, text, bounds).0 {
-            let (id, bytes, tokens, marks) = match step {
+    fn lookup(
+        &self,
+        root: usize,
+        text: &str,
+        first_cut: impl FnMut(usize) -> Option<usize>,
+        tick: u64,
+    ) -> Hit {
+        let (steps, _) = self.walk(root, text, first_cut);
+        let mut hit = Hit {
+            root: Some(root),
+            version: self.version,
+            ..Default::default()
+        };
+        for &step in &steps {
+            let (id, bytes, tokens) = match step {
                 Step::Full(id) => {
                     let node = self.node(id);
-                    (id, node.text.len(), node.ids.len(), &node.marks[..])
+                    (id, node.text.len(), node.ids.len())
                 }
                 Step::Partial(id, mark) => {
-                    hit.splits = true;
-                    let node = self.node(id);
-                    let (byte, token) = node.marks[mark];
-                    (id, byte as usize, token as usize, &node.marks[..mark])
+                    let (byte, token) = self.node(id).marks[mark];
+                    (id, byte as usize, token as usize)
                 }
             };
             let node = self.node(id);
-            node.last_used.store(tick, Ordering::Relaxed);
-            for &(byte, token) in marks {
-                hit.bounds
-                    .push((hit.bytes + byte as usize, hit.tokens + token as usize));
-            }
+            node.touch(tick);
             hit.pieces.push((node.ids.clone(), tokens));
             hit.bytes += bytes;
             hit.tokens += tokens;
-            hit.bounds.push((hit.bytes, hit.tokens));
         }
+        hit.steps = steps;
         hit
+    }
+
+    fn matched_tokens(&self, steps: &[Step]) -> usize {
+        steps
+            .iter()
+            .map(|&step| match step {
+                Step::Full(id) => self.node(id).ids.len(),
+                Step::Partial(id, mark) => self.node(id).marks[mark].1 as usize,
+            })
+            .sum()
     }
 
     fn root(&mut self, namespace: &Namespace, tick: u64) -> usize {
         if let Some(&root) = self.roots.get(namespace) {
             return root;
         }
-        let root = self.alloc(Node {
-            parent: NO_PARENT,
-            text: Box::from(""),
-            ids: Arc::from([]),
-            marks: Box::from([]),
-            children: HashMap::new(),
-            child_count: 0,
-            last_used: AtomicU64::new(tick),
-            namespace: Some(namespace.clone()),
-        });
+        let root = self.alloc(Node::new(
+            NO_NODE,
+            Box::from(""),
+            Arc::from([]),
+            Box::from([]),
+            tick,
+            Some(namespace.clone()),
+        ));
         self.roots.insert(namespace.clone(), root);
         root
     }
 
+    /// Content bytes that splitting `id` at `marks[mark]` adds.
+    fn split_bytes(&self, id: usize, mark: usize) -> usize {
+        let node = self.node(id);
+        let (byte, token) = node.marks[mark];
+        let (byte, token) = (byte as usize, token as usize);
+        let upper = node_bytes(byte, token, mark, None);
+        let lower = node_bytes(
+            node.text.len() - byte,
+            node.ids.len() - token,
+            node.marks.len() - mark - 1,
+            None,
+        );
+        (upper + lower).saturating_sub(node.bytes())
+    }
+
     /// Split `id` at `marks[mark]`; returns the new upper node.
     fn split(&mut self, id: usize, mark: usize) -> usize {
+        let parent = self.node(id).parent;
+        self.unlink(parent, id);
         let old_bytes = self.node(id).bytes();
         let node = self.node_mut(id);
         let (byte, token) = node.marks[mark];
         let (byte, token) = (byte as usize, token as usize);
-        let upper_text: Box<str> = Box::from(&node.text[..byte]);
-        let upper_ids: Arc<[u32]> = Arc::from(&node.ids[..token]);
-        let upper_marks: Box<[(u32, u32)]> = Box::from(&node.marks[..mark]);
+        let upper = Node::new(
+            parent,
+            Box::from(&node.text[..byte]),
+            Arc::from(&node.ids[..token]),
+            Box::from(&node.marks[..mark]),
+            node.last_used.load(Ordering::Relaxed),
+            None,
+        );
         node.text = Box::from(&node.text[byte..]);
         node.ids = Arc::from(&node.ids[token..]);
         node.marks = node.marks[mark + 1..]
             .iter()
             .map(|&(b, t)| (b - byte as u32, t - token as u32))
             .collect();
-        let parent = node.parent;
-        let last_used = node.last_used.load(Ordering::Relaxed);
         let new_bytes = node.bytes();
-        self.bytes = self.bytes - old_bytes + new_bytes;
-        let upper = self.alloc(Node {
-            parent,
-            text: upper_text,
-            ids: upper_ids,
-            marks: upper_marks,
-            children: HashMap::new(),
-            child_count: 0,
-            last_used: AtomicU64::new(last_used),
-            namespace: None,
-        });
+        self.content_bytes = self.content_bytes - old_bytes + new_bytes;
         // The upper node keeps the old first segment, hence the same key.
-        let key = self.key(self.node(upper).first_segment());
-        if let Some(ids) = self.node_mut(parent).children.get_mut(&key) {
-            for slot in ids.iter_mut().filter(|slot| **slot == id) {
-                *slot = upper;
-            }
-        }
+        let upper = self.alloc(upper);
+        self.add_child(parent, upper);
         self.node_mut(id).parent = upper;
         self.add_child(upper, id);
         upper
     }
 
+    fn push_leaf(&mut self, id: usize) {
+        let tick = self.node(id).last_used.load(Ordering::Relaxed);
+        self.leaves.push(Reverse((tick, id)));
+    }
+
     /// Remove a leaf. Single-child chains are kept: merging them would copy
     /// whole edges under the write lock.
     fn remove_leaf(&mut self, id: usize) {
-        let key = self.key(self.node(id).first_segment());
-        let parent = self.release(id).parent;
-        self.remove_child(parent, id, key);
+        let parent = self.node(id).parent;
+        self.unlink(parent, id);
+        self.release(id);
         let parent_node = self.node(parent);
-        if parent_node.namespace.is_some() && parent_node.child_count == 0 {
+        if parent_node.child_count > 0 {
+            return;
+        }
+        if parent_node.namespace.is_some() {
             if let Some(namespace) = self.release(parent).namespace {
                 self.roots.remove(&namespace);
             }
+        } else {
+            // Chains shrink from the end: a parent that became a leaf is next.
+            self.push_leaf(parent);
         }
     }
 
-    /// Evict least-recently-used leaves down to 90% of the limits.
-    fn evict(&mut self, config: &L1CacheConfig) -> u64 {
-        if self.bytes <= config.max_bytes && self.live <= config.max_nodes {
-            return 0;
-        }
-        let target_bytes = config.max_bytes - config.max_bytes / 10;
-        let target_nodes = config.max_nodes - config.max_nodes / 10;
-        let is_leaf = |node: &Node| node.namespace.is_none() && node.child_count == 0;
-        let mut heap: BinaryHeap<Reverse<(u64, usize)>> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(id, node)| {
-                let node = node.as_ref()?;
-                is_leaf(node).then(|| Reverse((node.last_used.load(Ordering::Relaxed), id)))
-            })
-            .collect();
+    /// Evict least-recently-used leaves until both budgets hold. Each step
+    /// is O(log n): stale heap entries are dropped, or re-queued at the
+    /// node's current tick, when they reach the top.
+    fn evict(&mut self, max_bytes: usize, max_nodes: usize) -> u64 {
         let mut evicted = 0;
-        while let Some(Reverse((_, id))) = heap.pop() {
-            if self.bytes <= target_bytes && self.live <= target_nodes {
+        while self.live > 0 && (self.live > max_nodes || self.bytes() > max_bytes) {
+            let Some(Reverse((tick, id))) = self.leaves.pop() else {
+                debug_assert!(false, "every leaf has a heap entry");
                 break;
+            };
+            let Some(node) = self.nodes.get(id).and_then(Option::as_deref) else {
+                continue;
+            };
+            if !node.is_leaf() {
+                continue;
             }
-            let parent = self.node(id).parent;
+            let now = node.last_used.load(Ordering::Relaxed);
+            if now != tick {
+                self.leaves.push(Reverse((now, id)));
+                continue;
+            }
             self.remove_leaf(id);
             evicted += 1;
-            // Chains shrink from the end: a parent that became a leaf is next.
-            if let Some(node) = self.nodes[parent].as_ref().filter(|node| is_leaf(node)) {
-                heap.push(Reverse((node.last_used.load(Ordering::Relaxed), parent)));
-            }
+            self.shrink_sparse();
+        }
+        if self.live == 0 {
+            self.release_storage();
+        } else if self.leaves.len() > 2 * self.live + 16 {
+            self.compact_leaves();
         }
         evicted
+    }
+
+    /// Release container capacity once it is mostly unused, so evictions
+    /// also return the slack `bytes` charges. A shrink only follows enough
+    /// removals to pay for it.
+    fn shrink_sparse(&mut self) {
+        let sparse = |len: usize, capacity: usize| capacity > 64 && len * 4 < capacity;
+        if sparse(self.edges.len(), self.edges.capacity()) {
+            self.edges.shrink_to_fit();
+        }
+        if sparse(self.roots.len(), self.roots.capacity()) {
+            self.roots.shrink_to_fit();
+        }
+        if sparse(self.leaves.len(), self.leaves.capacity()) {
+            self.leaves.shrink_to_fit();
+        }
+        if sparse(self.free.len(), self.free.capacity()) {
+            self.free.shrink_to_fit();
+        }
+    }
+
+    /// Keep one entry per live leaf, at its current tick.
+    fn compact_leaves(&mut self) {
+        let nodes = &self.nodes;
+        let mut entries: Vec<(usize, u64)> = self
+            .leaves
+            .drain()
+            .filter_map(|Reverse((_, id))| {
+                let node = nodes.get(id)?.as_deref()?;
+                node.is_leaf()
+                    .then(|| (id, node.last_used.load(Ordering::Relaxed)))
+            })
+            .collect();
+        entries.sort_unstable();
+        entries.dedup_by_key(|&mut (id, _)| id);
+        self.leaves = entries
+            .into_iter()
+            .map(|(id, tick)| Reverse((tick, id)))
+            .collect();
+    }
+
+    fn release_storage(&mut self) {
+        self.version += 1;
+        self.nodes = Vec::new();
+        self.free = Vec::new();
+        self.leaves = BinaryHeap::new();
+        self.edges = hashbrown::HashMap::new();
+        self.roots = hashbrown::HashMap::new();
     }
 }
 
@@ -894,6 +1141,8 @@ fn publish_occupancy(nodes_delta: isize, bytes_delta: isize) {
 pub(crate) struct L1Cache {
     config: L1CacheConfig,
     tree: RwLock<Tree>,
+    /// LRU clock. Only inserts advance it, so lookups never write it and
+    /// write a node at most once between inserts.
     tick: AtomicU64,
     lookups: AtomicU64,
     hits: AtomicU64,
@@ -926,7 +1175,7 @@ impl L1Cache {
     pub(crate) fn stats(&self) -> L1CacheStats {
         let (nodes, bytes) = {
             let tree = self.tree.read();
-            (tree.live, tree.bytes)
+            (tree.live, tree.bytes())
         };
         L1CacheStats {
             lookups: self.lookups.load(Ordering::Relaxed),
@@ -942,98 +1191,117 @@ impl L1Cache {
         }
     }
 
-    fn next_tick(&self) -> u64 {
-        self.tick.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    fn lookup(&self, namespace: &Namespace, text: &str, bounds: &[usize]) -> Hit {
-        let tick = self.next_tick();
+    fn lookup(
+        &self,
+        namespace: &Namespace,
+        text: &str,
+        first_cut: impl FnMut(usize) -> Option<usize>,
+    ) -> Hit {
+        let tick = self.tick.load(Ordering::Relaxed);
         let tree = self.tree.read();
         match tree.roots.get(namespace) {
-            Some(&root) => tree.lookup(root, text, bounds, tick),
-            None => Hit::default(),
+            Some(&root) => tree.lookup(root, text, first_cut, tick),
+            None => Hit {
+                version: tree.version,
+                ..Default::default()
+            },
         }
     }
 
-    /// Insert boundaries of `text`; `bounds` are absolute (byte, token)
-    /// offsets of every boundary in `text`.
-    fn insert(&self, namespace: &Namespace, text: &str, ids: &[u32], bounds: &[(usize, usize)]) {
-        let tick = self.next_tick();
-        let bytes: Vec<usize> = bounds.iter().map(|&(byte, _)| byte).collect();
+    /// Store the cuts after `hit`. `bounds` are the absolute (byte, token)
+    /// offsets of cuts after `hit.bytes`, in order.
+    fn insert(
+        &self,
+        namespace: &Namespace,
+        text: &str,
+        ids: &[u32],
+        hit: Hit,
+        bounds: &[(usize, usize)],
+        first_cut: impl FnMut(usize) -> Option<usize>,
+    ) {
+        let tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
         let mut tree = self.tree.write();
-        let (before_nodes, before_bytes) = (tree.live, tree.bytes);
-        let new_root = !tree.roots.contains_key(namespace);
-        let root = tree.root(namespace, tick);
-        let (steps, offset) = tree.walk(root, text, &bytes);
-        let splits = steps.iter().any(|step| matches!(step, Step::Partial(_, _)));
-        let salt_len = namespace.salt.as_ref().map_or(0, |salt| salt.len());
-        let start = bounds.partition_point(|&(byte, _)| byte <= offset);
-        let start_token = start.checked_sub(1).map_or(0, |i| bounds[i].1);
-        let mut end = None;
-        for (i, &(byte, token)) in bounds
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(self.config.max_insert_segments)
-        {
-            let cost = retained_insert_bytes(
-                byte - offset,
-                (token - start_token) * 4,
-                i - start,
-                new_root,
-                salt_len,
-                splits,
-            );
-            if cost > self.config.max_insert_bytes {
-                break;
-            }
-            end = Some(i);
-        }
-        if start < bounds.len() && end.is_none() {
-            self.oversized.fetch_add(1, Ordering::Relaxed);
-        }
-        if let Some(end) = end {
-            let mut parent = root;
-            for step in &steps {
-                match *step {
-                    Step::Full(id) => {
-                        tree.node(id).last_used.store(tick, Ordering::Relaxed);
-                        parent = id;
-                    }
-                    Step::Partial(id, mark) => parent = tree.split(id, mark),
+        let (before_nodes, before_bytes) = (tree.live, tree.bytes());
+        let (root, steps, offset, start_token) = if tree.version == hit.version {
+            (hit.root, hit.steps, hit.bytes, hit.tokens)
+        } else if let Some(&root) = tree.roots.get(namespace) {
+            let (steps, offset) = tree.walk(root, text, first_cut);
+            let tokens = tree.matched_tokens(&steps);
+            (Some(root), steps, offset, tokens)
+        } else {
+            (None, Vec::new(), 0, 0)
+        };
+        // An eviction since the lookup removed part of the path; the cuts
+        // in between have no token offsets here, so leave it to a later
+        // request.
+        if offset >= hit.bytes {
+            let start = bounds.partition_point(|&(byte, _)| byte <= offset);
+            let end = bounds.len().min(start + self.config.max_insert_segments);
+            let fresh = &bounds[start..end];
+            let salt = namespace.salt.as_ref().map(|salt| salt.len());
+            let fixed = if root.is_none() {
+                node_bytes(0, 0, 0, salt)
+            } else {
+                0
+            } + match steps.last() {
+                Some(&Step::Partial(id, mark)) => tree.split_bytes(id, mark),
+                _ => 0,
+            };
+            // Cost grows with the number of segments; keep the longest run
+            // that fits.
+            let cost = |i: usize| {
+                let (byte, token) = fresh[i];
+                fixed + node_bytes(byte - offset, token - start_token, i, None)
+            };
+            let (mut stored, mut over) = (0, fresh.len());
+            while stored < over {
+                let mid = (stored + over) / 2;
+                if cost(mid) <= self.config.max_insert_bytes {
+                    stored = mid + 1;
+                } else {
+                    over = mid;
                 }
             }
-            let (end_byte, end_token) = bounds[end];
-            let marks: Vec<(u32, u32)> = bounds[start..end]
-                .iter()
-                .map(|&(b, t)| ((b - offset) as u32, (t - start_token) as u32))
-                .collect();
-            // Growth appends a child; existing edges are never copied.
-            let leaf = tree.alloc(Node {
-                parent,
-                text: Box::from(&text[offset..end_byte]),
-                ids: Arc::from(&ids[start_token..end_token]),
-                marks: marks.into_boxed_slice(),
-                children: HashMap::new(),
-                child_count: 0,
-                last_used: AtomicU64::new(tick),
-                namespace: None,
-            });
-            tree.add_child(parent, leaf);
-        }
-        if tree.node(root).child_count == 0 {
-            if let Some(namespace) = tree.release(root).namespace {
-                tree.roots.remove(&namespace);
+            if stored == 0 && !fresh.is_empty() {
+                self.oversized.fetch_add(1, Ordering::Relaxed);
+            }
+            if stored > 0 {
+                let mut parent = root.unwrap_or_else(|| tree.root(namespace, tick));
+                for &step in &steps {
+                    match step {
+                        Step::Full(id) => {
+                            tree.node(id).touch(tick);
+                            parent = id;
+                        }
+                        Step::Partial(id, mark) => parent = tree.split(id, mark),
+                    }
+                }
+                let (end_byte, end_token) = fresh[stored - 1];
+                let marks: Box<[(u32, u32)]> = fresh[..stored - 1]
+                    .iter()
+                    .map(|&(b, t)| ((b - offset) as u32, (t - start_token) as u32))
+                    .collect();
+                // Growth appends a child; existing edges are never copied.
+                let leaf = tree.alloc(Node::new(
+                    parent,
+                    Box::from(&text[offset..end_byte]),
+                    Arc::from(&ids[start_token..end_token]),
+                    marks,
+                    tick,
+                    None,
+                ));
+                tree.add_child(parent, leaf);
+                tree.push_leaf(leaf);
             }
         }
-        let evicted = tree.evict(&self.config);
+        let evicted = tree.evict(self.config.max_bytes, self.config.max_nodes);
         if evicted > 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
             TokenizerMetrics::record_l1_evictions(evicted);
         }
         publish_occupancy(
             tree.live as isize - before_nodes as isize,
-            tree.bytes as isize - before_bytes as isize,
+            tree.bytes() as isize - before_bytes as isize,
         );
     }
 }
@@ -1041,7 +1309,7 @@ impl L1Cache {
 impl Drop for L1Cache {
     fn drop(&mut self) {
         let tree = self.tree.get_mut();
-        publish_occupancy(-(tree.live as isize), -(tree.bytes as isize));
+        publish_occupancy(-(tree.live as isize), -(tree.bytes() as isize));
     }
 }
 
@@ -1053,6 +1321,7 @@ pub(crate) struct L1Encoder {
     model_id: Arc<str>,
     disabled: Arc<AtomicBool>,
     mismatch_warning: Arc<Once>,
+    segment_warning: Arc<Once>,
 }
 
 impl L1Encoder {
@@ -1063,6 +1332,7 @@ impl L1Encoder {
             model_id: Arc::from(model_id),
             disabled: Arc::new(AtomicBool::new(false)),
             mismatch_warning: Arc::new(Once::new()),
+            segment_warning: Arc::new(Once::new()),
         }
     }
 
@@ -1079,60 +1349,33 @@ impl L1Encoder {
             self.record_bypass(L1Bypass::Disabled);
             return Ok(None);
         }
-        let bounds = self.matcher.boundaries(text);
-        if bounds.is_empty() {
-            self.record_bypass(L1Bypass::NoBoundary);
-            return Ok(None);
-        }
         let namespace = Namespace {
             instance,
             salt: cache_salt.map(Arc::<str>::from),
         };
-        let hit = self.cache.lookup(&namespace, text, &bounds);
-        let mut ids = Vec::with_capacity(hit.tokens + (text.len() - hit.bytes) / 3);
+        let matcher = &*self.matcher;
+        let first_cut = |from: usize| matcher.first_cut(text, from);
+        let hit = self.cache.lookup(&namespace, text, first_cut);
+        // Every cut up to the match is already in the tree; scan the rest.
+        let cuts = matcher.cuts(text, hit.bytes);
+        if hit.bytes == 0 && cuts.is_empty() {
+            self.record_bypass(L1Bypass::NoBoundary);
+            return Ok(None);
+        }
+        // The tail starts at a cut, so one encode of it has the same IDs as
+        // encoding each segment.
+        let tail = &text[hit.bytes..];
+        let tail_ids = if tail.is_empty() {
+            Vec::new()
+        } else {
+            tokenizer.encode(tail, false)?
+        };
+        let bounds = self.tail_bounds(tokenizer, text, &hit, &cuts, &tail_ids)?;
+        let mut ids = Vec::with_capacity(hit.tokens + tail_ids.len());
         for (piece, take) in &hit.pieces {
             ids.extend_from_slice(&piece[..*take]);
         }
-        let matched_bounds = hit.bounds.len();
-        let mut all_bounds = hit.bounds;
-        let mut offset = hit.bytes;
-        // Segment only what insert will keep. A later cut is still a
-        // boundary, so one encode of the remainder has the same IDs.
-        let origin = offset;
-        let start_tokens = ids.len();
-        let new_root = !self.cache.tree.read().roots.contains_key(&namespace);
-        let salt_len = cache_salt.map(str::len).unwrap_or(0);
-        let fresh = &bounds[bounds.partition_point(|&bound| bound <= offset)..];
-        for (stored, &bound) in fresh.iter().enumerate() {
-            if stored == self.cache.config.max_insert_segments {
-                break;
-            }
-            let piece = tokenizer.encode(&text[offset..bound], false)?;
-            let tokens_after = ids.len() + piece.len();
-            let cost = retained_insert_bytes(
-                bound - origin,
-                (tokens_after - start_tokens) * 4,
-                stored,
-                new_root,
-                salt_len,
-                hit.splits,
-            );
-            if cost > self.cache.config.max_insert_bytes {
-                // No bound is stored, so `insert` will not run to count it.
-                if stored == 0 {
-                    self.cache.oversized.fetch_add(1, Ordering::Relaxed);
-                }
-                ids.extend(piece);
-                offset = bound;
-                break;
-            }
-            ids.extend(piece);
-            all_bounds.push((bound, tokens_after));
-            offset = bound;
-        }
-        if offset < text.len() {
-            ids.extend(tokenizer.encode(&text[offset..], false)?);
-        }
+        ids.extend(tail_ids);
         if self.cache.config.verify {
             let full = tokenizer.encode(text, false)?;
             if full != ids {
@@ -1152,21 +1395,66 @@ impl L1Encoder {
                 return Ok(Some((full, 0)));
             }
         }
+        let cached = hit.tokens;
         self.cache.lookups.fetch_add(1, Ordering::Relaxed);
         self.cache
             .cached_tokens
-            .fetch_add(hit.tokens as u64, Ordering::Relaxed);
+            .fetch_add(cached as u64, Ordering::Relaxed);
         self.cache
             .encoded_tokens
-            .fetch_add((ids.len() - hit.tokens) as u64, Ordering::Relaxed);
-        TokenizerMetrics::record_l1_lookup(hit.tokens, ids.len() - hit.tokens);
-        if hit.tokens > 0 {
+            .fetch_add((ids.len() - cached) as u64, Ordering::Relaxed);
+        TokenizerMetrics::record_l1_lookup(cached, ids.len() - cached);
+        if cached > 0 {
             self.cache.hits.fetch_add(1, Ordering::Relaxed);
         }
-        if all_bounds.len() > matched_bounds {
-            self.cache.insert(&namespace, text, &ids, &all_bounds);
+        if !bounds.is_empty() {
+            self.cache
+                .insert(&namespace, text, &ids, hit, &bounds, first_cut);
         }
-        Ok(Some((ids, hit.tokens)))
+        Ok(Some((ids, cached)))
+    }
+
+    /// Absolute (byte, token) offsets of the tail's `cuts`, read from the
+    /// tail encoding when boundary IDs line up. Otherwise the segments are
+    /// encoded one at a time, as far as insert could store them.
+    fn tail_bounds(
+        &self,
+        tokenizer: &dyn Tokenizer,
+        text: &str,
+        hit: &Hit,
+        cuts: &[(usize, usize)],
+        tail_ids: &[u32],
+    ) -> vllm_tokenizer::Result<Vec<(usize, usize)>> {
+        if let Some(offsets) = self.matcher.token_offsets(cuts, tail_ids) {
+            return Ok(cuts
+                .iter()
+                .zip(offsets)
+                .map(|(&(byte, _), token)| (byte, hit.tokens + token))
+                .collect());
+        }
+        self.segment_warning.call_once(|| {
+            tracing::debug!(
+                model_id = %self.model_id,
+                "boundary token IDs do not line up with the encoding; L1 encodes segments one at a time"
+            );
+        });
+        let config = &self.cache.config;
+        let (mut from, mut tokens) = (hit.bytes, 0);
+        let mut bounds = Vec::new();
+        for &(byte, _) in cuts.iter().take(config.max_insert_segments) {
+            if byte - hit.bytes > config.max_insert_bytes {
+                break;
+            }
+            let piece = tokenizer.encode(&text[from..byte], false)?;
+            // Never store a segment that disagrees with the tail encoding.
+            if tail_ids.get(tokens..tokens + piece.len()) != Some(&piece[..]) {
+                break;
+            }
+            tokens += piece.len();
+            from = byte;
+            bounds.push((byte, hit.tokens + tokens));
+        }
+        Ok(bounds)
     }
 
     pub(crate) fn record_bypass(&self, reason: L1Bypass) {
@@ -1239,6 +1527,7 @@ mod tests {
         Counter, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
     };
     use serde_json::json;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::thread;
     use vllm_tokenizer::HuggingFaceTokenizer;
@@ -1492,8 +1781,9 @@ mod tests {
 
     fn encoder(config: L1CacheConfig) -> (L1Encoder, Arc<L1Cache>) {
         let cache = Arc::new(L1Cache::new(config).unwrap());
-        let matcher =
-            BoundaryMatcher::new(&token_set(vec![spec("<s>"), spec("</s>")], true)).unwrap();
+        let matcher = BoundaryMatcher::new(&token_set(vec![spec("<s>"), spec("</s>")], true))
+            .unwrap()
+            .with_token_ids(&fixture_tokenizer());
         (L1Encoder::new("test-model", cache.clone(), matcher), cache)
     }
 
@@ -1589,51 +1879,157 @@ mod tests {
     }
 
     #[test]
-    fn node_overhead_covers_fixed_per_node_storage() {
-        use std::mem::size_of;
-        // The arena slot, the entry in the parent's child map (key, bucket,
-        // control byte), the ID in that bucket, and the ID `Arc` counts.
-        let fixed = size_of::<Option<Node>>()
-            + size_of::<SegmentKey>()
-            + size_of::<Vec<usize>>()
-            + 1
-            + size_of::<usize>()
-            + 2 * size_of::<usize>();
-        assert!(
-            fixed <= NODE_OVERHEAD_BYTES,
-            "{fixed} > {NODE_OVERHEAD_BYTES}"
-        );
+    fn bytes_count_node_contents_and_container_capacity() {
+        let tokenizer = fixture_tokenizer();
+        let (encoder, cache) = encoder(Default::default());
+        check(&encoder, &tokenizer, "<s>system hi</s><s>user</s>");
+        let tree = cache.tree.read();
+        let containers = tree.nodes.capacity() * size_of::<Option<Box<Node>>>()
+            + tree.free.capacity() * size_of::<usize>()
+            + tree.leaves.capacity() * size_of::<Reverse<(u64, usize)>>()
+            + tree.edges.allocation_size()
+            + tree.roots.allocation_size();
+        assert!(tree.edges.allocation_size() > 0 && tree.roots.allocation_size() > 0);
+        assert_eq!(tree.bytes(), tree.content_bytes + containers);
+        for node in tree.nodes.iter().flatten() {
+            // At least the struct, the edge text, the IDs and the `Arc` counts.
+            let raw = size_of::<Node>() + node.text.len() + 4 * node.ids.len() + 16;
+            assert!(node.bytes() >= raw);
+        }
     }
 
     #[test]
-    fn removing_children_releases_child_map_capacity() {
+    fn evictions_release_container_capacity() {
         let tokenizer = fixture_tokenizer();
         let (encoder, cache) = encoder(L1CacheConfig::default());
-        for i in 0..64 {
+        for i in 0..256 {
             check(&encoder, &tokenizer, &format!("{i}</s>"));
         }
-        let root_capacity = |cache: &L1Cache| {
+        let (edges, bytes) = {
             let tree = cache.tree.read();
-            let root = *tree.roots.values().next().unwrap();
-            (root, tree.node(root).children.capacity())
+            (tree.edges.capacity(), tree.bytes())
         };
-        let (root, grown) = root_capacity(&cache);
-        assert!(grown >= 64);
+        assert!(edges >= 256);
         {
             let mut tree = cache.tree.write();
-            let children: Vec<usize> = tree
-                .node(root)
-                .children
-                .values()
-                .flatten()
-                .copied()
+            // Keep the root and one leaf.
+            assert_eq!(tree.evict(usize::MAX, 2), 255);
+            assert!(tree.edges.capacity() < edges / 4);
+            assert!(tree.bytes() < bytes / 4);
+        }
+        check_invariants(&cache);
+        // An empty tree holds no storage at all.
+        cache.tree.write().evict(0, 0);
+        assert_eq!(cache.stats().bytes, 0);
+        assert!(check(&encoder, &tokenizer, "0</s>") == 0);
+        check_invariants(&cache);
+    }
+
+    #[test]
+    fn eviction_is_least_recently_used() {
+        let tokenizer = fixture_tokenizer();
+        let (encoder, cache) = encoder(L1CacheConfig {
+            max_nodes: 4,
+            ..Default::default()
+        });
+        for text in ["a</s>", "b</s>", "c</s>"] {
+            check(&encoder, &tokenizer, text);
+        }
+        // A hit refreshes `a`, so `b` is the oldest leaf when `d` arrives.
+        assert!(check(&encoder, &tokenizer, "a</s>") > 0);
+        check(&encoder, &tokenizer, "d</s>");
+        assert_eq!(cache.stats().evictions, 1);
+        for text in ["a</s>", "c</s>", "d</s>"] {
+            assert!(check(&encoder, &tokenizer, text) > 0, "{text}");
+        }
+        assert_eq!(check(&encoder, &tokenizer, "b</s>"), 0);
+        check_invariants(&cache);
+    }
+
+    #[test]
+    fn insert_walks_again_when_the_tree_changed_after_lookup() {
+        let tokenizer = fixture_tokenizer();
+        let (encoder, cache) = encoder(Default::default());
+        let namespace = Namespace {
+            instance: 0,
+            salt: None,
+        };
+        let insert_after = |text: &str, change: &dyn Fn()| {
+            let first_cut = |from| encoder.matcher.first_cut(text, from);
+            let hit = cache.lookup(&namespace, text, first_cut);
+            change();
+            let cuts = encoder.matcher.cuts(text, hit.bytes);
+            let tail = tokenizer.encode(&text[hit.bytes..], false).unwrap();
+            let bounds = encoder
+                .tail_bounds(&tokenizer, text, &hit, &cuts, &tail)
+                .unwrap();
+            let mut ids: Vec<u32> = hit
+                .pieces
+                .iter()
+                .flat_map(|(piece, take)| piece[..*take].to_vec())
                 .collect();
-            for &child in &children[..children.len() - 1] {
-                tree.remove_leaf(child);
+            ids.extend(tail);
+            cache.insert(&namespace, text, &ids, hit, &bounds, first_cut);
+        };
+        // Another request stores a shared prefix in between: the insert
+        // walks again, splits that edge and appends only its own turn.
+        let text = "<s>sys</s><s>user one</s><s>";
+        insert_after(text, &|| {
+            check(&encoder, &tokenizer, "<s>sys</s><s>user two</s><s>");
+        });
+        check_invariants(&cache);
+        let all = tokenizer.encode(text, false).unwrap().len();
+        assert_eq!(check(&encoder, &tokenizer, text), all);
+        // An eviction removes the matched path in between: the cuts before
+        // the match have no offsets, so nothing is stored.
+        insert_after(&format!("{text}assistant</s>"), &|| {
+            cache.tree.write().evict(0, 0);
+        });
+        check_invariants(&cache);
+        assert_eq!(cache.stats().nodes, 0);
+    }
+
+    #[test]
+    fn cut_offsets_fall_back_to_segments_when_boundary_ids_do_not_line_up() {
+        use std::sync::atomic::AtomicUsize;
+
+        // Emits `<s>`'s ID for plain "zz" too, which never crosses a cut.
+        struct Spurious {
+            inner: HuggingFaceTokenizer,
+            calls: AtomicUsize,
+        }
+        impl Tokenizer for Spurious {
+            fn encode(&self, text: &str, special: bool) -> vllm_tokenizer::Result<Vec<u32>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.inner.encode(&text.replace("zz", "<s>"), special)
+            }
+            fn encode_ordinary(&self, text: &str) -> vllm_tokenizer::Result<Vec<u32>> {
+                self.inner.encode_ordinary(text)
+            }
+            fn decode(&self, ids: &[u32], special: bool) -> vllm_tokenizer::Result<String> {
+                self.inner.decode(ids, special)
+            }
+            fn token_to_id(&self, token: &str) -> Option<u32> {
+                self.inner.token_to_id(token)
+            }
+            fn id_to_token(&self, id: u32) -> Option<String> {
+                self.inner.id_to_token(id)
             }
         }
-        assert!(root_capacity(&cache).1 < grown / 4);
+        let tokenizer = Spurious {
+            inner: fixture_tokenizer(),
+            calls: AtomicUsize::new(0),
+        };
+        let (encoder, cache) = encoder(Default::default());
+        let text = "<s>zz one</s><s>two</s><s>";
+        assert_eq!(check(&encoder, &tokenizer, text), 0);
+        // The tail encode, one encode per segment for the offsets, and the
+        // reference encode in `check`.
+        assert_eq!(tokenizer.calls.load(Ordering::Relaxed), 1 + 5 + 1);
+        let all = tokenizer.encode(text, false).unwrap().len();
+        assert_eq!(check(&encoder, &tokenizer, text), all);
         check_invariants(&cache);
+        assert_eq!(cache.stats().hits, 1);
     }
 
     #[test]
@@ -1643,7 +2039,7 @@ mod tests {
         {
             let (encoder, cache) = encoder(Default::default());
             check(&encoder, &tokenizer, text);
-            let plain = cache.stats().bytes;
+            let plain = cache.tree.read().content_bytes;
             let salt = "abcdef";
             // Same text again, so this lookup hits.
             check(&encoder, &tokenizer, text);
@@ -1652,7 +2048,10 @@ mod tests {
                 .encode(&tokenizer, 0, text, Some(salt))
                 .unwrap()
                 .unwrap();
-            assert_eq!(cache.stats().bytes, plain * 2 + salt.len());
+            assert_eq!(
+                cache.tree.read().content_bytes,
+                plain * 2 + heap_bytes(2 * size_of::<usize>() + salt.len())
+            );
             {
                 let tree = cache.tree.read();
                 let root = tree
@@ -1675,15 +2074,13 @@ mod tests {
             check_invariants(&cache);
         }
 
-        // Nine `<s>` tokens: text + ids + one node header fits in 256 bytes,
-        // but the interior marks and the new root do not. The old estimate
-        // would have stored the whole leaf.
+        // Nine `<s>` tokens: the leaf and the new namespace root fit the
+        // insert cap, but not once the leaf's interior marks are counted.
         let nine = "<s>".repeat(9);
         let ids = tokenizer.encode(&nine, false).unwrap();
-        let old_estimate = nine.len() + ids.len() * 4 + NODE_OVERHEAD_BYTES;
+        let leaf_alone = node_bytes(nine.len(), ids.len(), 0, None) + node_bytes(0, 0, 0, None);
         let (encoder, cache) = encoder(L1CacheConfig {
-            max_bytes: old_estimate.max(NODE_OVERHEAD_BYTES * 4),
-            max_insert_bytes: old_estimate,
+            max_insert_bytes: leaf_alone,
             max_nodes: 32,
             ..Default::default()
         });
@@ -1696,8 +2093,8 @@ mod tests {
                 .all(|node| node.text.len() != nine.len()),
             "the full leaf is over the insert cap once marks and the root are counted"
         );
+        assert!(tree.live > 0 && tree.content_bytes <= leaf_alone);
         drop(tree);
-        assert!(cache.stats().bytes <= old_estimate);
         check_invariants(&cache);
     }
 
@@ -1705,7 +2102,7 @@ mod tests {
     fn eviction_keeps_budget_and_recent_paths() {
         let tokenizer = fixture_tokenizer();
         let config = L1CacheConfig {
-            max_bytes: 4096,
+            max_bytes: 8 * 1024,
             max_nodes: 16,
             max_insert_bytes: 1024,
             max_insert_segments: 8,
@@ -1845,16 +2242,29 @@ mod tests {
     }
 
     fn lookup_report_node(parent: usize, text: String) -> Node {
-        Node {
+        Node::new(
             parent,
-            text: Box::from(text),
-            ids: Arc::from([]),
-            marks: Box::from([]),
-            children: HashMap::new(),
-            child_count: 0,
-            last_used: AtomicU64::new(0),
-            namespace: None,
+            Box::from(text),
+            Arc::from([]),
+            Box::from([]),
+            0,
+            None,
+        )
+    }
+
+    /// Children of `parent` whose first segment shares `segment`'s key.
+    fn bucket_len(tree: &Tree, parent: usize, segment: &str) -> usize {
+        let key = EdgeKey {
+            parent,
+            segment: tree.key(segment),
+        };
+        let mut id = tree.edges.get(&key).copied().unwrap_or(NO_NODE);
+        let mut len = 0;
+        while id != NO_NODE {
+            len += 1;
+            id = tree.node(id).next_same_key;
         }
+        len
     }
 
     fn timed_lookup(
@@ -1910,16 +2320,7 @@ mod tests {
 
     fn build_lookup_tree(segments: &[String], strategy: L1HashStrategy) -> (Tree, usize) {
         let mut tree = Tree::new(strategy);
-        let root = tree.alloc(Node {
-            parent: NO_PARENT,
-            text: Box::from(""),
-            ids: Arc::from([]),
-            marks: Box::from([]),
-            children: HashMap::new(),
-            child_count: 0,
-            last_used: AtomicU64::new(0),
-            namespace: None,
-        });
+        let root = tree.alloc(lookup_report_node(NO_NODE, String::new()));
         for segment in segments {
             let id = tree.alloc(lookup_report_node(root, segment.clone()));
             tree.add_child(root, id);
@@ -2057,11 +2458,7 @@ mod tests {
                     let (first_last_tree, first_last_root) =
                         build_lookup_tree(&segments, L1HashStrategy::FirstLast64);
                     let (full_tree, full_root) = build_lookup_tree(&segments, L1HashStrategy::Full);
-                    let first_last_bucket = first_last_tree
-                        .node(first_last_root)
-                        .children
-                        .get(&segment_key(query, L1HashStrategy::FirstLast64))
-                        .map_or(0, Vec::len);
+                    let first_last_bucket = bucket_len(&first_last_tree, first_last_root, query);
                     assert_eq!(
                         first_last_bucket,
                         if case == "normal" { 1 } else { siblings }
@@ -2219,11 +2616,7 @@ mod tests {
                     let (first_last_tree, first_last_root) =
                         build_lookup_tree(&segments, L1HashStrategy::FirstLast64);
                     let (full_tree, full_root) = build_lookup_tree(&segments, L1HashStrategy::Full);
-                    let first_last_bucket = first_last_tree
-                        .node(first_last_root)
-                        .children
-                        .get(&segment_key(query, L1HashStrategy::FirstLast64))
-                        .map_or(0, Vec::len);
+                    let first_last_bucket = bucket_len(&first_last_tree, first_last_root, query);
                     assert_eq!(
                         first_last_bucket,
                         if case == "normal" { 1 } else { siblings }
@@ -2281,24 +2674,38 @@ mod tests {
         assert_eq!(live.len(), tree.live);
         assert_eq!(
             live.iter().map(|&id| tree.node(id).bytes()).sum::<usize>(),
-            tree.bytes
+            tree.content_bytes
         );
+        assert!(tree.bytes() <= cache.config.max_bytes);
+        assert!(tree.live <= cache.config.max_nodes);
+        // Each edge entry chains children of its parent under its key.
+        let mut children = vec![0; tree.nodes.len()];
+        for (key, &head) in &tree.edges {
+            let mut id = head;
+            while id != NO_NODE {
+                assert_eq!(tree.node(id).parent, key.parent);
+                assert!(tree.edge(key.parent, id) == *key);
+                children[key.parent] += 1;
+                id = tree.node(id).next_same_key;
+            }
+        }
+        assert_eq!(
+            children.iter().sum::<usize>(),
+            live.len() - tree.roots.len()
+        );
+        let queued: HashSet<usize> = tree.leaves.iter().map(|&Reverse((_, id))| id).collect();
         for &id in &live {
             let node = tree.node(id);
-            let children: Vec<usize> = node.children.values().flatten().copied().collect();
-            assert_eq!(children.len(), node.child_count);
-            for (key, ids) in &node.children {
-                for &child in ids {
-                    assert_eq!(tree.node(child).parent, id);
-                    assert!(tree.key(tree.node(child).first_segment()) == *key);
-                }
-            }
+            assert_eq!(children[id], node.child_count);
             if let Some(namespace) = &node.namespace {
                 assert_eq!(tree.roots[namespace], id);
                 assert!(node.child_count > 0, "empty roots are removed");
                 continue;
             }
             assert!(!node.text.is_empty());
+            if node.is_leaf() {
+                assert!(queued.contains(&id), "every leaf has a heap entry");
+            }
             let mut prev = (0, 0);
             for &(byte, token) in node.marks.iter() {
                 assert!(byte > prev.0 && token > prev.1);
@@ -2321,12 +2728,11 @@ mod tests {
         let words = [
             "hi", " there", "\n", "数", "😀", "<s", "s>", "</", " \t", "1", "é",
         ];
-        for budget in [1024, 4096, 1 << 20] {
+        for budget in [8 * 1024, 16 * 1024, 1 << 20] {
             let (encoder, cache) = encoder(L1CacheConfig {
                 max_bytes: budget,
                 max_nodes: 24,
-                // A new root is its own node, so half of 1024 cannot hold a root
-                // plus one leaf. The cache cap is the insert cap here.
+                // The insert cap is the whole budget, so inserts also evict.
                 max_insert_bytes: budget,
                 max_insert_segments: 6,
                 ..Default::default()
@@ -2538,8 +2944,8 @@ mod tests {
         let (ids, cached) = encoder.encode(&tokenizer, 0, text, None).unwrap().unwrap();
         assert_eq!(ids, tokenizer.inner.encode(text, false).unwrap());
         assert_eq!(cached, 0);
-        // Two stored segments, then one encode of every later cut.
-        assert_eq!(tokenizer.calls.load(Ordering::Relaxed), 3);
+        // One encode of the tail; boundary IDs give the stored offsets.
+        assert_eq!(tokenizer.calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -2603,8 +3009,13 @@ mod tests {
             ..Default::default()
         });
         let text = "<s>system hello there</s><s>user hi</s>";
-        let (ids, cached) = encoder.encode(&tokenizer, 0, text, None).unwrap().unwrap();
-        assert_eq!((ids, cached), (tokenizer.encode(text, false).unwrap(), 0));
+        let expected = (tokenizer.encode(text, false).unwrap(), 0);
+        // The cold request is one encode of the whole prompt; the reuse on
+        // the next request is what disagrees.
+        let encode = || encoder.encode(&tokenizer, 0, text, None).unwrap();
+        assert_eq!(encode().unwrap(), expected);
+        assert_eq!(cache.stats().verify_mismatches, 0);
+        assert_eq!(encode().unwrap(), expected);
         assert_eq!(cache.stats().verify_mismatches, 1);
         assert!(encoder.encode(&tokenizer, 0, text, None).unwrap().is_none());
         assert_eq!(cache.stats().bypasses, 1);
@@ -2689,5 +3100,169 @@ mod tests {
             ("VLLM_ROUTER_L1_MAX_INSERT_BYTES", "11"),
         ])
         .is_err());
+    }
+
+    fn long_chat_turn(i: usize) -> String {
+        format!(
+            "<s>user {i}: {}</s>\n",
+            "lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(8)
+        )
+    }
+
+    fn timings(mut f: impl FnMut()) -> (std::time::Duration, std::time::Duration) {
+        let mut samples: Vec<_> = (0..30)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                f();
+                start.elapsed()
+            })
+            .collect();
+        samples.sort();
+        (samples[0], samples[samples.len() / 2])
+    }
+
+    fn percentiles(mut samples: Vec<std::time::Duration>) -> String {
+        samples.sort();
+        let at = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize];
+        format!(
+            "p50 {:?} p99 {:?} max {:?} (n={})",
+            at(0.5),
+            at(0.99),
+            at(1.0),
+            samples.len()
+        )
+    }
+
+    /// Synthetic ~440 KB chat with 1,862 boundaries built over 118 growing
+    /// turns, the shape of the 128k-token review probe.
+    ///
+    /// `cargo test --release --lib l1_long_chat_report -- --ignored --nocapture`
+    #[test]
+    #[ignore = "CPU-only performance report; run in release mode"]
+    fn l1_long_chat_report() {
+        use super::super::encode_cache::{FrontendCache, PromptEncoder};
+        use crate::tokenizer::TokenizerCacheConfig;
+        use vllm_text::Prompt;
+
+        let tokenizer = Arc::new(fixture_tokenizer());
+        let turns: Vec<String> = (0..931).map(long_chat_turn).collect();
+        let prompt = |n: usize| format!("{}<s>assistant\n", turns[..n].concat());
+        let full = prompt(931);
+        let config = L1CacheConfig {
+            max_bytes: 1 << 30,
+            max_insert_bytes: 1 << 28,
+            ..Default::default()
+        };
+        println!(
+            "prompt bytes {} boundaries {} tokens {}",
+            full.len(),
+            encoder(config).0.matcher.boundaries(&full).len(),
+            tokenizer.encode(&full, false).unwrap().len()
+        );
+
+        let (single_min, _) = timings(|| {
+            std::hint::black_box(tokenizer.encode(&full, false).unwrap());
+        });
+        let mut cold = Vec::new();
+        for _ in 0..5 {
+            let (encoder, _) = encoder(config);
+            let start = std::time::Instant::now();
+            let ids = encoder.encode(tokenizer.as_ref(), 0, &full, None).unwrap();
+            cold.push(start.elapsed());
+            assert_eq!(ids.unwrap().0, tokenizer.encode(&full, false).unwrap());
+        }
+        cold.sort();
+        println!("cold: L1 {:?} vs single-pass {single_min:?}", cold[0]);
+
+        let (encoder, cache) = encoder(config);
+        for step in 1..=118 {
+            check(&encoder, tokenizer.as_ref(), &prompt(931 * step / 118));
+        }
+        let warm = cache.stats();
+        let (min, median) = timings(|| {
+            encoder.encode(tokenizer.as_ref(), 0, &full, None).unwrap();
+        });
+        println!(
+            "full hit: min {min:?} median {median:?} (nodes {} bytes {})",
+            warm.nodes, warm.bytes
+        );
+        let (min, median) = timings(|| {
+            std::hint::black_box(encoder.matcher.boundaries(&full));
+        });
+        println!("boundaries(full) alone: min {min:?} median {median:?}");
+        let mut extra = 0;
+        let (min, median) = timings(|| {
+            extra += 1;
+            let text = format!("{}<s>user extra {extra}</s>\n<s>assistant\n", full);
+            encoder.encode(tokenizer.as_ref(), 0, &text, None).unwrap();
+        });
+        println!("growth by one turn: min {min:?} median {median:?}");
+
+        let l0 = Arc::new(
+            FrontendCache::new(TokenizerCacheConfig {
+                max_entries: 1024,
+                max_bytes: 1 << 30,
+                max_entry_bytes: 1 << 26,
+            })
+            .unwrap(),
+        );
+        let both = PromptEncoder::new("fixture", tokenizer.clone(), Some(l0))
+            .with_l1_cache(Some(encoder.clone()));
+        let run = |text: &str| {
+            both.encode_detailed(Prompt::Text(text.to_string()), false, None)
+                .unwrap()
+        };
+        run(&full);
+        let (min, median) = timings(|| {
+            run(&full);
+        });
+        println!("L0+L1, L0 hit: min {min:?} median {median:?}");
+        let mut extra = 0;
+        let (min, median) = timings(|| {
+            extra += 1;
+            run(&format!("{full}<s>user l0 miss {extra}</s>\n"));
+        });
+        println!("L0+L1, L0 miss then L1 hit: min {min:?} median {median:?}");
+
+        for threads in [1, 8, 16] {
+            let start = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    let (encoder, tokenizer, full) = (&encoder, tokenizer.clone(), &full);
+                    scope.spawn(move || {
+                        for _ in 0..20 {
+                            encoder.encode(tokenizer.as_ref(), 0, full, None).unwrap();
+                        }
+                    });
+                }
+            });
+            let per = start.elapsed() / (threads * 20) as u32;
+            println!("{threads} threads full hit: {per:?} wall per request");
+        }
+
+        for max_nodes in [2048, 65_536] {
+            let (encoder, cache) = super::tests::encoder(L1CacheConfig {
+                max_nodes,
+                ..config
+            });
+            let (mut samples, mut alone) = (Vec::new(), Vec::new());
+            for i in 0..max_nodes * 3 {
+                let text = format!("<s>sys {}</s><s>user {i}</s><s>a", i % 3);
+                let start = std::time::Instant::now();
+                encoder.encode(tokenizer.as_ref(), 0, &text, None).unwrap();
+                let elapsed = start.elapsed();
+                if cache.stats().evictions > 0 {
+                    samples.push(elapsed);
+                    let start = std::time::Instant::now();
+                    std::hint::black_box(tokenizer.encode(&text, false).unwrap());
+                    alone.push(start.elapsed());
+                }
+            }
+            println!(
+                "max_nodes {max_nodes} encode once evicting: {}; tokenizer alone: {}",
+                percentiles(samples),
+                percentiles(alone)
+            );
+        }
     }
 }
