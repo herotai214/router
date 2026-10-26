@@ -1,7 +1,8 @@
 //! Shared prompt encoding caches: exact-match L0, then prefix L1.
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, LazyLock, Once};
 
 use anyhow::{bail, Context, Result};
 use vllm_text::Prompt;
@@ -11,12 +12,41 @@ use super::l1_encode_cache::{L1Bypass, L1Encoder};
 use crate::tokenizer::cache::{entry_overhead_bytes, EncodeCache};
 use crate::tokenizer::TokenizerCacheConfig;
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+/// The prompt is hashed once, before the cache lock is taken; the map only
+/// rehashes `hash`.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct EncodingKey {
+    hash: u64,
     instance: u64,
     add_special_tokens: bool,
     cache_salt: Option<String>,
     text: String,
+}
+
+impl EncodingKey {
+    fn new(
+        instance: u64,
+        add_special_tokens: bool,
+        cache_salt: Option<String>,
+        text: String,
+    ) -> Self {
+        // Seeded per process, so prompts cannot be crafted to collide.
+        static PROMPT_HASH: LazyLock<foldhash::quality::RandomState> =
+            LazyLock::new(Default::default);
+        Self {
+            hash: PROMPT_HASH.hash_one((instance, add_special_tokens, &cache_salt, &text)),
+            instance,
+            add_special_tokens,
+            cache_salt,
+            text,
+        }
+    }
+}
+
+impl Hash for EncodingKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
 }
 
 // Hits share this allocation with `TokenizeOut` instead of copying it.
@@ -97,12 +127,12 @@ impl PromptEncoder {
         let Some(cache) = &self.cache else {
             return self.encode_text(&text, add_special_tokens, cache_salt);
         };
-        let key = EncodingKey {
-            instance: self.instance,
+        let key = EncodingKey::new(
+            self.instance,
             add_special_tokens,
-            cache_salt: cache_salt.map(str::to_owned),
+            cache_salt.map(str::to_owned),
             text,
-        };
+        );
         let (ids, l1_cached) = cache.get_or_encode_with(
             &key,
             || {
