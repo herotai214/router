@@ -14,7 +14,7 @@ use vllm_chat::{
 use vllm_text::TextDecodeOptions;
 
 use super::encode_cache::{deterministic_model, FrontendCache, PromptEncoder};
-use super::l1_cache::{load_boundary_matcher, L1Cache, L1Encoder};
+use super::l1_encode_cache::{load_boundary_matcher, L1Cache, L1Encoder};
 use vllm_tokenizer::{IncrementalDecoder, Tokenizer};
 
 pub use vllm_chat::ChatMessage as UpstreamChatMessage;

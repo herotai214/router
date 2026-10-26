@@ -9,7 +9,7 @@ use vllm_text::backend::hf::{ResolvedModelFiles, TokenizerSource};
 use vllm_text::Prompt;
 use vllm_tokenizer::DynTokenizer;
 
-use super::l1_cache::{L1Bypass, L1Encoder};
+use super::l1_encode_cache::{L1Bypass, L1Encoder};
 use crate::tokenizer::cache::{entry_overhead_bytes, EncodeCache};
 use crate::tokenizer::TokenizerCacheConfig;
 

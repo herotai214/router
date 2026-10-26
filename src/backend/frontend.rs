@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use axum::response::Response;
 
 use super::grpc::{FirstOutputCallback, GrpcEngineBackend};
-use super::l1_cache::{L1CacheConfig, L1CacheStats};
+use super::l1_encode_cache::{L1CacheConfig, L1CacheStats};
 use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
 use crate::protocols::spec::ChatCompletionRequest;
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
@@ -108,7 +108,7 @@ impl EngineFrontend {
         Self::with_encoding_caches(
             request_timeout,
             super::encode_cache::config_from_env()?,
-            super::l1_cache::config_from_env()?,
+            super::l1_encode_cache::config_from_env()?,
         )
     }
 
