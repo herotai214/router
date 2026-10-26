@@ -490,7 +490,9 @@ fn added_tokens(value: &Value, skip: Option<&[u64]>) -> Vec<AddedTokenSpec> {
 }
 
 const NO_PARENT: usize = usize::MAX;
-const NODE_OVERHEAD_BYTES: usize = 192;
+/// Covers the fixed per-node storage checked by
+/// `node_overhead_covers_fixed_per_node_storage`.
+const NODE_OVERHEAD_BYTES: usize = 256;
 const MARK_BYTES: usize = 8;
 
 /// Bytes an insert retains: the new leaf, one overhead per interior mark, a
@@ -682,6 +684,12 @@ impl Tree {
             }
         }
         node.child_count -= 1;
+        // `Node::bytes` charges no spare capacity, so release it once the map
+        // is mostly empty. Shrinking only below a quarter keeps this amortized
+        // O(1).
+        if node.children.len() * 4 < node.children.capacity() {
+            node.children.shrink_to_fit();
+        }
     }
 
     /// Follow `text` from `root`; returns the steps and the matched bytes.
@@ -1581,6 +1589,54 @@ mod tests {
     }
 
     #[test]
+    fn node_overhead_covers_fixed_per_node_storage() {
+        use std::mem::size_of;
+        // The arena slot, the entry in the parent's child map (key, bucket,
+        // control byte), the ID in that bucket, and the ID `Arc` counts.
+        let fixed = size_of::<Option<Node>>()
+            + size_of::<SegmentKey>()
+            + size_of::<Vec<usize>>()
+            + 1
+            + size_of::<usize>()
+            + 2 * size_of::<usize>();
+        assert!(
+            fixed <= NODE_OVERHEAD_BYTES,
+            "{fixed} > {NODE_OVERHEAD_BYTES}"
+        );
+    }
+
+    #[test]
+    fn removing_children_releases_child_map_capacity() {
+        let tokenizer = fixture_tokenizer();
+        let (encoder, cache) = encoder(L1CacheConfig::default());
+        for i in 0..64 {
+            check(&encoder, &tokenizer, &format!("{i}</s>"));
+        }
+        let root_capacity = |cache: &L1Cache| {
+            let tree = cache.tree.read();
+            let root = *tree.roots.values().next().unwrap();
+            (root, tree.node(root).children.capacity())
+        };
+        let (root, grown) = root_capacity(&cache);
+        assert!(grown >= 64);
+        {
+            let mut tree = cache.tree.write();
+            let children: Vec<usize> = tree
+                .node(root)
+                .children
+                .values()
+                .flatten()
+                .copied()
+                .collect();
+            for &child in &children[..children.len() - 1] {
+                tree.remove_leaf(child);
+            }
+        }
+        assert!(root_capacity(&cache).1 < grown / 4);
+        check_invariants(&cache);
+    }
+
+    #[test]
     fn salt_is_one_allocation_and_the_insert_cap_counts_marks() {
         let tokenizer = fixture_tokenizer();
         let text = "<s>system hi</s><s>user</s>";
@@ -2265,11 +2321,11 @@ mod tests {
         let words = [
             "hi", " there", "\n", "数", "😀", "<s", "s>", "</", " \t", "1", "é",
         ];
-        for budget in [512, 4096, 1 << 20] {
+        for budget in [1024, 4096, 1 << 20] {
             let (encoder, cache) = encoder(L1CacheConfig {
                 max_bytes: budget,
                 max_nodes: 24,
-                // A new root is its own node, so half of 512 cannot hold a root
+                // A new root is its own node, so half of 1024 cannot hold a root
                 // plus one leaf. The cache cap is the insert cap here.
                 max_insert_bytes: budget,
                 max_insert_segments: 6,
