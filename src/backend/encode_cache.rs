@@ -308,6 +308,40 @@ mod tests {
     }
 
     #[test]
+    fn keys_with_equal_hashes_stay_distinct() {
+        let cache = FrontendCache::new(Default::default()).unwrap();
+        let key =
+            |instance, add_special_tokens, cache_salt: Option<&str>, text: &str| EncodingKey {
+                hash: 7,
+                instance,
+                add_special_tokens,
+                cache_salt: cache_salt.map(str::to_owned),
+                text: text.to_owned(),
+            };
+        let keys = [
+            key(0, false, None, "a"),
+            key(0, false, None, "b"),
+            key(1, false, None, "a"),
+            key(0, true, None, "a"),
+            key(0, false, Some("s"), "a"),
+        ];
+        for round in 0..2 {
+            for (i, key) in keys.iter().enumerate() {
+                let (ids, miss) = cache
+                    .get_or_encode_with(
+                        key,
+                        || Ok::<_, ()>((Arc::<[u32]>::from([i as u32]), ())),
+                        |_| 64,
+                    )
+                    .unwrap();
+                assert_eq!(&*ids, &[i as u32]);
+                assert_eq!(miss.is_some(), round == 0);
+            }
+        }
+        assert_eq!(cache.stats().entries, keys.len());
+    }
+
+    #[test]
     fn cache_salt_isolates_entries_and_counts_retained_bytes() {
         let cache = Arc::new(FrontendCache::new(Default::default()).unwrap());
         let inner = CountingTokenizer::new(0);

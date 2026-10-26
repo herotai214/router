@@ -481,6 +481,38 @@ fn insert_walks_again_when_the_tree_changed_after_lookup() {
 }
 
 #[test]
+fn lookups_scan_for_cuts_only_where_a_node_has_several_children() {
+    let tokenizer = fixture_tokenizer();
+    let (encoder, cache) = encoder(Default::default());
+    let namespace = Namespace {
+        instance: 0,
+        salt: None,
+    };
+    let mut chat = String::new();
+    for turn in 0..6 {
+        chat.push_str(&format!("<s>turn {turn}</s>"));
+        check(&encoder, &tokenizer, &chat);
+    }
+    let scans = |text: &str| {
+        let calls = std::cell::Cell::new(0);
+        let hit = cache.lookup(&namespace, text, |from| {
+            calls.set(calls.get() + 1);
+            encoder.matcher.first_cut(text, from)
+        });
+        (hit.bytes, calls.get())
+    };
+    assert_eq!(scans(&chat), (chat.len(), 0));
+    // A sibling after turn 2 makes that one step pick by first segment.
+    check(
+        &encoder,
+        &tokenizer,
+        "<s>turn 0</s><s>turn 1</s><s>turn 2</s><s>other</s>",
+    );
+    assert_eq!(scans(&chat), (chat.len(), 1));
+    check_invariants(&cache);
+}
+
+#[test]
 fn walk_finds_the_remaining_child_after_the_last_added_one_is_evicted() {
     let tokenizer = fixture_tokenizer();
     let (encoder, cache) = encoder(Default::default());
