@@ -432,7 +432,7 @@ fn is_identity_normalizer(normalizer: &Value) -> bool {
 }
 
 fn check_tokenizer_json(json: &Value) -> Result<()> {
-    if !super::encode_cache::deterministic_hf_model(&json["model"]) {
+    if !super::tokenizer_determinism::deterministic_hf_model(&json["model"]) {
         bail!("tokenizer model is not known to be deterministic");
     }
     if !json["truncation"].is_null() || !json["padding"].is_null() {
