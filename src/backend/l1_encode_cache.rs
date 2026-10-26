@@ -601,16 +601,31 @@ struct Hit {
     splits: bool,
 }
 
-#[derive(Default)]
 struct Tree {
     nodes: Vec<Option<Node>>,
     free: Vec<usize>,
     roots: HashMap<Namespace, usize>,
     live: usize,
     bytes: usize,
+    strategy: L1HashStrategy,
 }
 
 impl Tree {
+    fn new(strategy: L1HashStrategy) -> Self {
+        Self {
+            nodes: Vec::new(),
+            free: Vec::new(),
+            roots: HashMap::new(),
+            live: 0,
+            bytes: 0,
+            strategy,
+        }
+    }
+
+    fn key(&self, segment: &str) -> SegmentKey {
+        segment_key(segment, self.strategy)
+    }
+
     fn node(&self, id: usize) -> &Node {
         self.nodes[id].as_ref().expect("live L1 node")
     }
@@ -642,17 +657,17 @@ impl Tree {
         node
     }
 
-    fn child(&self, parent: usize, segment: &str, strategy: L1HashStrategy) -> Option<usize> {
+    fn child(&self, parent: usize, segment: &str) -> Option<usize> {
         self.node(parent)
             .children
-            .get(&segment_key(segment, strategy))?
+            .get(&self.key(segment))?
             .iter()
             .copied()
             .find(|&id| self.node(id).first_segment() == segment)
     }
 
-    fn add_child(&mut self, parent: usize, child: usize, strategy: L1HashStrategy) {
-        let key = segment_key(self.node(child).first_segment(), strategy);
+    fn add_child(&mut self, parent: usize, child: usize) {
+        let key = self.key(self.node(child).first_segment());
         let node = self.node_mut(parent);
         node.children.entry(key).or_default().push(child);
         node.child_count += 1;
@@ -670,13 +685,7 @@ impl Tree {
     }
 
     /// Follow `text` from `root`; returns the steps and the matched bytes.
-    fn walk(
-        &self,
-        root: usize,
-        text: &str,
-        bounds: &[usize],
-        strategy: L1HashStrategy,
-    ) -> (Vec<Step>, usize) {
+    fn walk(&self, root: usize, text: &str, bounds: &[usize]) -> (Vec<Step>, usize) {
         let mut steps = Vec::new();
         let (mut node, mut offset) = (root, 0);
         loop {
@@ -684,7 +693,7 @@ impl Tree {
             let Some(&end) = bounds.get(next) else {
                 break;
             };
-            let Some(child) = self.child(node, &text[offset..end], strategy) else {
+            let Some(child) = self.child(node, &text[offset..end]) else {
                 break;
             };
             let edge = self.node(child);
@@ -714,16 +723,9 @@ impl Tree {
         (steps, offset)
     }
 
-    fn lookup(
-        &self,
-        root: usize,
-        text: &str,
-        bounds: &[usize],
-        tick: u64,
-        strategy: L1HashStrategy,
-    ) -> Hit {
+    fn lookup(&self, root: usize, text: &str, bounds: &[usize], tick: u64) -> Hit {
         let mut hit = Hit::default();
-        for step in self.walk(root, text, bounds, strategy).0 {
+        for step in self.walk(root, text, bounds).0 {
             let (id, bytes, tokens, marks) = match step {
                 Step::Full(id) => {
                     let node = self.node(id);
@@ -769,7 +771,7 @@ impl Tree {
     }
 
     /// Split `id` at `marks[mark]`; returns the new upper node.
-    fn split(&mut self, id: usize, mark: usize, strategy: L1HashStrategy) -> usize {
+    fn split(&mut self, id: usize, mark: usize) -> usize {
         let old_bytes = self.node(id).bytes();
         let node = self.node_mut(id);
         let (byte, token) = node.marks[mark];
@@ -798,21 +800,21 @@ impl Tree {
             namespace: None,
         });
         // The upper node keeps the old first segment, hence the same key.
-        let key = segment_key(self.node(upper).first_segment(), strategy);
+        let key = self.key(self.node(upper).first_segment());
         if let Some(ids) = self.node_mut(parent).children.get_mut(&key) {
             for slot in ids.iter_mut().filter(|slot| **slot == id) {
                 *slot = upper;
             }
         }
         self.node_mut(id).parent = upper;
-        self.add_child(upper, id, strategy);
+        self.add_child(upper, id);
         upper
     }
 
     /// Remove a leaf. Single-child chains are kept: merging them would copy
     /// whole edges under the write lock.
-    fn remove_leaf(&mut self, id: usize, strategy: L1HashStrategy) {
-        let key = segment_key(self.node(id).first_segment(), strategy);
+    fn remove_leaf(&mut self, id: usize) {
+        let key = self.key(self.node(id).first_segment());
         let parent = self.release(id).parent;
         self.remove_child(parent, id, key);
         let parent_node = self.node(parent);
@@ -846,7 +848,7 @@ impl Tree {
                 break;
             }
             let parent = self.node(id).parent;
-            self.remove_leaf(id, config.hash_strategy);
+            self.remove_leaf(id);
             evicted += 1;
             // Chains shrink from the end: a parent that became a leaf is next.
             if let Some(node) = self.nodes[parent].as_ref().filter(|node| is_leaf(node)) {
@@ -900,7 +902,7 @@ impl L1Cache {
         config.validate()?;
         Ok(Self {
             config,
-            tree: RwLock::new(Tree::default()),
+            tree: RwLock::new(Tree::new(config.hash_strategy)),
             tick: AtomicU64::new(0),
             lookups: AtomicU64::new(0),
             hits: AtomicU64::new(0),
@@ -940,7 +942,7 @@ impl L1Cache {
         let tick = self.next_tick();
         let tree = self.tree.read();
         match tree.roots.get(namespace) {
-            Some(&root) => tree.lookup(root, text, bounds, tick, self.config.hash_strategy),
+            Some(&root) => tree.lookup(root, text, bounds, tick),
             None => Hit::default(),
         }
     }
@@ -954,7 +956,7 @@ impl L1Cache {
         let (before_nodes, before_bytes) = (tree.live, tree.bytes);
         let new_root = !tree.roots.contains_key(namespace);
         let root = tree.root(namespace, tick);
-        let (steps, offset) = tree.walk(root, text, &bytes, self.config.hash_strategy);
+        let (steps, offset) = tree.walk(root, text, &bytes);
         let splits = steps.iter().any(|step| matches!(step, Step::Partial(_, _)));
         let salt_len = namespace.salt.as_ref().map_or(0, |salt| salt.len());
         let start = bounds.partition_point(|&(byte, _)| byte <= offset);
@@ -990,9 +992,7 @@ impl L1Cache {
                         tree.node(id).last_used.store(tick, Ordering::Relaxed);
                         parent = id;
                     }
-                    Step::Partial(id, mark) => {
-                        parent = tree.split(id, mark, self.config.hash_strategy)
-                    }
+                    Step::Partial(id, mark) => parent = tree.split(id, mark),
                 }
             }
             let (end_byte, end_token) = bounds[end];
@@ -1011,7 +1011,7 @@ impl L1Cache {
                 last_used: AtomicU64::new(tick),
                 namespace: None,
             });
-            tree.add_child(parent, leaf, self.config.hash_strategy);
+            tree.add_child(parent, leaf);
         }
         if tree.node(root).child_count == 0 {
             if let Some(namespace) = tree.release(root).namespace {
@@ -1853,7 +1853,7 @@ mod tests {
     }
 
     fn build_lookup_tree(segments: &[String], strategy: L1HashStrategy) -> (Tree, usize) {
-        let mut tree = Tree::default();
+        let mut tree = Tree::new(strategy);
         let root = tree.alloc(Node {
             parent: NO_PARENT,
             text: Box::from(""),
@@ -1866,7 +1866,7 @@ mod tests {
         });
         for segment in segments {
             let id = tree.alloc(lookup_report_node(root, segment.clone()));
-            tree.add_child(root, id, strategy);
+            tree.add_child(root, id);
         }
         (tree, root)
     }
@@ -2016,11 +2016,10 @@ mod tests {
                         (64 * 1024 * 1024 / (len * siblings)).max(32)
                     };
                     let first_last_lookup = timed_lookup(lookup_iters, || {
-                        first_last_tree.child(first_last_root, query, L1HashStrategy::FirstLast64)
+                        first_last_tree.child(first_last_root, query)
                     });
-                    let full_lookup = timed_lookup(lookup_iters, || {
-                        full_tree.child(full_root, query, L1HashStrategy::Full)
-                    });
+                    let full_lookup =
+                        timed_lookup(lookup_iters, || full_tree.child(full_root, query));
                     report_lookup_row(
                         case,
                         len,
@@ -2179,11 +2178,10 @@ mod tests {
                         (64 * 1024 * 1024 / (bytes * siblings)).max(16)
                     };
                     let first_last_lookup = timed_lookup(lookup_iters, || {
-                        first_last_tree.child(first_last_root, query, L1HashStrategy::FirstLast64)
+                        first_last_tree.child(first_last_root, query)
                     });
-                    let full_lookup = timed_lookup(lookup_iters, || {
-                        full_tree.child(full_root, query, L1HashStrategy::Full)
-                    });
+                    let full_lookup =
+                        timed_lookup(lookup_iters, || full_tree.child(full_root, query));
                     report_lookup_row(
                         dims,
                         first_last_bucket,
@@ -2236,10 +2234,7 @@ mod tests {
             for (key, ids) in &node.children {
                 for &child in ids {
                     assert_eq!(tree.node(child).parent, id);
-                    assert!(
-                        segment_key(tree.node(child).first_segment(), cache.config.hash_strategy)
-                            == *key
-                    );
+                    assert!(tree.key(tree.node(child).first_segment()) == *key);
                 }
             }
             if let Some(namespace) = &node.namespace {
