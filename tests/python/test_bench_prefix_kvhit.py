@@ -15,8 +15,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-
-SCRIPT = Path(__file__).parents[1] / "benches" / "backend" / "bench_prefix_kvhit.py"
+SCRIPT = Path(__file__).parents[2] / "benches" / "backend" / "bench_prefix_kvhit.py"
 SPEC = importlib.util.spec_from_file_location("bench_prefix_kvhit", SCRIPT)
 assert SPEC and SPEC.loader
 BENCH_PREFIX_KVHIT = importlib.util.module_from_spec(SPEC)
@@ -88,7 +87,9 @@ class PrefixKvhitSseTests(unittest.TestCase):
         self.assertGreater(result["total_duration_ms"], 100)
 
     def test_top_level_sse_error_fails_measurement(self):
-        with sse_server([(0, chunk("partial")), (0, '{"error":"worker failed"}')]) as url:
+        with sse_server(
+            [(0, chunk("partial")), (0, '{"error":"worker failed"}')]
+        ) as url:
             with self.assertRaises(SystemExit):
                 BENCH_PREFIX_KVHIT.post_chat(url, "model", HELLO, 2, 2)
 

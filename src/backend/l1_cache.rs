@@ -1477,7 +1477,7 @@ mod tests {
     fn fixture_tokenizer() -> HuggingFaceTokenizer {
         HuggingFaceTokenizer::new(Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/tokenizer/byte_level_bpe.json"
+            "/tests/rust/fixtures/tokenizer/byte_level_bpe.json"
         )))
         .unwrap()
     }
