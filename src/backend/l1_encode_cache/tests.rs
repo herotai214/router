@@ -572,7 +572,7 @@ fn cut_offsets_fall_back_to_segments_when_boundary_ids_do_not_line_up() {
         calls: AtomicUsize::new(0),
     };
     let (encoder, cache) = encoder(Default::default());
-    let text = "<s>zz one</s><s>two</s><s>";
+    let text = &format!("<s>zz one{}</s><s>two</s><s>", " word".repeat(60));
     assert_eq!(check(&encoder, &tokenizer, text), 0);
     // The tail encode, one encode per segment for the offsets, and the
     // reference encode in `check`.
@@ -1452,7 +1452,7 @@ async fn randomized_prompts_match_real_tokenizers() {
 }
 
 #[test]
-fn tail_beyond_the_insert_cap_is_one_encode() {
+fn tail_is_one_encode_unless_short() {
     use std::sync::atomic::AtomicUsize;
 
     struct Counting {
@@ -1482,16 +1482,28 @@ fn tail_beyond_the_insert_cap_is_one_encode() {
         inner: fixture_tokenizer(),
         calls: AtomicUsize::new(0),
     };
-    let (encoder, _) = encoder(L1CacheConfig {
+    let (capped, _) = encoder(L1CacheConfig {
         max_insert_segments: 2,
         ..Default::default()
     });
-    let text = "<s>one</s><s>two</s><s>three</s><s>four</s>tail";
-    let (ids, cached) = encoder.encode(&tokenizer, 0, text, None).unwrap().unwrap();
+    let long = " word".repeat(60);
+    let text = &format!("<s>one{long}</s><s>two</s><s>three</s><s>four</s>tail");
+    let (ids, cached) = capped.encode(&tokenizer, 0, text, None).unwrap().unwrap();
     assert_eq!(ids, tokenizer.inner.encode(text, false).unwrap());
     assert_eq!(cached, 0);
     // One encode of the tail; boundary IDs give the stored offsets.
     assert_eq!(tokenizer.calls.load(Ordering::Relaxed), 1);
+
+    // A short tail is encoded one segment at a time.
+    let (fresh, _) = encoder(L1CacheConfig::default());
+    tokenizer.calls.store(0, Ordering::Relaxed);
+    let text = "<s>one</s><s>two</s><s>three</s><s>four</s>tail";
+    let (ids, _) = fresh.encode(&tokenizer, 0, text, None).unwrap().unwrap();
+    assert_eq!(ids, tokenizer.inner.encode(text, false).unwrap());
+    let segments = fresh.matcher.cuts(text, 0).len() + 1;
+    assert_eq!(tokenizer.calls.load(Ordering::Relaxed), segments);
+    let (_, cached) = fresh.encode(&tokenizer, 0, text, None).unwrap().unwrap();
+    assert!(cached > 0);
 }
 
 #[test]
@@ -1554,7 +1566,7 @@ fn verify_mode_disables_l1_on_mismatch() {
         verify: true,
         ..Default::default()
     });
-    let text = "<s>system hello there</s><s>user hi</s>";
+    let text = &format!("<s>system{}</s><s>user hi</s>", " hello there".repeat(25));
     let expected = (tokenizer.encode(text, false).unwrap(), 0);
     // The cold request is one encode of the whole prompt; the reuse on
     // the next request is what disagrees.

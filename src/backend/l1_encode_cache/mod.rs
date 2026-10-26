@@ -354,6 +354,34 @@ impl Drop for L1Cache {
     }
 }
 
+/// Tails up to this size are encoded one segment at a time. fastokens sends
+/// an input with 16 or more pre-token splits to a thread pool, which costs
+/// more than encoding a few short segments directly; longer tails gain from
+/// the pool.
+const SEGMENTED_TAIL_BYTES: usize = 256;
+
+/// Encode the tail after `hit` into `ids`, one segment per cut plus the text
+/// after the last cut. Returns the absolute (byte, token) offsets of the cuts.
+fn encode_segments(
+    tokenizer: &dyn Tokenizer,
+    text: &str,
+    hit: &Hit,
+    cuts: &[(usize, usize)],
+    ids: &mut Vec<u32>,
+) -> vllm_tokenizer::Result<Vec<(usize, usize)>> {
+    let mut bounds = Vec::with_capacity(cuts.len());
+    let mut from = hit.bytes;
+    for &(byte, _) in cuts {
+        ids.extend(tokenizer.encode(&text[from..byte], false)?);
+        bounds.push((byte, hit.tokens + ids.len()));
+        from = byte;
+    }
+    if from < text.len() {
+        ids.extend(tokenizer.encode(&text[from..], false)?);
+    }
+    Ok(bounds)
+}
+
 /// Per-model L1 handle used by `PromptEncoder`.
 #[derive(Clone)]
 pub(crate) struct L1Encoder {
@@ -406,12 +434,15 @@ impl L1Encoder {
         // The tail starts at a cut, so one encode of it has the same IDs as
         // encoding each segment.
         let tail = &text[hit.bytes..];
-        let tail_ids = if tail.is_empty() {
-            Vec::new()
+        let (tail_ids, bounds) = if tail.len() <= SEGMENTED_TAIL_BYTES {
+            let mut tail_ids = Vec::new();
+            let bounds = encode_segments(tokenizer, text, &hit, &cuts, &mut tail_ids)?;
+            (tail_ids, bounds)
         } else {
-            tokenizer.encode(tail, false)?
+            let tail_ids = tokenizer.encode(tail, false)?;
+            let bounds = self.tail_bounds(tokenizer, text, &hit, &cuts, &tail_ids)?;
+            (tail_ids, bounds)
         };
-        let bounds = self.tail_bounds(tokenizer, text, &hit, &cuts, &tail_ids)?;
         let mut ids = Vec::with_capacity(hit.tokens + tail_ids.len());
         for (piece, take) in &hit.pieces {
             ids.extend_from_slice(&piece[..*take]);
