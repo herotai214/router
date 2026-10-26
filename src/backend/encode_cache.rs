@@ -1,5 +1,4 @@
 //! Shared prompt encoding caches: exact-match L0, then prefix L1.
-use std::cell::Cell;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Once};
@@ -104,13 +103,11 @@ impl PromptEncoder {
             cache_salt: cache_salt.map(str::to_owned),
             text,
         };
-        let l1_cached = Cell::new(None);
-        let ids = cache.get_or_encode(
+        let (ids, l1_cached) = cache.get_or_encode_with(
             &key,
             || {
                 let encoded = self.encode_text(&key.text, add_special_tokens, cache_salt)?;
-                l1_cached.set(Some(encoded.cached_tokens));
-                Ok(encoded.ids)
+                Ok((encoded.ids, encoded.cached_tokens))
             },
             |ids| {
                 let bytes = entry_overhead_bytes::<EncodingKey, Arc<[u32]>>()
@@ -133,8 +130,8 @@ impl PromptEncoder {
                 bytes
             },
         )?;
-        // The closure only runs on an L0 miss.
-        let cached_tokens = l1_cached.get().unwrap_or(ids.len());
+        // An L0 hit serves every ID from the cache.
+        let cached_tokens = l1_cached.unwrap_or(ids.len());
         Ok(Encoded { ids, cached_tokens })
     }
 
@@ -328,6 +325,30 @@ mod tests {
         );
         assert_eq!(small.stats().oversized, 1);
         assert_eq!(small.stats().bytes, unsalted_bytes);
+    }
+
+    #[test]
+    fn cached_tokens_count_only_l0_hits_without_l1() {
+        let cached = |encoder: &PromptEncoder| {
+            encoder
+                .encode_detailed(Prompt::Text("Hello".into()), false, None)
+                .unwrap()
+                .cached_tokens
+        };
+        let cache = Arc::new(FrontendCache::new(Default::default()).unwrap());
+        let encoder = PromptEncoder::new("test-model", CountingTokenizer::new(0), Some(cache));
+        let len = encode(&encoder, "Hello", false).len();
+        assert_eq!(cached(&encoder), len);
+
+        let tiny = Arc::new(
+            FrontendCache::new(TokenizerCacheConfig {
+                max_entry_bytes: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let encoder = PromptEncoder::new("test-model", CountingTokenizer::new(0), Some(tiny));
+        assert_eq!((cached(&encoder), cached(&encoder)), (0, 0));
     }
 
     #[test]
