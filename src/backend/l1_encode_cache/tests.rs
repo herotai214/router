@@ -461,6 +461,16 @@ fn insert_walks_again_when_the_tree_changed_after_lookup() {
     check_invariants(&cache);
     let all = tokenizer.encode(text, false).unwrap().len();
     assert_eq!(check(&encoder, &tokenizer, text), all);
+    // Inserts into another namespace leave this one's steps reusable.
+    let next = format!("{text}assistant</s>");
+    let hit = cache.lookup(&namespace, &next, |from| {
+        encoder.matcher.first_cut(&next, from)
+    });
+    encoder
+        .encode(&tokenizer, 1, "<s>sys</s><s>other model</s><s>", None)
+        .unwrap();
+    let root = hit.root.unwrap();
+    assert_eq!(cache.tree.read().node(root).changed, hit.version);
     // An eviction removes the matched path in between: the cuts before
     // the match have no offsets, so nothing is stored.
     insert_after(&format!("{text}assistant</s>"), &|| {
@@ -468,6 +478,34 @@ fn insert_walks_again_when_the_tree_changed_after_lookup() {
     });
     check_invariants(&cache);
     assert_eq!(cache.stats().nodes, 0);
+}
+
+#[test]
+fn walk_finds_the_remaining_child_after_the_last_added_one_is_evicted() {
+    let tokenizer = fixture_tokenizer();
+    let (encoder, cache) = encoder(Default::default());
+    let (x, y) = ("<s>a</s><s>x</s>", "<s>a</s><s>y</s>");
+    check(&encoder, &tokenizer, x);
+    check(&encoder, &tokenizer, y);
+    {
+        let mut tree = cache.tree.write();
+        let leaf = tree.nodes.iter().position(|node| {
+            node.as_deref()
+                .is_some_and(|node| node.is_leaf() && &*node.text == "y</s>")
+        });
+        let leaf = leaf.unwrap();
+        let parent = tree.node(leaf).parent;
+        tree.remove_leaf(leaf);
+        assert_eq!(tree.node(parent).child_count, 1);
+        assert_eq!(tree.node(parent).child, leaf, "the hint is stale");
+    }
+    check_invariants(&cache);
+    let all = tokenizer.encode(x, false).unwrap().len();
+    assert_eq!(check(&encoder, &tokenizer, x), all);
+    // A new child refreshes the hint.
+    check(&encoder, &tokenizer, "<s>a</s><s>z</s>");
+    assert_eq!(check(&encoder, &tokenizer, x), all);
+    check_invariants(&cache);
 }
 
 #[test]
@@ -798,7 +836,12 @@ fn adversarial_long_segment(i: usize, len: usize) -> String {
 
 fn build_lookup_tree(segments: &[String], strategy: L1HashStrategy) -> (Tree, usize) {
     let mut tree = Tree::new(strategy);
-    let root = tree.alloc(lookup_report_node(NO_NODE, String::new()));
+    let mut root = lookup_report_node(NO_NODE, String::new());
+    root.namespace = Some(Namespace {
+        instance: 0,
+        salt: None,
+    });
+    let root = tree.alloc(root);
     for segment in segments {
         let id = tree.alloc(lookup_report_node(root, segment.clone()));
         tree.add_child(root, id);
@@ -1171,9 +1214,11 @@ fn check_invariants(cache: &L1Cache) {
         assert_eq!(children[id], node.child_count);
         if let Some(namespace) = &node.namespace {
             assert_eq!(tree.roots[namespace], id);
+            assert_eq!(node.root, id);
             assert!(node.child_count > 0, "empty roots are removed");
             continue;
         }
+        assert_eq!(node.root, tree.node(node.parent).root);
         assert!(!node.text.is_empty());
         if node.is_leaf() {
             assert!(queued.contains(&id), "every leaf has a heap entry");
@@ -1707,6 +1752,42 @@ fn l1_long_chat_report() {
         });
         let per = start.elapsed() / (threads * 20) as u32;
         println!("{threads} threads full hit: {per:?} wall per request");
+    }
+
+    // Each thread grows its own conversation in its own namespace, so the
+    // only thing they share is the tree and its lock.
+    for (models, shared) in [(1, true), (8, true), (16, true), (16, false)] {
+        let (shared_encoder, _) = super::tests::encoder(config);
+        let own: Vec<_> = (0..models)
+            .map(|_| super::tests::encoder(config).0)
+            .collect();
+        let per_request: std::time::Duration = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..models)
+                .map(|t| {
+                    let encoder = if shared { &shared_encoder } else { &own[t] };
+                    let tokenizer = tokenizer.clone();
+                    scope.spawn(move || {
+                        let (mut chat, mut busy) = (String::new(), std::time::Duration::ZERO);
+                        for i in 0..300 {
+                            chat.push_str(&long_chat_turn(t * 1000 + i));
+                            let text = format!("{chat}<s>assistant\n");
+                            let start = std::time::Instant::now();
+                            encoder
+                                .encode(tokenizer.as_ref(), t as u64, &text, None)
+                                .unwrap();
+                            busy += start.elapsed();
+                        }
+                        busy / 300
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        let tree = if shared { "one tree" } else { "a tree each" };
+        println!(
+            "{models} models growing in parallel, {tree}: {:?} per request",
+            per_request / models as u32
+        );
     }
 
     for max_nodes in [2048, 65_536] {

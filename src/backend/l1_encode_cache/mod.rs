@@ -241,10 +241,7 @@ impl L1Cache {
         let tree = self.tree.read();
         match tree.roots.get(namespace) {
             Some(&root) => tree.lookup(root, text, first_cut, tick),
-            None => Hit {
-                version: tree.version,
-                ..Default::default()
-            },
+            None => Hit::default(),
         }
     }
 
@@ -262,14 +259,18 @@ impl L1Cache {
         let tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
         let mut tree = self.tree.write();
         let (before_nodes, before_bytes) = (tree.live, tree.bytes());
-        let (root, steps, offset, start_token) = if tree.version == hit.version {
-            (hit.root, hit.steps, hit.bytes, hit.tokens)
-        } else if let Some(&root) = tree.roots.get(namespace) {
-            let (steps, offset) = tree.walk(root, text, first_cut);
-            let tokens = tree.matched_tokens(&steps);
-            (Some(root), steps, offset, tokens)
-        } else {
-            (None, Vec::new(), 0, 0)
+        let (root, steps, offset, start_token) = match tree.roots.get(namespace) {
+            // Versions only grow, so a root recreated in the same slot does
+            // not match either.
+            Some(&root) if hit.root == Some(root) && tree.node(root).changed == hit.version => {
+                (hit.root, hit.steps, hit.bytes, hit.tokens)
+            }
+            Some(&root) => {
+                let (steps, offset) = tree.walk(root, text, first_cut);
+                let tokens = tree.matched_tokens(&steps);
+                (Some(root), steps, offset, tokens)
+            }
+            None => (None, Vec::new(), 0, 0),
         };
         // An eviction since the lookup removed part of the path; the cuts
         // in between have no token offsets here, so leave it to a later

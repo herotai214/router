@@ -94,6 +94,9 @@ pub(super) struct Node {
     /// Next child of `parent` whose first segment has the same key.
     pub(super) next_same_key: usize,
     pub(super) child_count: usize,
+    /// The last child added. It is the only child while `child_count` is 1
+    /// and it still names a live node whose parent is this one.
+    pub(super) child: usize,
     /// Edge text; it ends at a boundary (empty for namespace roots).
     pub(super) text: Box<str>,
     pub(super) ids: Arc<[u32]>,
@@ -103,6 +106,10 @@ pub(super) struct Node {
     pub(super) last_used: AtomicU64,
     /// Set on namespace roots.
     pub(super) namespace: Option<Namespace>,
+    /// The namespace root this node belongs to (itself for a root).
+    pub(super) root: usize,
+    /// On roots: the tree version of the namespace's last structural change.
+    pub(super) changed: u64,
 }
 
 impl Node {
@@ -118,11 +125,14 @@ impl Node {
             parent,
             next_same_key: NO_NODE,
             child_count: 0,
+            child: NO_NODE,
             text,
             ids,
             marks,
             last_used: AtomicU64::new(tick),
             namespace,
+            root: NO_NODE,
+            changed: 0,
         }
     }
 
@@ -168,7 +178,7 @@ pub(super) enum Step {
 pub(super) struct Hit {
     /// The namespace root, if it existed.
     pub(super) root: Option<usize>,
-    /// Tree version the steps are valid for.
+    /// The root's `changed` the steps are valid for.
     pub(super) version: u64,
     pub(super) steps: Vec<Step>,
     pub(super) bytes: usize,
@@ -189,7 +199,8 @@ pub(super) struct Tree {
     pub(super) live: usize,
     /// Heap bytes owned by live nodes.
     pub(super) content_bytes: usize,
-    /// Bumped by every structural change, so a lookup's steps can be reused.
+    /// Bumped by every structural change. Roots record it per namespace, so
+    /// a lookup's steps stay reusable while only other namespaces change.
     pub(super) version: u64,
     pub(super) strategy: L1HashStrategy,
 }
@@ -232,30 +243,41 @@ impl Tree {
         self.nodes[id].as_deref_mut().expect("live L1 node")
     }
 
-    pub(super) fn alloc(&mut self, node: Node) -> usize {
-        self.version += 1;
+    pub(super) fn alloc(&mut self, mut node: Node) -> usize {
         self.live += 1;
         self.content_bytes += node.bytes();
+        let id = self.free.pop().unwrap_or(self.nodes.len());
+        node.root = if node.namespace.is_some() {
+            id
+        } else {
+            self.node(node.parent).root
+        };
+        let root = node.root;
         let node = Some(Box::new(node));
-        match self.free.pop() {
-            Some(id) => {
-                self.nodes[id] = node;
-                id
-            }
-            None => {
-                self.nodes.push(node);
-                self.nodes.len() - 1
-            }
+        if id == self.nodes.len() {
+            self.nodes.push(node);
+        } else {
+            self.nodes[id] = node;
         }
+        self.changed(root);
+        id
     }
 
     pub(super) fn release(&mut self, id: usize) -> Box<Node> {
-        self.version += 1;
         let node = self.nodes[id].take().expect("live L1 node");
         self.free.push(id);
         self.live -= 1;
         self.content_bytes -= node.bytes();
+        if node.root != id {
+            self.changed(node.root);
+        }
         node
+    }
+
+    fn changed(&mut self, root: usize) {
+        self.version += 1;
+        let version = self.version;
+        self.node_mut(root).changed = version;
     }
 
     pub(super) fn edge(&self, parent: usize, child: usize) -> EdgeKey {
@@ -284,7 +306,18 @@ impl Tree {
         let key = self.edge(parent, child);
         let next = self.edges.insert(key, child).unwrap_or(NO_NODE);
         self.node_mut(child).next_same_key = next;
-        self.node_mut(parent).child_count += 1;
+        let parent_node = self.node_mut(parent);
+        parent_node.child_count += 1;
+        parent_node.child = child;
+    }
+
+    fn only_child(&self, parent: usize) -> Option<usize> {
+        let node = self.node(parent);
+        if node.child_count != 1 {
+            return None;
+        }
+        let child = self.nodes.get(node.child)?.as_deref()?;
+        (child.parent == parent).then_some(node.child)
     }
 
     pub(super) fn unlink(&mut self, parent: usize, child: usize) {
@@ -309,9 +342,11 @@ impl Tree {
 
     /// Follow `text` from `root`, comparing edge text directly.
     /// `first_cut(offset)` returns the end of the first segment of
-    /// `text[offset..]` and is only asked at cut positions; it is used to
-    /// pick the child. Returns the steps and the matched bytes, which end at
-    /// a cut.
+    /// `text[offset..]` and is only asked at cut positions, to pick among
+    /// several children. An only child needs no scan: siblings' first
+    /// segments are prefix-free and cuts inside a shared prefix are shared,
+    /// so the child matches exactly when `text` continues with its first
+    /// segment. Returns the steps and the matched bytes, which end at a cut.
     pub(super) fn walk(
         &self,
         root: usize,
@@ -320,9 +355,23 @@ impl Tree {
     ) -> (Vec<Step>, usize) {
         let mut steps = Vec::new();
         let (mut node, mut offset) = (root, 0);
-        while let Some(end) = first_cut(offset) {
-            let Some(child) = self.child(node, &text[offset..end]) else {
+        loop {
+            let child = if let Some(child) = self.only_child(node) {
+                let first = self.node(child).first_segment().as_bytes();
+                if !text.as_bytes()[offset..].starts_with(first) {
+                    break;
+                }
+                child
+            } else if self.node(node).child_count == 0 {
                 break;
+            } else {
+                let Some(end) = first_cut(offset) else {
+                    break;
+                };
+                let Some(child) = self.child(node, &text[offset..end]) else {
+                    break;
+                };
+                child
             };
             let edge = self.node(child);
             let rest = &text.as_bytes()[offset..];
@@ -355,7 +404,7 @@ impl Tree {
         let (steps, _) = self.walk(root, text, first_cut);
         let mut hit = Hit {
             root: Some(root),
-            version: self.version,
+            version: self.node(root).changed,
             ..Default::default()
         };
         for &step in &steps {
