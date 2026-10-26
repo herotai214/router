@@ -134,7 +134,9 @@ class PrefixKvhitSseTests(unittest.TestCase):
         ]
         with sse_server(events) as url:
             start = time.perf_counter()
-            result = BENCH_PREFIX_KVHIT.post_hit_wave(url, "model", [HELLO] * 4, 1, 2, 4)
+            result = BENCH_PREFIX_KVHIT.post_hit_wave(
+                url, "model", [HELLO] * 4, 1, 2, 4
+            )
             elapsed = time.perf_counter() - start
         self.assertEqual(result["concurrency"], 4)
         self.assertEqual(result["requests"], 4)
@@ -152,7 +154,9 @@ class PrefixKvhitSseTests(unittest.TestCase):
         text = "abcdefghij" * 10
         first, second = make(0.7, text, 4, "A"), make(0.7, text, 4, "B")
         self.assertEqual(first[:-1], second[:-1])
-        self.assertEqual([m["role"] for m in first], ["user", "assistant"] * 2 + ["user"])
+        self.assertEqual(
+            [m["role"] for m in first], ["user", "assistant"] * 2 + ["user"]
+        )
         self.assertEqual("".join(m["content"] for m in first[:-1]), text[:70])
         self.assertEqual(first[-1]["content"], "A " + text[70:])
         self.assertNotEqual(first[-1], second[-1])
@@ -160,7 +164,8 @@ class PrefixKvhitSseTests(unittest.TestCase):
 
     def test_zero_hit_turn_bodies_share_nothing(self):
         first, second = (
-            BENCH_PREFIX_KVHIT.make_turn_messages(0.0, "payload", 8, tag) for tag in "AB"
+            BENCH_PREFIX_KVHIT.make_turn_messages(0.0, "payload", 8, tag)
+            for tag in "AB"
         )
         self.assertEqual(first[0], {"role": "system", "content": "A"})
         self.assertNotEqual(first[0], second[0])
@@ -182,7 +187,9 @@ class PrefixKvhitSseTests(unittest.TestCase):
         ] + [{"ttft_ms": 12.0, "stages": None}]
         summary = BENCH_PREFIX_KVHIT.summarize_rows(rows)
         self.assertEqual(summary["ttft_ms"]["max"], 12.0)
-        self.assertEqual(summary["encode_ms"], {"min": 1.0, "p50": 2.0, "avg": 2.0, "max": 3.0})
+        self.assertEqual(
+            summary["encode_ms"], {"min": 1.0, "p50": 2.0, "avg": 2.0, "max": 3.0}
+        )
         self.assertEqual(summary["frontend_ms"]["max"], 6.0)
         self.assertEqual(summary["encode_reuse"]["avg"], 0.5)
         self.assertNotIn("template_ms", summary)
