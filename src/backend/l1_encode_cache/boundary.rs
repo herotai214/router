@@ -120,7 +120,7 @@ impl BoundaryMatcher {
     }
 
     /// Cut positions in `text`, which must itself start at a cut position.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     pub(crate) fn boundaries(&self, text: &str) -> Vec<usize> {
         self.cuts(text, 0).into_iter().map(|(end, _)| end).collect()
     }

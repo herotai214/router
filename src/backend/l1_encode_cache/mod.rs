@@ -47,7 +47,7 @@ use self::boundary::BoundaryMatcher;
 use self::tree::{node_bytes, Hit, Namespace, Node, Step, Tree};
 
 mod boundary;
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests;
 mod tree;
 

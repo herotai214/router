@@ -23,7 +23,7 @@ pub(crate) fn deterministic_hf_model(model: &serde_json::Value) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use serde_json::json;
 

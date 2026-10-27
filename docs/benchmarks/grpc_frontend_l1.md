@@ -6,7 +6,7 @@ The prompt is one shared chat history plus a unique last user turn, rendered
 with the Qwen template so the cut falls on `<|im_end|>`.
 
 ```bash
-cargo test --release --test grpc_frontend_bench grpc_frontend_l1_overhead -- --ignored --nocapture
+cargo test --features cpu,ready --release --test grpc_frontend_bench grpc_frontend_l1_overhead -- --ignored --nocapture
 ```
 
 | Variable | Default | Meaning |
@@ -38,7 +38,7 @@ then times L1 off and on. A shape check,
 checks that 0%, 70%, and 99.99% land in the expected reuse bands.
 
 ```bash
-cargo test --test grpc_frontend_bench l1_bench_prompts_hit_the_requested_reuse -- --nocapture
+cargo test --features cpu,ready --test grpc_frontend_bench l1_bench_prompts_hit_the_requested_reuse -- --nocapture
 ```
 
 Example of a shorter timing run:
@@ -47,7 +47,7 @@ Example of a shorter timing run:
 VLLM_ROUTER_BENCH_TOKENS=2048 \
 VLLM_ROUTER_BENCH_REUSE=0,70,99.99 \
 VLLM_ROUTER_BENCH_CONCURRENCY=1 \
-cargo test --release --test grpc_frontend_bench grpc_frontend_l1_overhead -- --ignored --nocapture
+cargo test --features cpu,ready --release --test grpc_frontend_bench grpc_frontend_l1_overhead -- --ignored --nocapture
 ```
 
 ## End to end with a real worker

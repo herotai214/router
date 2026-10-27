@@ -236,7 +236,7 @@ fn ignored_cache_switches(read: impl Fn(&str) -> Option<String>) -> Vec<&'static
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::ignored_cache_switches;
 

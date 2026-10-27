@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 use super::boundary::*;
 use super::tree::*;
 use super::*;

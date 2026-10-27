@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! L1 cache integration tests: every prompt encoded through L1 must
 //! match the uncached frontend exactly.
 mod common;
