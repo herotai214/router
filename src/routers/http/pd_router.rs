@@ -540,7 +540,7 @@ impl PdRouterBase {
             .map(|worker| worker.base_url().to_owned())
             .collect::<Vec<_>>();
         match router_prompts {
-            Some(prompts) => router_token_inputs(bases, prompts),
+            Some(prompts) => router_token_inputs(bases, request, prompts),
             None => {
                 prepare_http_token_inputs(
                     &self.client,

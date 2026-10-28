@@ -450,7 +450,7 @@ impl PdKvState {
             })
             .collect();
         let results = match router_prompts {
-            Some(prompts) => router_token_inputs(bases, prompts),
+            Some(prompts) => router_token_inputs(bases, request, prompts),
             None => {
                 prepare_http_token_inputs(
                     &self.client,
