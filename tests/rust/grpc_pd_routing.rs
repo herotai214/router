@@ -98,8 +98,15 @@ async fn pd_router_with_pools(
     let ctx = create_test_context(config);
     // Separate P and D policy instances, as `RouterFactory` installs them.
     let policies = &ctx.policy_registry;
-    policies.set_prefill_policy(PolicyFactory::create_from_config(&prefill_policy));
-    policies.set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+    let affinity = policies.kv_affinity_table();
+    policies.set_prefill_policy(PolicyFactory::create_from_config(
+        &prefill_policy,
+        Some(&affinity),
+    ));
+    policies.set_decode_policy(PolicyFactory::create_from_config(
+        &PolicyConfig::RoundRobin,
+        Some(&affinity),
+    ));
     let router = VllmPDRouter::new(prefill_urls, vec![decode.grpc_url.clone()], None, &ctx)
         .await
         .expect("grpc P/D workers should pass grpc.health.v1");
@@ -324,6 +331,7 @@ async fn push_pair() -> (MockVllmRsServer, MockVllmRsServer, VllmPDRouter) {
 async fn grpc_pd_power_of_two_uses_local_prefill_load() {
     let busy = MockVllmRsServer::spawn_with_state(MockVllmRs {
         finish_kv_transfer_params: Some(prefill_kv()),
+        reply_delay: std::time::Duration::from_secs(30),
         ..Default::default()
     })
     .await;
@@ -338,20 +346,34 @@ async fn grpc_pd_power_of_two_uses_local_prefill_load() {
     };
     let router = pd_router_with_pools(&[&busy, &idle], &decode, 1, policy).await;
     router.pin_test_token_ids(vec![1, 2, 3]);
-    // Let the load monitor run its first pass.
+    // Let the load monitor run its first pass; it caches 0 for grpc:// URLs.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    router
-        .worker_registry()
-        .get_by_url(&busy.grpc_url)
-        .unwrap()
-        .increment_load();
+
+    // Hold one admitted request on the slow prefill. Requests that land on
+    // the idle prefill finish right away.
+    let request = chat(false);
+    let mut held = None;
+    for _ in 0..32 {
+        let mut pending = Box::pin(router.route_chat(None, &request, None));
+        tokio::select! {
+            response = &mut pending => assert!(response.status().is_success()),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                held = Some(pending);
+                break;
+            }
+        }
+    }
+    assert!(held.is_some(), "no request reached the slow prefill");
+    assert_eq!(busy.captured().len(), 1);
+    let idle_before = idle.captured().len();
 
     for _ in 0..8 {
         let response = router.route_chat(None, &chat(false), None).await;
         assert!(response.status().is_success());
     }
-    assert!(busy.captured().is_empty(), "the busy prefill was picked");
-    assert_eq!(idle.captured().len(), 8);
+    assert_eq!(busy.captured().len(), 1, "the busy prefill was picked");
+    assert_eq!(idle.captured().len(), idle_before + 8);
+    drop(held);
 }
 
 #[tokio::test]
