@@ -6,7 +6,7 @@ use super::pd_types::{
     Loads, PDRouterError, PdAttempt, PdEndpoint, PdLoadManager, PdPrefillInput, PdRequestContext,
     PdSelection, Stage, StageDecision,
 };
-use crate::backend::preprocess::prepare_http_token_inputs;
+use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs, HttpTokenInput};
 use crate::core::worker::WorkerMetadata;
 use crate::core::{
     BasicWorker, CircuitBreaker, CircuitBreakerConfig, ConnectionMode, DPAwareWorker, HealthConfig,
@@ -452,38 +452,31 @@ fn build_dp_workers(
 }
 
 impl PdRouterBase {
+    /// `router_prompts` are the router's token ids for `grpc://` pools. HTTP
+    /// pools pass `None` and each backend renders the request itself.
     pub(super) async fn prepare_prefill_inputs(
         &self,
         workers: &[Arc<dyn Worker>],
         request: &Value,
         route: &str,
         headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
     ) -> Option<HashMap<String, super::pd_types::PdPrefillInput>> {
         let policy = self.policy_registry.get_prefill_policy();
         if kv_aware_ops(policy.as_ref()).is_some() {
             return Some(
                 self.kv_state
                     .as_ref()?
-                    .prepare(workers, &policy, request, route, headers)
+                    .prepare(workers, &policy, request, route, headers, router_prompts)
                     .await,
             );
         }
         if policy.name() != "cache_aware" {
             return None;
         }
-        let results = prepare_http_token_inputs(
-            &self.client,
-            workers
-                .iter()
-                .map(|worker| worker.base_url().to_owned())
-                .collect(),
-            request,
-            route,
-            headers,
-            self.api_key.as_deref(),
-            Duration::from_secs(1),
-        )
-        .await;
+        let results = self
+            .token_inputs(workers, request, route, headers, router_prompts)
+            .await;
         Some(
             results
                 .into_iter()
@@ -512,23 +505,14 @@ impl PdRouterBase {
         request: &Value,
         route: &str,
         headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
     ) -> Option<WorkerTokenInputs> {
         if self.policy_registry.get_decode_policy().name() != "cache_aware" {
             return None;
         }
-        let results = prepare_http_token_inputs(
-            &self.client,
-            workers
-                .iter()
-                .map(|worker| worker.base_url().to_owned())
-                .collect(),
-            request,
-            route,
-            headers,
-            self.api_key.as_deref(),
-            Duration::from_secs(1),
-        )
-        .await;
+        let results = self
+            .token_inputs(workers, request, route, headers, router_prompts)
+            .await;
         Some(
             results
                 .into_iter()
@@ -541,6 +525,35 @@ impl PdRouterBase {
                 })
                 .collect(),
         )
+    }
+
+    async fn token_inputs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
+    ) -> HashMap<String, Result<HttpTokenInput, &'static str>> {
+        let bases = workers
+            .iter()
+            .map(|worker| worker.base_url().to_owned())
+            .collect::<Vec<_>>();
+        match router_prompts {
+            Some(prompts) => router_token_inputs(bases, prompts),
+            None => {
+                prepare_http_token_inputs(
+                    &self.client,
+                    bases,
+                    request,
+                    route,
+                    headers,
+                    self.api_key.as_deref(),
+                    Duration::from_secs(1),
+                )
+                .await
+            }
+        }
     }
 
     /// Shared entry point for static and discovered P/D pools. Selection and

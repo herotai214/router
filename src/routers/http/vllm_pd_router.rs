@@ -932,6 +932,31 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
         forward_policy_headers: bool,
     ) -> Option<(super::pd_types::PdSelection, PdAttempt)> {
+        self.admit_pair_with_tokens(
+            prefill_workers,
+            decode_workers,
+            request,
+            path,
+            headers,
+            forward_policy_headers,
+            None,
+        )
+        .await
+    }
+
+    /// `router_prompts` replaces backend rendering with the router's own
+    /// token ids, which is what `grpc://` workers receive.
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_pair_with_tokens(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+        request: &Value,
+        path: &str,
+        headers: Option<&HeaderMap>,
+        forward_policy_headers: bool,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
+    ) -> Option<(super::pd_types::PdSelection, PdAttempt)> {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
         let text = [prefill_policy.as_ref(), decode_policy.as_ref()]
@@ -953,10 +978,20 @@ impl VllmPDRouter {
                 .collect()
         });
         let (prefill_inputs, decode_inputs) = tokio::join!(
-            self.pd_router
-                .prepare_prefill_inputs(prefill_workers, request, path, headers),
-            self.pd_router
-                .prepare_decode_inputs(decode_workers, request, path, headers),
+            self.pd_router.prepare_prefill_inputs(
+                prefill_workers,
+                request,
+                path,
+                headers,
+                router_prompts
+            ),
+            self.pd_router.prepare_decode_inputs(
+                decode_workers,
+                request,
+                path,
+                headers,
+                router_prompts
+            ),
         );
         let model_id = request.get("model").and_then(Value::as_str);
         let cache_salt = request
@@ -1157,8 +1192,8 @@ impl VllmPDRouter {
             .is_some_and(|worker| crate::backend::is_grpc_url(worker.url()))
     }
 
-    /// Chat on static `grpc://` pools: admit the pair through the shared P/D
-    /// admission, then run both legs over gRPC with the router's token ids.
+    /// Chat on static `grpc://` pools: tokenize once, admit the pair through
+    /// the shared P/D admission, then run both legs over gRPC with those ids.
     async fn route_grpc_chat(
         &self,
         headers: Option<&HeaderMap>,
@@ -1201,26 +1236,29 @@ impl VllmPDRouter {
                     .into_response();
             }
         };
+        // Tokenize before admission so kv_aware and cache_aware score the
+        // exact ids P will prefill.
+        let prepared = match self.grpc_frontend.prepare(body.clone()).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return (prepare_error_status(&error), error.to_string()).into_response();
+            }
+        };
+        let router_prompts: Arc<[Vec<u32>]> = Arc::from([prepared.tokenized.token_ids.to_vec()]);
         let Some((selection, attempt)) = self
-            .admit_pair(
+            .admit_pair_with_tokens(
                 &prefill_workers,
                 &decode_workers,
                 &request_json,
                 path,
                 headers,
                 true,
+                Some(&router_prompts),
             )
             .await
         else {
             RouterMetrics::record_pd_error("server_selection");
             return (StatusCode::SERVICE_UNAVAILABLE, "No eligible P/D pair").into_response();
-        };
-        let prepared = match self.grpc_frontend.prepare(body.clone()).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                attempt.release();
-                return (prepare_error_status(&error), error.to_string()).into_response();
-            }
         };
         let prefill_worker = prefill_workers[selection.prefill.worker_index].clone();
         let decode_worker = decode_workers[selection.decode.worker_index].clone();

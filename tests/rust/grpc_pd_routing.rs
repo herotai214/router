@@ -13,7 +13,7 @@ mod common;
 #[path = "common/grpc_frontend_fixture.rs"]
 mod fixture;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 
@@ -22,7 +22,9 @@ use common::mock_vllm_rs::{MockVllmRs, MockVllmRsServer};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde_json::{json, Value};
 use vllm_router_rs::backend::EngineFrontend;
-use vllm_router_rs::config::{KvConnector, PolicyConfig, RouterConfig, RoutingMode};
+use vllm_router_rs::config::{
+    KvConnector, PdKvEventSources, PolicyConfig, RouterConfig, RoutingMode,
+};
 use vllm_router_rs::policies::PolicyFactory;
 use vllm_router_rs::protocols::spec::ChatCompletionRequest;
 use vllm_router_rs::routers::http::vllm_pd_router::VllmPDRouter;
@@ -75,6 +77,16 @@ async fn pd_router_with_pools(
     dp_size: usize,
     prefill_policy: PolicyConfig,
 ) -> VllmPDRouter {
+    pd_router_with_kv_sources(prefills, decode, dp_size, prefill_policy, HashMap::new()).await
+}
+
+async fn pd_router_with_kv_sources(
+    prefills: &[&MockVllmRsServer],
+    decode: &MockVllmRsServer,
+    dp_size: usize,
+    prefill_policy: PolicyConfig,
+    pd_kv_event_sources: HashMap<String, PdKvEventSources>,
+) -> VllmPDRouter {
     metrics();
     let prefill_urls: Vec<(String, Option<u16>)> = prefills
         .iter()
@@ -84,11 +96,12 @@ async fn pd_router_with_pools(
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: prefill_urls.clone(),
             decode_urls: vec![decode.grpc_url.clone()],
-            prefill_policy: None,
+            prefill_policy: Some(prefill_policy.clone()),
             decode_policy: None,
             discovery_address: None,
         },
         policy: PolicyConfig::RoundRobin,
+        pd_kv_event_sources,
         kv_connector: KvConnector::Nixl,
         worker_startup_timeout_secs: 5,
         intra_node_data_parallel_size: dp_size,
@@ -374,6 +387,140 @@ async fn grpc_pd_power_of_two_uses_local_prefill_load() {
     assert_eq!(busy.captured().len(), 1, "the busy prefill was picked");
     assert_eq!(idle.captured().len(), idle_before + 8);
     drop(held);
+}
+
+/// One prefill's KV event publisher, as `--pd-kv-events` would name it.
+struct KvPublisher {
+    _context: zmq::Context,
+    socket: zmq::Socket,
+    endpoint: String,
+}
+
+impl KvPublisher {
+    fn bind() -> Self {
+        let context = zmq::Context::new();
+        let socket = context.socket(zmq::PUB).unwrap();
+        socket.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = socket.get_last_endpoint().unwrap().unwrap();
+        Self {
+            _context: context,
+            socket,
+            endpoint,
+        }
+    }
+
+    /// vLLM's `BlockStored` batch for two 16-token blocks.
+    fn store_blocks(&self, token_ids: &[u32]) {
+        let payload = rmp_serde::to_vec(&(
+            1.0,
+            vec![json!({
+                "type": "BlockStored", "block_hashes": [1, 2], "parent_block_hash": null,
+                "token_ids": token_ids, "block_size": 16,
+                "lora_id": null, "lora_name": null, "medium": "GPU",
+            })],
+            0_u32,
+        ))
+        .unwrap();
+        let seq = 0_u64.to_be_bytes();
+        self.socket
+            .send_multipart([b"".as_slice(), seq.as_slice(), payload.as_slice()], 0)
+            .unwrap();
+    }
+}
+
+/// kv_aware on `grpc://` prefills scores the router's own token ids against
+/// each prefill's KV events, and sends a request to the prefill that already
+/// holds its prefix. The sources carry no model, as with `--pd-kv-events`.
+#[tokio::test]
+async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
+    // Run with each prefill warm so a cold tie-break cannot pass the test.
+    for warm_index in [0, 1] {
+        let prefills = [
+            MockVllmRsServer::spawn_with_state(MockVllmRs {
+                finish_kv_transfer_params: Some(prefill_kv()),
+                ..Default::default()
+            })
+            .await,
+            MockVllmRsServer::spawn_with_state(MockVllmRs {
+                finish_kv_transfer_params: Some(prefill_kv()),
+                ..Default::default()
+            })
+            .await,
+        ];
+        let publishers = [KvPublisher::bind(), KvPublisher::bind()];
+        let decode = MockVllmRsServer::spawn().await;
+        let sources = prefills
+            .iter()
+            .zip(&publishers)
+            .map(|(prefill, publisher)| {
+                (
+                    prefill.grpc_url.clone(),
+                    PdKvEventSources {
+                        endpoints: vec![publisher.endpoint.clone()],
+                        replay_endpoints: None,
+                        block_size: 16,
+                        model: None,
+                    },
+                )
+            })
+            .collect();
+        let policy = PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.4,
+            static_kv_event_sources: Default::default(),
+        };
+        let router =
+            pd_router_with_kv_sources(&[&prefills[0], &prefills[1]], &decode, 1, policy, sources)
+                .await;
+        let prompt: Vec<u32> = (0..33).collect();
+        router.pin_test_token_ids(prompt.clone());
+
+        let warm = &prefills[warm_index];
+        let cold = &prefills[1 - warm_index];
+        // The subscriber connects asynchronously; republish until a request
+        // lands on the warm prefill.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                publishers[warm_index].store_blocks(&prompt[..32]);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let before = warm.captured().len();
+                send_chat_ok(&router).await;
+                if warm.captured().len() > before {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("kv_aware never picked the warm prefill");
+
+        let (warm_before, cold_before) = (warm.captured().len(), cold.captured().len());
+        for _ in 0..8 {
+            send_chat_ok(&router).await;
+        }
+        assert_eq!(
+            warm.captured().len(),
+            warm_before + 8,
+            "warm_index={warm_index}"
+        );
+        assert_eq!(cold.captured().len(), cold_before);
+        assert!(warm
+            .captured()
+            .iter()
+            .all(|request| request.token_ids == prompt));
+    }
+}
+
+/// Names the model the mocks report from `Control.GetModelInfo`.
+async fn send_chat_ok(router: &VllmPDRouter) {
+    let mut request = chat(false);
+    request.model = Some("mock-model".into());
+    let response = router.route_chat(None, &request, None).await;
+    assert!(response.status().is_success(), "{}", response.status());
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

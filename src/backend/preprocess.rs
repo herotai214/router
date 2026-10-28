@@ -148,6 +148,25 @@ pub(crate) struct HttpTokenInput {
     pub source: &'static str,
 }
 
+/// The router's own token ids for `grpc://` pools, which take token ids and
+/// serve no `/tokenize`. Every backend gets the same ids it will be sent.
+pub(crate) fn router_token_inputs(
+    urls: impl IntoIterator<Item = String>,
+    prompts: &Arc<[Vec<u32>]>,
+) -> std::collections::HashMap<String, Result<HttpTokenInput, &'static str>> {
+    urls.into_iter()
+        .map(|url| {
+            (
+                url,
+                Ok(HttpTokenInput {
+                    prompts: prompts.clone(),
+                    source: "router_tokens",
+                }),
+            )
+        })
+        .collect()
+}
+
 pub(crate) async fn prepare_http_token_inputs(
     client: &Client,
     mut urls: Vec<String>,
